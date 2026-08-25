@@ -1,18 +1,17 @@
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::Client;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube_tui::app::Overlay;
 use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
 use kube_tui::app::session::{
-    Session, SessionEvent, SharedSession, is_deliberate_abort, switch_cluster,
+    Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
 };
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
 use kube_tui::cluster::{ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
-use kube_tui::store::watch::{ResourceStore, spawn_watch};
+use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
@@ -26,9 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
 /// A namespace choice meaning "watch everything", not a literal namespace.
@@ -114,6 +111,23 @@ fn connecting_cluster_name(entries: &[ClusterEntry]) -> Option<String> {
         .map(|e| e.id.0.clone())
 }
 
+/// The filtered-list index a confirmed picker choice refers to, whether it
+/// came from a click or from Enter.
+///
+/// `PickerSelect` already carries the index a click landed on. `PickerConfirm`
+/// (Enter) carries none — it confirms whatever the picker currently has
+/// highlighted, `Picker::selected`, itself a filtered-list index per
+/// `picker.rs`'s own contract (`render_picker` compares it against `row`,
+/// enumerated over the FILTERED matches). Any other action, or `PickerConfirm`
+/// with no picker open, resolves nothing.
+fn confirm_index_for(action: Action, overlay: &Overlay) -> Option<usize> {
+    match action {
+        Action::PickerSelect(i) => Some(i),
+        Action::PickerConfirm => overlay.picker().map(|p| p.selected),
+        _ => None,
+    }
+}
+
 /// Resolve a filtered-list index back to the item it actually refers to.
 ///
 /// `HitTarget::PickerRow` and `Picker::selected` both carry an index into
@@ -128,32 +142,6 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
         .get(filtered_index)
         .and_then(|&real| picker.items.get(real))
         .map(|item| item.label.clone())
-}
-
-/// Record the client currently in use for the active cluster.
-///
-/// `Session` holds the store, the watch handles and the registry, but not
-/// the `Client` itself — nothing needed it before namespace switching, which
-/// restarts the watch against the SAME cluster without reconnecting. A
-/// cluster switch mints a fresh `Client`, reachable only inside the closure
-/// `switch_cluster` hands it to; this cell is how that value survives past
-/// the switch for a later namespace change to reuse. `std::sync::Mutex`
-/// rather than the session's `tokio::sync::Mutex`: writes happen inside
-/// `switch_cluster`'s `spawn_watches` closure, which the session lock is
-/// held across — a second lock acquired and released synchronously, with no
-/// `.await` in between, cannot deadlock that.
-fn set_current_client(cell: &StdMutex<Client>, client: Client) {
-    match cell.lock() {
-        Ok(mut guard) => *guard = client,
-        Err(poisoned) => *poisoned.into_inner() = client,
-    }
-}
-
-fn get_current_client(cell: &StdMutex<Client>) -> Client {
-    match cell.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
 }
 
 /// Draw one frame: the ribbon, then the table and status bar, then the
@@ -354,20 +342,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 
     // Everything belonging to "the cluster on screen" lives behind one handle
     // so that a switch can replace it wholesale — the store in particular is
-    // replaced rather than cleared. See `switch_cluster`.
+    // replaced rather than cleared. See `switch_cluster`. `Session` also
+    // owns the Client for whichever cluster is active: a namespace switch
+    // reads it from the SAME lock it uses to restart the watch (see
+    // `restart_watch`), rather than from a separate cell elsewhere that
+    // could go stale relative to a concurrent cluster switch.
     let session: SharedSession = Arc::new(Mutex::new(Session::new(
         ClusterRegistry::from_contexts(contexts),
+        client.clone(),
     )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
-
-    // Tracks the Client for whichever cluster is currently active. `Session`
-    // holds the store, the handles and the registry, but not the Client
-    // itself — nothing needed it before namespace switching, which restarts
-    // the watch against the SAME cluster without reconnecting. A cluster
-    // switch (via `switch_cluster`) mints a fresh Client reachable only
-    // inside the closure it is handed to; this cell is how that value
-    // survives past the switch for a later namespace change to reuse.
-    let current_client: Arc<StdMutex<Client>> = Arc::new(StdMutex::new(client.clone()));
 
     let pod_ar = ApiResource::erase::<Pod>(&());
     let pod_gvk = GroupVersionKind::gvk("", "v1", "Pod");
@@ -563,15 +547,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
             let action = action_for(input, &hits, overlay.is_open());
-            // Enter and a picker-row click both confirm a choice; they carry
-            // the chosen row differently (Enter uses the picker's own
-            // highlighted position, a click carries the filtered index it
-            // actually landed on) but resolve identically from there.
-            let confirm_index = match action {
-                Action::PickerSelect(i) => Some(i),
-                Action::PickerConfirm => overlay.picker().map(|p| p.selected),
-                _ => None,
-            };
+            let confirm_index = confirm_index_for(action, &overlay);
             match action {
                 Action::Quit => quit = true,
                 Action::SelectRow(i) => {
@@ -638,7 +614,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                     let session2 = session.clone();
                                     let tx2 = tx.clone();
                                     let pod_ar2 = pod_ar.clone();
-                                    let current_client2 = current_client.clone();
                                     tokio::spawn(async move {
                                         switch_cluster(
                                             session2,
@@ -648,15 +623,15 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                                 cluster::connect_with(&switch_opts).await
                                             },
                                             move |client, store| {
-                                                set_current_client(
-                                                    &current_client2,
-                                                    client.clone(),
-                                                );
                                                 // Contexts frequently set no namespace and
                                                 // `default` is empty on these clusters — the
                                                 // picker overrides whatever `-A`/`-n` chose
                                                 // for the INITIAL connect with all-namespaces
-                                                // on every subsequent switch.
+                                                // on every subsequent switch. `switch_cluster`
+                                                // itself records `client` on the session, under
+                                                // the same lock it uses to activate the cluster
+                                                // — see `restart_watch` below for why that
+                                                // matters.
                                                 supervise(
                                                     "watch",
                                                     spawn_watch(
@@ -677,20 +652,30 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             Overlay::NamespacePicker(p) => {
                                 if let Some(label) = resolve_picker_choice(&p, i) {
                                     let ns_choice = namespace_choice_from_label(&label);
-                                    let client_now = get_current_client(&current_client);
-                                    let mut s = session.lock().await;
-                                    s.handles.abort_all();
-                                    s.store = Arc::new(RwLock::new(ResourceStore::new()));
-                                    let new_store = s.store.clone();
-                                    let handle = spawn_watch(
-                                        client_now,
-                                        pod_ar.clone(),
-                                        ns_choice.clone(),
-                                        new_store,
-                                        tx.clone(),
-                                    );
-                                    s.handles.push(supervise("watch", handle, tx.clone()));
-                                    drop(s);
+                                    let pod_ar2 = pod_ar.clone();
+                                    let tx2 = tx.clone();
+                                    let ns_choice2 = ns_choice.clone();
+                                    // `restart_watch` reads the session's CURRENT client
+                                    // from the same lock it uses to tear down and replace
+                                    // the store — not a copy captured earlier, which could
+                                    // have gone stale if a cluster switch completed in the
+                                    // gap between capturing it and taking the lock. See
+                                    // `Session::client`'s doc comment for the interleaving
+                                    // this closes.
+                                    restart_watch(session.clone(), move |client, store| {
+                                        supervise(
+                                            "watch",
+                                            spawn_watch(
+                                                client,
+                                                pod_ar2,
+                                                ns_choice2,
+                                                store,
+                                                tx2.clone(),
+                                            ),
+                                            tx2,
+                                        )
+                                    })
+                                    .await;
                                     display_namespace = ns_choice
                                         .unwrap_or_else(|| ALL_NAMESPACES_LABEL.to_string());
                                     is_fallback_namespace = false;
@@ -891,7 +876,6 @@ mod tests {
     mod overlay_wiring {
         use super::*;
         use k8s_openapi::api::core::v1::Pod;
-        use kube::Client;
         use kube::api::{ApiResource, DynamicObject};
         use kube_tui::app::Overlay;
         use kube_tui::app::event::WatchStatus;
@@ -1048,33 +1032,83 @@ mod tests {
             assert_eq!(resolve_picker_choice(&picker, 5), None);
         }
 
-        fn offline_client() -> Client {
-            let uri: http::Uri = "http://127.0.0.1:1/"
-                .parse()
-                .expect("a static, well-formed URI");
-            Client::try_from(kube::Config::new(uri)).expect("building a client performs no I/O")
+        #[test]
+        fn confirm_index_for_picker_select_carries_its_own_index() {
+            // PickerSelect(i) already IS the answer, regardless of what the
+            // picker's own `selected` happens to be — a click at filtered
+            // row 7 confirms row 7, not whatever was last highlighted.
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "T".into(),
+                items: vec![PickerItem {
+                    label: "a".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 3,
+            });
+            assert_eq!(
+                confirm_index_for(Action::PickerSelect(7), &overlay),
+                Some(7)
+            );
         }
 
-        // `Client::try_from` spawns an internal tower buffer task even
-        // though it performs no I/O itself, so it needs a Tokio runtime —
-        // matching session.rs's own `offline_client` tests.
-        #[tokio::test]
-        async fn current_client_round_trips_through_the_cell() {
-            let cell = StdMutex::new(offline_client());
-            set_current_client(&cell, offline_client());
-            let _ = get_current_client(&cell); // must not panic
+        #[test]
+        fn confirm_index_for_picker_confirm_uses_the_pickers_own_selection_not_a_hardcoded_zero() {
+            // selected=1 under filter "e": matches "prod-eu" (unfiltered
+            // index 0, filtered position 0) and "dev" (unfiltered index 3,
+            // filtered position 1). Picker::selected (1), the filtered
+            // position it names (1), and the real item it will resolve to
+            // (unfiltered index 3) are all different from 0 — a
+            // PickerConfirm branch hardcoded to 0 would silently confirm
+            // "prod-eu" (index 0) instead of "dev" (index 3), and this is
+            // the only kind of fixture that can catch that: with
+            // selected=0, or a filter that left filtered and unfiltered
+            // positions coincident, the mutation would be invisible.
+            let items: Vec<PickerItem> = ["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]
+                .iter()
+                .map(|n| PickerItem {
+                    label: n.to_string(),
+                    detail: String::new(),
+                    accent: None,
+                })
+                .collect();
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items,
+                filter: "e".into(),
+                selected: 1,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(index, Some(1), "must be the picker's own selection, not 0");
+
+            // Full pipeline, end to end: that index must resolve to "dev",
+            // not "prod-eu".
+            let picker = overlay.picker().expect("cluster picker is open");
+            assert_eq!(
+                resolve_picker_choice(picker, index.expect("checked above")),
+                Some("dev".to_string())
+            );
         }
 
-        #[tokio::test]
-        async fn get_current_client_recovers_from_a_poisoned_mutex() {
-            let cell = StdMutex::new(offline_client());
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = cell.lock().expect("not yet poisoned");
-                panic!("poison it");
-            }));
-            // Must recover the value rather than panicking a second time.
-            let _ = get_current_client(&cell);
-            set_current_client(&cell, offline_client());
+        #[test]
+        fn confirm_index_for_picker_confirm_with_no_overlay_open_is_none() {
+            assert_eq!(
+                confirm_index_for(Action::PickerConfirm, &Overlay::None),
+                None
+            );
+        }
+
+        #[test]
+        fn confirm_index_for_unrelated_actions_is_none() {
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "T".into(),
+                items: vec![],
+                filter: String::new(),
+                selected: 0,
+            });
+            assert_eq!(confirm_index_for(Action::ClosePicker, &overlay), None);
+            assert_eq!(confirm_index_for(Action::Quit, &overlay), None);
         }
 
         #[test]

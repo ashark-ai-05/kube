@@ -33,6 +33,19 @@ pub struct Session {
     pub handles: WatchHandles,
     /// Replaced wholesale on every switch — never cleared and reused.
     pub store: SharedStore,
+    /// The `Client` for whichever cluster `registry.active()` currently
+    /// reports.
+    ///
+    /// Lives here, behind the SAME lock as `registry`/`store`/`handles`,
+    /// rather than in a side cell somewhere else: a client read from a
+    /// separate lock — even one updated correctly by `switch_cluster` — can
+    /// be captured, then go stale in the gap before the reader acquires
+    /// ITS OWN lock, if a concurrent switch completes in between. Reading it
+    /// from the same guard used for whatever else needs it (see
+    /// `restart_watch`) makes that gap not exist rather than requiring two
+    /// sources of truth to be kept in sync — found in review of this
+    /// session's own first version, which is exactly what this replaced.
+    pub client: Client,
     /// Bumped by every switch so a slow connect that has been superseded can
     /// tell it is stale and stand down.
     pub generation: u64,
@@ -47,11 +60,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(registry: ClusterRegistry) -> Self {
+    pub fn new(registry: ClusterRegistry, client: Client) -> Self {
         Self {
             registry,
             handles: WatchHandles::new(),
             store: Arc::new(RwLock::new(ResourceStore::new())),
+            client,
             generation: 0,
             pending: HashMap::new(),
         }
@@ -176,6 +190,13 @@ pub async fn switch_cluster<C, F, W>(
             //    of needing to be timed.
             s.store = Arc::new(RwLock::new(ResourceStore::new()));
 
+            // Record the client BEFORE handing it to `spawn_watches`, which
+            // consumes it — and while still holding this same guard, so
+            // `client` and `active`/`state` change together atomically. A
+            // reader taking the lock either sees the whole switch or none of
+            // it, never a client for one cluster paired with another's id.
+            s.client = client.clone();
+
             // 6. Watch the store minted just above — never the one the previous
             //    cluster's watches were writing into.
             let store = s.store.clone();
@@ -205,6 +226,36 @@ pub async fn switch_cluster<C, F, W>(
             }));
         }
     }
+}
+
+/// Restart the watch for the cluster the session is CURRENTLY on — used when
+/// only the namespace scope changes, not the cluster itself. Tears down the
+/// existing watch(es), mints a fresh store (same reasoning as
+/// `switch_cluster` step 5: a stray write from a not-yet-cancelled watch must
+/// land somewhere nobody reads), and spawns a new one.
+///
+/// **Reads `client` from the SAME lock guard used for the teardown and store
+/// swap**, rather than from an earlier, separate acquisition — a client
+/// captured before taking the lock can go stale if a concurrent
+/// `switch_cluster` completes in the gap between capturing it and actually
+/// acquiring the lock. `Session` holding the client (rather than a side cell
+/// elsewhere) is what makes that gap not exist rather than requiring two
+/// locks to be kept in sync — see the doc comment on `Session::client`.
+///
+/// **`spawn_watches` is called with the session lock held**, the same
+/// constraint as `switch_cluster`'s: it must do no more than start the watch
+/// and hand back its handle.
+pub async fn restart_watch<W>(session: SharedSession, spawn_watches: W)
+where
+    W: FnOnce(Client, SharedStore) -> JoinHandle<()>,
+{
+    let mut s = session.lock().await;
+    s.handles.abort_all();
+    s.store = Arc::new(RwLock::new(ResourceStore::new()));
+    let store = s.store.clone();
+    let client = s.client.clone();
+    let handle = spawn_watches(client, store);
+    s.handles.push(handle);
 }
 
 #[cfg(test)]
@@ -248,9 +299,10 @@ mod tests {
             .enumerate()
             .map(|(i, n)| ctx(n, i == 0))
             .collect();
-        Arc::new(Mutex::new(Session::new(ClusterRegistry::from_contexts(
-            contexts,
-        ))))
+        Arc::new(Mutex::new(Session::new(
+            ClusterRegistry::from_contexts(contexts),
+            offline_client(),
+        )))
     }
 
     fn id(name: &str) -> ClusterId {
@@ -265,6 +317,20 @@ mod tests {
             .parse()
             .expect("a static, well-formed URI");
         Client::try_from(kube::Config::new(uri)).expect("building a client performs no I/O")
+    }
+
+    /// An offline client tagged so a test can tell which one ended up in
+    /// use. `Client` exposes no other identity a test can read back without
+    /// performing I/O; `default_namespace` is a public `Config` field that
+    /// survives into the built `Client` and back out via
+    /// `Client::default_namespace()`.
+    fn tagged_client(tag: &str) -> Client {
+        let uri: http::Uri = "http://127.0.0.1:1/"
+            .parse()
+            .expect("a static, well-formed URI");
+        let mut cfg = kube::Config::new(uri);
+        cfg.default_namespace = tag.to_string();
+        Client::try_from(cfg).expect("building a client performs no I/O")
     }
 
     /// A watch stand-in that stays alive until aborted.
@@ -884,5 +950,194 @@ mod tests {
                 .map(|e| e.id.0.as_str()),
             Some("dev")
         );
+    }
+
+    #[tokio::test]
+    async fn a_successful_switch_installs_the_new_clusters_client() {
+        // Task 9's review: a status/namespace path must never have to guess
+        // which client belongs to the cluster the registry now reports
+        // active. `switch_cluster` installing it is the other half of that
+        // guarantee — `restart_watch` (below) is the half that reads it.
+        let session = session_over(&["prod", "dev"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            tx,
+            || async { Ok(tagged_client("dev-client")) },
+            |_, _| live_watch(),
+        )
+        .await;
+        assert_eq!(
+            session.lock().await.client.default_namespace(),
+            "dev-client",
+            "the session's client must be the one the successful connect produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_tears_down_the_old_watch_and_replaces_the_store() {
+        let session = session_over(&["prod"]);
+        session.lock().await.handles.push(live_watch());
+        let old_store = session.lock().await.store.clone();
+
+        restart_watch(session.clone(), |_client, _store| live_watch()).await;
+
+        let s = session.lock().await;
+        assert_eq!(
+            s.handles.len(),
+            1,
+            "the old watch must be replaced, not added to"
+        );
+        assert!(
+            !Arc::ptr_eq(&s.store, &old_store),
+            "a fresh store must be minted, same reasoning as switch_cluster \
+             — a stray write from a not-yet-cancelled watch must land \
+             somewhere nobody reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_uses_the_sessions_current_client() {
+        let session = Arc::new(Mutex::new(Session::new(
+            ClusterRegistry::from_contexts(vec![ctx("prod", true)]),
+            tagged_client("prod-client"),
+        )));
+        let seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let seen2 = seen.clone();
+        restart_watch(session, move |client, _store| {
+            *seen2.lock().expect("uncontended in a test") =
+                Some(client.default_namespace().to_string());
+            live_watch()
+        })
+        .await;
+        assert_eq!(
+            seen.lock().expect("uncontended in a test").clone(),
+            Some("prod-client".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_reads_the_client_atomically_with_the_teardown_a_racing_switch_cannot_leave_it_stale()
+     {
+        // The exact interleaving Task 9's review traced: a switch to "dev"
+        // is in flight, and — before it resolves — something needs to
+        // restart the watch (originally: a namespace change). The buggy
+        // shape `main.rs` had before this fix read the client from ONE lock
+        // acquisition, then did the teardown in a SEPARATE one; a
+        // concurrent `switch_cluster` completing in the gap between those
+        // two acquisitions leaves the second one using a client for a
+        // cluster the registry no longer calls active.
+        //
+        // First: reproduce that shape by hand, with an explicit gate
+        // forcing the race window open, and confirm it really does go
+        // stale — proving the hazard is real, not hypothetical. Then: run
+        // the identical race against the real `restart_watch` and confirm
+        // it cannot, because it has no second acquisition to race into —
+        // client and teardown come from the same guard.
+        let session = session_over(&["prod", "dev"]);
+        assert_eq!(
+            session.lock().await.client.default_namespace(),
+            "default",
+            "sanity: prod starts as session_over's default (untagged) client"
+        );
+
+        let (entered, release, switch) =
+            stalled_switch_to_client(session.clone(), id("dev"), tagged_client("dev-client"));
+        entered.await.expect("the switch to dev must start");
+
+        // The buggy, pre-fix shape: capture the client, THEN wait for a
+        // gate, THEN take the lock to do the rest — reproduced here by hand
+        // since the real (fixed) `restart_watch` no longer has this seam to
+        // reproduce it in.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let stale_seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let buggy = {
+            let session = session.clone();
+            let stale_seen = stale_seen.clone();
+            tokio::spawn(async move {
+                let captured = session.lock().await.client.clone();
+                let _ = gate_rx.await;
+                let mut s = session.lock().await;
+                s.handles.abort_all();
+                *stale_seen.lock().expect("uncontended in a test") =
+                    Some(captured.default_namespace().to_string());
+            })
+        };
+
+        // Let dev's switch complete NOW, while `buggy` is parked at the
+        // gate holding a client captured before dev won.
+        let _ = release.send(());
+        switch.await.expect("the switch must not panic");
+        assert_eq!(
+            session
+                .lock()
+                .await
+                .registry
+                .active()
+                .map(|e| e.id.0.clone()),
+            Some("dev".to_string()),
+            "dev must be fully active before the stale read is allowed to proceed"
+        );
+
+        let _ = gate_tx.send(());
+        buggy.await.expect("must not panic");
+        assert_eq!(
+            stale_seen.lock().expect("uncontended in a test").clone(),
+            Some("default".to_string()),
+            "reproduces the bug: the two-acquisition shape used prod's \
+             client while the registry already said dev"
+        );
+
+        // Now the fix, under the identical interleaving: restart_watch is
+        // asked to run only AFTER dev has already won, same as above — and
+        // because it reads the client and does the teardown under one lock,
+        // there is no earlier acquisition whose result could have gone
+        // stale.
+        let fixed_seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let fixed_seen2 = fixed_seen.clone();
+        restart_watch(session.clone(), move |client, _store| {
+            *fixed_seen2.lock().expect("uncontended in a test") =
+                Some(client.default_namespace().to_string());
+            live_watch()
+        })
+        .await;
+        assert_eq!(
+            fixed_seen.lock().expect("uncontended in a test").clone(),
+            Some("dev-client".to_string()),
+            "restart_watch must use dev's client, matching the registry"
+        );
+    }
+
+    /// As `stalled_switch`, but resolves the connect to a caller-chosen
+    /// client rather than always `offline_client()` — needed to tell which
+    /// cluster's client actually ended up in use.
+    fn stalled_switch_to_client(
+        session: SharedSession,
+        target: ClusterId,
+        client: Client,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            switch_cluster(
+                session,
+                target,
+                tx,
+                move || async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(client)
+                },
+                |_, _| live_watch(),
+            )
+            .await;
+        });
+        (entered_rx, release_tx, task)
     }
 }
