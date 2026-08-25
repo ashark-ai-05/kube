@@ -144,6 +144,25 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
         .map(|item| item.label.clone())
 }
 
+/// Everything one frame needs out of the store, read in a single lock
+/// acquisition.
+///
+/// Objects and watch health must come from the SAME store, because a cluster
+/// switch replaces the store wholesale (`switch_cluster` step 5). Keeping
+/// health in a separate local fed by `WatchStatus` events instead means a
+/// switch empties the table while the old cluster's "live" survives — an
+/// empty table presented as fresh, which `ui/views/status.rs` calls out as
+/// the worst failure mode for an ops tool. A replaced store reports
+/// `Initialising` by construction, so reading both here makes that state
+/// unrepresentable rather than something to remember to reset.
+async fn store_snapshot(
+    store: &kube_tui::store::watch::SharedStore,
+    gvk: &GroupVersionKind,
+) -> (Vec<Arc<DynamicObject>>, WatchStatus) {
+    let s = store.read().await;
+    (s.objects(gvk), s.status(gvk))
+}
+
 /// Draw one frame: the ribbon, then the table and status bar, then the
 /// overlay LAST — so its z=1 hit zones (registered by `render_picker`)
 /// resolve above the table's z=0 zones wherever the two overlap, and its
@@ -457,7 +476,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     let mut view = TableView::new();
     let mut hits = HitRegistry::new();
     let mut last_error: Option<String> = None;
-    let mut status = WatchStatus::Initialising;
     // At most one picker is ever open; opening one replaces whatever was
     // open before. Neither cluster nor namespace picking touched a network
     // before this task — this is what makes them reachable.
@@ -487,8 +505,10 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             last_error = Some(e.clone());
             needs_redraw = true;
         }
-        if let Some((_, s)) = batch.status_changes.last() {
-            status = *s;
+        // The status itself is read back off the store below, not carried in a
+        // local — see `store_snapshot`. The event only says "something
+        // changed", which is all a redraw needs.
+        if !batch.status_changes.is_empty() {
             needs_redraw = true;
         }
         // A switch changes the ribbon, the status bar and the whole table, and
@@ -521,9 +541,12 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let connecting_name = connecting_cluster_name(&entries);
-        // Read the store snapshot into a local Vec before drawing; the render
+        // Read the store snapshot into locals before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
-        let objects = store.read().await.objects(&pod_gvk);
+        // Objects and watch health come from one acquisition of one store, so
+        // a switch cannot show the previous cluster's health over this
+        // cluster's (empty) object list.
+        let (objects, status) = store_snapshot(&store, &pod_gvk).await;
 
         // Keep an open picker's items current: the registry (cluster
         // states) and the object list (namespaces seen) can both change
@@ -1109,6 +1132,56 @@ mod tests {
             });
             assert_eq!(confirm_index_for(Action::ClosePicker, &overlay), None);
             assert_eq!(confirm_index_for(Action::Quit, &overlay), None);
+        }
+
+        #[tokio::test]
+        async fn the_status_shown_comes_from_the_store_the_objects_came_from() {
+            use kube::runtime::watcher;
+            use kube_tui::store::watch::ResourceStore;
+            use tokio::sync::RwLock;
+
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let ar = ApiResource::erase::<Pod>(&());
+
+            // The cluster the user is on: three pods, watch synced.
+            let live: kube_tui::store::watch::SharedStore =
+                Arc::new(RwLock::new(ResourceStore::new()));
+            {
+                let mut s = live.write().await;
+                s.set_status(gvk.clone(), WatchStatus::Synced);
+                for i in 0..3 {
+                    s.apply(
+                        &gvk,
+                        &ar,
+                        watcher::Event::Apply(
+                            DynamicObject::new(&format!("pod-{i}"), &ar).within("default"),
+                        ),
+                    );
+                }
+            }
+            let (objects, status) = store_snapshot(&live, &gvk).await;
+            assert_eq!(objects.len(), 3);
+            assert_eq!(
+                status,
+                WatchStatus::Synced,
+                "a live watch's own store must report live"
+            );
+
+            // What a cluster switch does: replace the store wholesale, so the
+            // new cluster starts empty with nothing yet synced. Health read
+            // from anywhere ELSE — a local carried across the switch, fed by
+            // the previous cluster's WatchStatus events — would still say
+            // "live" here, labelling an empty table as fresh data.
+            let fresh: kube_tui::store::watch::SharedStore =
+                Arc::new(RwLock::new(ResourceStore::new()));
+            let (objects, status) = store_snapshot(&fresh, &gvk).await;
+            assert!(objects.is_empty(), "the new cluster starts with no objects");
+            assert_eq!(
+                status,
+                WatchStatus::Initialising,
+                "zero items must never be labelled 'live': the status must come \
+                 from the same store the (empty) object list did"
+            );
         }
 
         #[test]
