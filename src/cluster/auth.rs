@@ -170,6 +170,21 @@ users:
 - name: token-user
   user:
     token: abcdef123456
+- name: exec-with-stale-token
+  user:
+    token: stale-cached-value
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: kubelogin
+      args: ["get-token"]
+- name: oidc-with-stale-cert
+  user:
+    client-certificate-data: Zm9v
+    client-key-data: YmFy
+    auth-provider:
+      name: oidc
+      config:
+        idp-issuer-url: https://sso.corp.example.com
 "#;
 
     fn kc() -> kube::config::Kubeconfig {
@@ -205,6 +220,29 @@ users:
     #[test]
     fn detects_static_token_auth() {
         assert_eq!(auth_method_for(&kc(), "token-user"), AuthMethod::Token);
+    }
+
+    #[test]
+    fn an_exec_plugin_wins_over_a_stale_cached_token() {
+        // A corporate kubeconfig routinely carries a cached token beside the
+        // plugin that refreshes it. Reporting Token here would send someone
+        // chasing an expired credential instead of their exec helper.
+        assert_eq!(
+            auth_method_for(&kc(), "exec-with-stale-token"),
+            AuthMethod::Exec {
+                command: "kubelogin".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_auth_provider_wins_over_stale_certificate_data() {
+        assert_eq!(
+            auth_method_for(&kc(), "oidc-with-stale-cert"),
+            AuthMethod::AuthProvider {
+                name: "oidc".to_string()
+            }
+        );
     }
 
     #[test]
