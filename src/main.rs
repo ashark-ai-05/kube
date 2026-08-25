@@ -177,6 +177,32 @@ fn connect_failure_hint(auth: &AuthMethod, error: &str) -> String {
     }
 }
 
+/// The longest error text that may reach the status bar.
+const MAX_ERROR_CHARS: usize = 200;
+
+/// Cap an error at something a one-line status bar can plausibly carry.
+///
+/// The bar is one row and already width-truncates, so length costs nothing
+/// visually — but it is also what bounds an error we do not control the
+/// contents of. `kube::client::auth::Error::AuthExecRun` formats
+/// `out: std::process::Output` with `{out:?}`, which includes the credential
+/// plugin's stdout — where a partial `ExecCredential` (token and all) sits if
+/// the plugin exits non-zero after printing one. It renders as a decimal byte
+/// array, and nothing in this app writes logs, so it never leaves the screen;
+/// capping it keeps it from being the whole line as well.
+///
+/// Truncates by CHARACTERS, not bytes: an error containing multi-byte text
+/// (a cluster name, a server-supplied message) would panic a byte slice on a
+/// character boundary.
+fn truncate_error(e: String) -> String {
+    if e.chars().count() <= MAX_ERROR_CHARS {
+        return e;
+    }
+    let mut out: String = e.chars().take(MAX_ERROR_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// The error the status bar should show after this batch of events.
 ///
 /// Nothing used to clear `last_error`, so a single watch blip on prod pinned
@@ -215,13 +241,15 @@ fn next_error(
         error = None;
     }
 
+    // Everything that becomes a visible error passes through `truncate_error`
+    // here — one choke point, so no future error source can bypass the cap.
     for e in &batch.session_events {
         if let SessionEvent::ConnectFailed { id, reason } = e {
-            error = Some(format!("connecting to {}: {reason}", id.0));
+            error = Some(truncate_error(format!("connecting to {}: {reason}", id.0)));
         }
     }
     if let Some(e) = batch.errors.last() {
-        error = Some(e.clone());
+        error = Some(truncate_error(e.clone()));
     }
     error
 }
@@ -1178,6 +1206,57 @@ mod tests {
                 ),
                 original
             );
+        }
+
+        // --- Error text is bounded before it reaches the bar ---
+
+        #[test]
+        fn a_short_error_is_passed_through_untouched() {
+            let e = "forbidden: pods is denied".to_string();
+            assert_eq!(truncate_error(e.clone()), e);
+        }
+
+        #[test]
+        fn an_error_exactly_at_the_limit_is_not_marked_as_truncated() {
+            let e = "x".repeat(MAX_ERROR_CHARS);
+            assert_eq!(truncate_error(e.clone()), e, "the boundary is inclusive");
+        }
+
+        #[test]
+        fn an_exec_plugin_dumping_its_stdout_cannot_fill_the_status_bar() {
+            // `Error::AuthExecRun` formats `out: std::process::Output` with
+            // `{out:?}`, so a plugin that prints a partial ExecCredential and
+            // then exits non-zero puts its token into the error as a decimal
+            // byte array. Bound it.
+            let dump: String = (0..2000)
+                .map(|i| format!("{}, ", i % 256))
+                .collect::<String>();
+            let e = format!("auth exec command failed: Output {{ stdout: [{dump}] }}");
+            let out = truncate_error(e);
+            assert_eq!(
+                out.chars().count(),
+                MAX_ERROR_CHARS + 1,
+                "capped at the limit plus the ellipsis that marks it"
+            );
+            assert!(
+                out.ends_with('…'),
+                "a truncated error must show that it was truncated; got {out}"
+            );
+            assert!(
+                out.starts_with("auth exec command failed"),
+                "the useful part is the front, so that is the part kept; got {out}"
+            );
+        }
+
+        #[test]
+        fn truncating_multibyte_text_does_not_split_a_character() {
+            // Cluster names, server messages and a plugin's own output can
+            // all be non-ASCII. Slicing by BYTES at 200 lands mid-character
+            // in this string and panics; slicing by characters does not.
+            let e = "→".repeat(300);
+            let out = truncate_error(e);
+            assert_eq!(out.chars().count(), MAX_ERROR_CHARS + 1);
+            assert!(out.starts_with("→→→"));
         }
 
         // --- Errors are retired as well as raised ---
