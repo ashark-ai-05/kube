@@ -195,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
     let mut selected: usize = 0;
     let mut last_error: Option<String> = None;
     let mut status = WatchStatus::Initialising;
+    // Nothing has been painted yet, so the first batch must draw whatever it is.
+    let mut needs_redraw = true;
 
     loop {
         // Block for at least one event, then drain everything queued behind it.
@@ -210,38 +212,55 @@ async fn main() -> anyhow::Result<()> {
         if batch.quit {
             break;
         }
+        // Anything that can change what the frame looks like arms a redraw.
+        // With all-motion mouse reporting, a bare mouse move otherwise costs a
+        // full repaint, and `columns_for` reformats every object each frame.
+        needs_redraw |= batch.store_dirty;
         if let Some(e) = batch.errors.last() {
             last_error = Some(e.clone());
+            needs_redraw = true;
         }
         if let Some((_, s)) = batch.status_changes.last() {
             status = *s;
+            needs_redraw = true;
         }
 
         // Read the store snapshot into a local Vec before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
-        //
-        // Redraw on every batch regardless of `batch.store_dirty`: input alone
-        // can change the selection. The "10,000 deltas cost one repaint"
-        // property comes from draining the channel before drawing, not from
-        // this flag.
         let objects = store.read().await.objects(&pod_gvk);
 
         let mut quit = false;
         for input in &batch.inputs {
+            // A resize changes the layout but produces no action, so it has to
+            // arm the redraw itself.
+            if matches!(input, crossterm::event::Event::Resize(_, _)) {
+                needs_redraw = true;
+            }
             // `hits` reflects the PREVIOUS frame's layout: input always
             // arrives after the last draw, so on the very first iteration the
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
             match action_for(input, &hits) {
                 Action::Quit => quit = true,
-                Action::SelectRow(i) => selected = i.min(objects.len().saturating_sub(1)),
-                Action::ScrollBy(d) => selected = apply_selection(selected, d, objects.len()),
-                Action::SortByColumn(_) | Action::None => {}
+                Action::SelectRow(i) => {
+                    selected = i.min(objects.len().saturating_sub(1));
+                    needs_redraw = true;
+                }
+                Action::ScrollBy(d) => {
+                    selected = apply_selection(selected, d, objects.len());
+                    needs_redraw = true;
+                }
+                Action::SortByColumn(_) => needs_redraw = true,
+                Action::None => {}
             }
         }
         if quit {
             break;
         }
+        if !needs_redraw {
+            continue;
+        }
+        needs_redraw = false;
 
         view.state.select(if objects.is_empty() {
             None
