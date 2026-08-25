@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Exported logs from local runs
+/logs-export/
+*.log
+
+# Local cluster / kubeconfig artifacts — never commit cluster credentials
+kubeconfig
+*.kubeconfig
+.kube/
