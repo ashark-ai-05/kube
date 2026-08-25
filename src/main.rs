@@ -98,6 +98,22 @@ fn namespace_choice_from_label(label: &str) -> Option<String> {
     }
 }
 
+/// Name of the cluster a switch is connecting to, if any.
+///
+/// While a connect is in flight the active cluster is still the OLD one —
+/// `switch_cluster` only tears down and activates the new one on success —
+/// so a status bar that reads only `registry.active()` shows no sign of an
+/// attempt in progress. This must scan for a `ConnectionState::Connecting`
+/// entry instead; the registry is the only source of truth for connection
+/// state, since `SessionEvent`s are emitted after the session lock is
+/// released and can arrive out of order across concurrent switches.
+fn connecting_cluster_name(entries: &[ClusterEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| matches!(e.state, ConnectionState::Connecting))
+        .map(|e| e.id.0.clone())
+}
+
 /// Resolve a filtered-list index back to the item it actually refers to.
 ///
 /// `HitTarget::PickerRow` and `Picker::selected` both carry an index into
@@ -520,14 +536,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             )
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
-        // A connect in flight leaves the active cluster as the OLD one until
-        // it succeeds (Task 8: teardown only happens on success), so
-        // `context_name` alone shows no sign of the attempt. Scanning the
-        // registry for a `Connecting` entry is what makes it visible.
-        let connecting_name = entries
-            .iter()
-            .find(|e| matches!(e.state, ConnectionState::Connecting))
-            .map(|e| e.id.0.clone());
+        let connecting_name = connecting_cluster_name(&entries);
         // Read the store snapshot into a local Vec before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
         let objects = store.read().await.objects(&pod_gvk);
@@ -976,6 +985,30 @@ mod tests {
         }
 
         #[test]
+        fn connecting_cluster_name_finds_the_connecting_entry_even_though_a_different_one_is_active()
+         {
+            // The whole point: the entry actually being switched TO is
+            // "dev", not whatever the caller might assume is active. A
+            // status bar keyed off `registry.active()` alone would show no
+            // sign of this at all.
+            let entries = vec![
+                entry("prod", ConnectionState::Connected),
+                entry("dev", ConnectionState::Connecting),
+                entry("staging", ConnectionState::Disconnected),
+            ];
+            assert_eq!(connecting_cluster_name(&entries), Some("dev".to_string()));
+        }
+
+        #[test]
+        fn connecting_cluster_name_is_none_when_nothing_is_connecting() {
+            let entries = vec![
+                entry("prod", ConnectionState::Connected),
+                entry("staging", ConnectionState::Disconnected),
+            ];
+            assert_eq!(connecting_cluster_name(&entries), None);
+        }
+
+        #[test]
         fn resolve_picker_choice_maps_the_filtered_index_not_the_raw_one() {
             // Matches picker.rs's own non-vacuous fixture: "wsdc" matches only
             // the item at unfiltered index 4, rendered at filtered position 0.
@@ -1081,13 +1114,33 @@ mod tests {
 
         #[test]
         fn the_overlay_paints_over_the_table_and_status_drawn_before_it() {
-            // Draw order is ribbon, table, status, THEN the overlay last. If
-            // the overlay were drawn first instead, the table's own row text
-            // (drawn afterward, over the same region) would overwrite the
-            // picker's glyphs — HitRegistry's z-index still resolves
-            // PickerRow correctly either way (z=1 always beats z=0
-            // regardless of draw order), so this must be a VISUAL check, not
-            // a hit-resolution one, to actually catch that mutation.
+            // Draw order is ribbon, table, status, THEN the overlay last.
+            //
+            // This must be a VISUAL check, not a hit-resolution one:
+            // HitRegistry resolves PickerRow over TableRow by Z-INDEX alone
+            // (z=1 beats z=0 regardless of registration order — see
+            // picker.rs's own adversarial test), so no hit-test can ever
+            // distinguish "overlay drawn last" from "overlay drawn first".
+            //
+            // It must also target a coordinate PROVEN to actually get
+            // overwritten by whichever widget draws second, not merely one
+            // that happens to sit inside the overlapping rect: `render_table`
+            // sets no background style on its own `Block`, and `Row`/`Cell`
+            // rendering writes only the cells its text glyphs occupy — a
+            // short label like the picker's own title can survive a wrong
+            // draw order purely by chance, landing in a gap between column
+            // glyphs, which is a vacuous fixture Task 9 was warned about
+            // ("would a wrong implementation give a different answer with
+            // this data?"). Empirically dumping the buffer under the
+            // reversed order confirmed exactly that for the title text, but
+            // also that a data row's STATUS cell ("Unknown", stub pods have
+            // no real status) DOES land on and overwrite the picker's own
+            // border dashes at (x=48, y=5) for this geometry — 30 pods so
+            // the table has enough rows to reach the picker's row, and pod-3
+            // (drawn at y=5, the picker's own top border row given
+            // `centered` on an 80x24 frame) puts its STATUS column
+            // (columns_for: NAME Fill(2), READY 7, STATUS 14 — starting at
+            // x=48 after NAME+READY+spacing) squarely inside it.
             let pods: Vec<Arc<DynamicObject>> = (0..30)
                 .map(|i| pod_in(&format!("pod-{i}"), "default"))
                 .collect();
@@ -1125,16 +1178,17 @@ mod tests {
             .unwrap();
 
             let buf = term.backend().buffer();
-            let mut text = String::new();
-            for y in 0..24u16 {
-                for x in 0..80u16 {
-                    text.push_str(buf[(x, y)].symbol());
-                }
-                text.push('\n');
-            }
+            let row5: String = (0..80u16)
+                .map(|x| buf[(x, 5)].symbol().to_string())
+                .collect();
             assert!(
-                text.contains("Clusters"),
-                "the picker's title must survive on top of the table drawn beneath it:\n{text}"
+                !row5.contains("Unknown"),
+                "a data row's STATUS cell must not bleed through the picker's own \
+                 border row — the overlay was not drawn last:\n{row5}"
+            );
+            assert!(
+                row5.contains("Clusters"),
+                "the picker's title must still be present:\n{row5}"
             );
 
             let mut found_picker_row = false;
