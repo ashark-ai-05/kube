@@ -3,7 +3,7 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube_tui::app::Overlay;
-use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
+use kube_tui::app::event::{AppEvent, Coalesced, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
 use kube_tui::app::session::{
     Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
@@ -154,6 +154,55 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
         .get(filtered_index)
         .and_then(|&real| picker.items.get(real))
         .map(|item| item.label.clone())
+}
+
+/// The error the status bar should show after this batch of events.
+///
+/// Nothing used to clear `last_error`, so a single watch blip on prod pinned
+/// an error for the rest of the session: switch to dev, watch it connect and
+/// stream 250 pods, and the bar still reads `dev · … · 250 items · live`
+/// beside prod's dead error — permanently, and permanently suppressing the
+/// all-namespaces hint with it (`status.rs`).
+///
+/// Two things retire an error, both meaning "whatever went wrong is no
+/// longer what is happening": a switch that actually connected, and this
+/// kind's watch reporting itself synced. The kind is checked because
+/// `status_changes` carries every watched kind, and another kind's health
+/// says nothing about this one's error.
+///
+/// Clearing happens BEFORE new errors are applied, so an error arriving in
+/// the same batch as a sync still shows. `coalesce` keeps errors and status
+/// changes in separate lists and their relative order is lost, so this is a
+/// deliberate choice between two risks: showing a resolved error one batch
+/// too long, or hiding a live one. Only the first is recoverable.
+fn next_error(
+    previous: Option<String>,
+    batch: &Coalesced,
+    gvk: &GroupVersionKind,
+) -> Option<String> {
+    let mut error = previous;
+
+    let connected = batch
+        .session_events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Connected(_)));
+    let synced = batch
+        .status_changes
+        .iter()
+        .any(|(k, s)| k == gvk && *s == WatchStatus::Synced);
+    if connected || synced {
+        error = None;
+    }
+
+    for e in &batch.session_events {
+        if let SessionEvent::ConnectFailed { id, reason } = e {
+            error = Some(format!("connecting to {}: {reason}", id.0));
+        }
+    }
+    if let Some(e) = batch.errors.last() {
+        error = Some(e.clone());
+    }
+    error
 }
 
 /// Everything one frame needs out of the store, read in a single lock
@@ -521,8 +570,12 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // With all-motion mouse reporting, a bare mouse move otherwise costs a
         // full repaint, and `columns_for` reformats every object each frame.
         needs_redraw |= batch.store_dirty;
-        if let Some(e) = batch.errors.last() {
-            last_error = Some(e.clone());
+        // Errors are raised AND retired here: see `next_error`. Without the
+        // retiring half a single blip pins an error across every subsequent
+        // switch.
+        let updated_error = next_error(last_error.clone(), &batch, &pod_gvk);
+        if updated_error != last_error {
+            last_error = updated_error;
             needs_redraw = true;
         }
         // The status itself is read back off the store below, not carried in a
@@ -536,11 +589,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // finishes — which is the entire reason it is announced as an event.
         if !batch.session_events.is_empty() {
             needs_redraw = true;
-        }
-        for e in &batch.session_events {
-            if let SessionEvent::ConnectFailed { id, reason } = e {
-                last_error = Some(format!("connecting to {}: {reason}", id.0));
-            }
         }
 
         // A cluster switch REPLACES the store and changes which cluster is
@@ -1017,6 +1065,133 @@ mod tests {
                 vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
                 "all-namespaces sentinel first, then distinct namespaces sorted"
             );
+        }
+
+        // --- Errors are retired as well as raised ---
+
+        fn gvk() -> GroupVersionKind {
+            GroupVersionKind::gvk("", "v1", "Pod")
+        }
+
+        /// A stale error from a cluster the user has since left.
+        fn stale() -> Option<String> {
+            Some("watch Pod: connection reset by peer".to_string())
+        }
+
+        #[test]
+        fn a_successful_switch_retires_the_previous_clusters_error() {
+            // The reported failure: a blip on prod pins an error; switch to
+            // dev, which connects fine and streams 250 pods, and prod's error
+            // is still on the bar — for ever, since nothing ever cleared it.
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::Connected(ClusterId(
+                "dev".to_string(),
+            )))]);
+            assert_eq!(
+                next_error(stale(), &batch, &gvk()),
+                None,
+                "an error raised before a switch must not be visible after it"
+            );
+        }
+
+        #[test]
+        fn a_watch_reporting_itself_synced_retires_a_stale_error() {
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: gvk(),
+                status: WatchStatus::Synced,
+            }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), None);
+        }
+
+        #[test]
+        fn another_kinds_sync_does_not_retire_this_kinds_error() {
+            // `status_changes` carries every watched kind. A Deployment watch
+            // coming up says nothing about why the Pod watch failed, and
+            // clearing on it would hide a live error.
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                status: WatchStatus::Synced,
+            }]);
+            assert_eq!(
+                next_error(stale(), &batch, &gvk()),
+                stale(),
+                "only the displayed kind's own health may retire its error"
+            );
+        }
+
+        #[test]
+        fn a_watch_that_is_merely_reconnecting_does_not_retire_the_error() {
+            // Reconnecting is not recovery. Clearing here would blank the
+            // explanation at precisely the moment it is most wanted.
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: gvk(),
+                status: WatchStatus::Reconnecting,
+            }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
+        }
+
+        #[test]
+        fn an_error_arriving_with_a_sync_still_shows() {
+            // `coalesce` loses the relative order of errors and status
+            // changes, so this is the deliberate tie-break: never hide a live
+            // error, at the cost of possibly showing a resolved one one batch
+            // longer.
+            let batch = coalesce(vec![
+                AppEvent::WatchStatus {
+                    gvk: gvk(),
+                    status: WatchStatus::Synced,
+                },
+                AppEvent::Error("forbidden: pods is denied".to_string()),
+            ]);
+            assert_eq!(
+                next_error(None, &batch, &gvk()),
+                Some("forbidden: pods is denied".to_string())
+            );
+        }
+
+        #[test]
+        fn a_failed_connect_becomes_the_visible_error_naming_the_cluster() {
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::ConnectFailed {
+                id: ClusterId("dev".to_string()),
+                reason: "no route to host".to_string(),
+            })]);
+            let e = next_error(None, &batch, &gvk()).expect("a failed connect must be reported");
+            assert!(e.contains("dev"), "must name the cluster; got {e}");
+            assert!(e.contains("no route to host"), "got {e}");
+        }
+
+        #[test]
+        fn a_failed_connect_in_the_same_batch_as_a_sync_still_shows() {
+            // A switch that fails while the CURRENT cluster's watch is
+            // happily syncing: the sync is the old cluster's, and must not
+            // swallow the report that the new one is unreachable.
+            let batch = coalesce(vec![
+                AppEvent::WatchStatus {
+                    gvk: gvk(),
+                    status: WatchStatus::Synced,
+                },
+                AppEvent::Session(SessionEvent::ConnectFailed {
+                    id: ClusterId("dev".to_string()),
+                    reason: "no route to host".to_string(),
+                }),
+            ]);
+            let e = next_error(None, &batch, &gvk()).expect("a failed connect must be reported");
+            assert!(e.contains("no route to host"), "got {e}");
+        }
+
+        #[test]
+        fn a_batch_with_nothing_relevant_leaves_the_error_alone() {
+            // Mouse movement must not clear a real error off the bar.
+            let batch = coalesce(vec![AppEvent::StoreChanged { gvk: gvk() }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
+        }
+
+        #[test]
+        fn a_connecting_announcement_does_not_retire_the_error() {
+            // Only a connect that SUCCEEDED means the problem is behind us.
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::Connecting(
+                ClusterId("dev".to_string()),
+            ))]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
         }
 
         #[test]
