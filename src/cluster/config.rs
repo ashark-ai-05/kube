@@ -1,3 +1,4 @@
+use crate::cluster::auth::{AuthMethod, auth_method_for};
 use anyhow::Context as _;
 use kube::config::Kubeconfig;
 
@@ -8,19 +9,31 @@ pub struct ContextInfo {
     pub cluster: String,
     pub namespace: Option<String>,
     pub is_current: bool,
+    pub auth: AuthMethod,
 }
 
-fn flatten(kc: Kubeconfig) -> Vec<ContextInfo> {
+/// Flatten a kubeconfig's contexts for display, resolving each one's auth
+/// method by name. Takes `&Kubeconfig` (rather than consuming it) so the
+/// auth lookup can borrow `auth_infos` while contexts are also read.
+fn flatten(kc: &Kubeconfig) -> Vec<ContextInfo> {
     let current = kc.current_context.clone().unwrap_or_default();
     kc.contexts
-        .into_iter()
+        .iter()
         .map(|named| {
-            let ctx = named.context;
+            let ctx = named.context.as_ref();
+            let user = ctx.and_then(|c| c.user.clone());
+            let auth = match user {
+                Some(u) => auth_method_for(kc, &u),
+                None => AuthMethod::None,
+            };
             ContextInfo {
                 is_current: named.name == current,
-                name: named.name,
-                cluster: ctx.as_ref().map(|c| c.cluster.clone()).unwrap_or_default(),
-                namespace: ctx.and_then(|c| c.namespace).filter(|n| !n.is_empty()),
+                name: named.name.clone(),
+                cluster: ctx.map(|c| c.cluster.clone()).unwrap_or_default(),
+                namespace: ctx
+                    .and_then(|c| c.namespace.clone())
+                    .filter(|n| !n.is_empty()),
+                auth,
             }
         })
         .collect()
@@ -30,13 +43,13 @@ fn flatten(kc: Kubeconfig) -> Vec<ContextInfo> {
 /// context handling is testable without touching the filesystem.
 pub fn contexts_from_yaml(yaml: &str) -> anyhow::Result<Vec<ContextInfo>> {
     let kc = Kubeconfig::from_yaml(yaml).context("parsing kubeconfig")?;
-    Ok(flatten(kc))
+    Ok(flatten(&kc))
 }
 
 /// Load contexts from the standard kubeconfig location(s).
 pub fn load_contexts() -> anyhow::Result<Vec<ContextInfo>> {
     let kc = Kubeconfig::read().context("reading kubeconfig")?;
-    Ok(flatten(kc))
+    Ok(flatten(&kc))
 }
 
 /// Build a client from the current context.
@@ -77,7 +90,14 @@ contexts:
     cluster: dev-cluster
     user: dev-user
     namespace: ""
-users: []
+users:
+- name: prod-user
+  user:
+    client-certificate-data: Zm9v
+    client-key-data: YmFy
+- name: dev-user
+  user:
+    token: abcdef123456
 "#;
 
     #[test]
@@ -87,6 +107,26 @@ users: []
         assert_eq!(ctxs[0].name, "prod-eu");
         assert_eq!(ctxs[1].name, "dev");
         assert_eq!(ctxs[2].name, "empty-ns");
+    }
+
+    #[test]
+    fn resolves_each_context_auth_method_from_its_user() {
+        let ctxs = contexts_from_yaml(SAMPLE).unwrap();
+        assert_eq!(
+            ctxs[0].auth,
+            AuthMethod::ClientCert,
+            "prod-eu uses prod-user, a client-certificate user"
+        );
+        assert_eq!(
+            ctxs[1].auth,
+            AuthMethod::Token,
+            "dev uses dev-user, a token user"
+        );
+        assert_eq!(
+            ctxs[2].auth,
+            AuthMethod::Token,
+            "empty-ns also uses dev-user, so shares its auth method"
+        );
     }
 
     #[test]
