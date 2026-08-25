@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 pub struct TableView {
     pub state: TableState,
-    pub scroll_offset: usize,
 }
 
 impl Default for TableView {
@@ -23,7 +22,6 @@ impl TableView {
     pub fn new() -> Self {
         Self {
             state: TableState::default().with_selected(Some(0)),
-            scroll_offset: 0,
         }
     }
 }
@@ -44,6 +42,10 @@ pub fn phase_style(phase: &str) -> Style {
 /// Rows are registered against the same geometry ratatui uses to lay them out:
 /// the block border takes one line, the header one more, so the first data row
 /// begins at `area.y + 2`.
+///
+/// Zones map screen rows to the *visible window*, not to absolute object
+/// indices: ratatui scrolls `TableState::offset` to keep the selection on
+/// screen, so the object drawn at `area.y + 2` is `offset`, not `0`.
 pub fn render_table(
     f: &mut Frame,
     area: Rect,
@@ -105,10 +107,14 @@ pub fn render_table(
         );
     }
 
+    // Read AFTER rendering: ratatui adjusts the offset during render to bring
+    // the selection into view, so reading it beforehand yields the stale value
+    // and puts every zone one scroll behind what is on screen.
+    let offset = view.state.offset();
     let first_row_y = area.y.saturating_add(2);
     let last_y = area.y + area.height.saturating_sub(1);
-    for (i, _) in objects.iter().enumerate() {
-        let y = first_row_y.saturating_add(i as u16);
+    for (k, _) in objects.iter().skip(offset).enumerate() {
+        let y = first_row_y.saturating_add(k as u16);
         if y >= last_y {
             break;
         }
@@ -120,7 +126,7 @@ pub fn render_table(
                 height: 1,
             },
             0,
-            HitTarget::TableRow(i),
+            HitTarget::TableRow(offset + k),
         );
     }
 }
@@ -286,6 +292,43 @@ mod tests {
                 "clicking the row drawn at y={y} must select index {i}, not another row"
             );
         }
+    }
+
+    #[test]
+    fn hit_zones_follow_the_scrolled_viewport() {
+        // ratatui scrolls TableState::offset to keep the selection visible.
+        // Registering zones by absolute object index makes every row past the
+        // first screenful select the wrong pod.
+        let pods: Vec<_> = (0..40)
+            .map(|i| pod(&format!("pod-{i:02}"), "Running"))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut view = TableView::new();
+        view.state.select(Some(30));
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
+            .unwrap();
+
+        let offset = view.state.offset();
+        assert!(
+            offset > 0,
+            "expected the viewport to have scrolled, got offset {offset}"
+        );
+
+        // The pod drawn on the first data row must be the one a click there selects.
+        let buf = term.backend().buffer();
+        let first_row: String = (0..60).map(|x| buf[(x, 2)].symbol()).collect();
+        let expected = format!("pod-{offset:02}");
+        assert!(
+            first_row.contains(&expected),
+            "expected {expected} at y=2, got: {first_row}"
+        );
+        assert_eq!(
+            hits.hit(5, 2),
+            Some(&HitTarget::TableRow(offset)),
+            "clicking the first visible row must select the pod drawn there"
+        );
     }
 
     #[test]
