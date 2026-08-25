@@ -43,32 +43,57 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Increments a counter when dropped. Aborting a task drops its future,
+    /// so this fires on cancellation but not while the task is merely sleeping.
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
-    async fn abort_all_stops_running_tasks_and_reports_the_count() {
-        let ran = Arc::new(AtomicUsize::new(0));
+    async fn abort_all_actually_cancels_the_tasks_it_drops() {
+        let cancelled = Arc::new(AtomicUsize::new(0));
         let mut handles = WatchHandles::new();
 
         for _ in 0..3 {
-            let ran = ran.clone();
+            let signal = DropSignal(cancelled.clone());
             handles.push(tokio::spawn(async move {
-                // Long enough that abort lands first.
+                // Held across the await, so it is dropped only if the task
+                // is cancelled — not merely because it is still sleeping.
+                let _signal = signal;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                ran.fetch_add(1, Ordering::SeqCst);
             }));
         }
 
-        assert_eq!(handles.len(), 3);
+        // Let each task reach its await point and take ownership of its signal.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "nothing should be cancelled yet"
+        );
+
         assert_eq!(handles.abort_all(), 3);
         assert!(
             handles.is_empty(),
             "aborted handles must not linger in the registry"
         );
 
-        tokio::task::yield_now().await;
+        // Cancellation is processed asynchronously; give the runtime a chance.
+        for _ in 0..10 {
+            if cancelled.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
         assert_eq!(
-            ran.load(Ordering::SeqCst),
-            0,
-            "no task should have run to completion"
+            cancelled.load(Ordering::SeqCst),
+            3,
+            "every watch must actually be cancelled, not just forgotten"
         );
     }
 
