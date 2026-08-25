@@ -1,5 +1,7 @@
 use crate::ui::hit::{HitRegistry, HitTarget};
-use crossterm::event::{Event as CtEvent, KeyCode, MouseButton, MouseEventKind};
+use crossterm::event::{
+    Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 
 /// Scroll wheel step, in rows. Matches typical terminal conventions.
 const SCROLL_STEP: i32 = 3;
@@ -38,7 +40,8 @@ pub fn action_for(event: &CtEvent, hits: &HitRegistry) -> Action {
             },
             _ => Action::None,
         },
-        CtEvent::Key(k) => match k.code {
+        CtEvent::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
             KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -49,12 +52,16 @@ pub fn action_for(event: &CtEvent, hits: &HitRegistry) -> Action {
 }
 
 /// Move a selection index by `delta`, clamped to the list.
+///
+/// Uses `i128` intermediates so that no `usize` input can wrap or panic,
+/// including values above `i64::MAX`.
 pub fn apply_selection(current: usize, delta: i32, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    let next = current as i64 + delta as i64;
-    next.clamp(0, len as i64 - 1) as usize
+    let last = (len - 1) as i128;
+    let next = current as i128 + delta as i128;
+    next.clamp(0, last) as usize
 }
 
 #[cfg(test)]
@@ -124,6 +131,15 @@ mod tests {
             code,
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn key_kind(code: KeyCode, kind: KeyEventKind) -> CtEvent {
+        CtEvent::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind,
             state: KeyEventState::NONE,
         })
     }
@@ -216,5 +232,60 @@ mod tests {
             0,
             "an empty table must not index out of bounds"
         );
+    }
+
+    #[test]
+    fn key_release_events_are_ignored_so_one_press_acts_once() {
+        // Windows and the Kitty keyboard protocol emit Press AND Release for a
+        // single keystroke. Acting on both moves the selection two rows per press.
+        let r = registry();
+        assert_eq!(
+            action_for(&key_kind(KeyCode::Char('j'), KeyEventKind::Press), &r),
+            Action::ScrollBy(1)
+        );
+        assert_eq!(
+            action_for(&key_kind(KeyCode::Char('j'), KeyEventKind::Release), &r),
+            Action::None
+        );
+        assert_eq!(
+            action_for(&key_kind(KeyCode::Char('q'), KeyEventKind::Release), &r),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_since_raw_mode_disables_the_signal() {
+        let ev = CtEvent::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(action_for(&ev, &registry()), Action::Quit);
+    }
+
+    #[test]
+    fn only_the_left_button_selects() {
+        let r = registry();
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            let ev = CtEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(
+                action_for(&ev, &r),
+                Action::None,
+                "{button:?} must not select a row"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_does_not_panic_at_the_extremes_of_usize() {
+        assert_eq!(apply_selection(usize::MAX, 1, usize::MAX), usize::MAX - 1);
+        assert_eq!(apply_selection(0, i32::MIN, 10), 0);
+        assert_eq!(apply_selection(usize::MAX, i32::MAX, 10), 9);
     }
 }
