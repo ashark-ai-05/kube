@@ -4,7 +4,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
-use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args};
+use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
 use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
@@ -113,22 +113,33 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     };
 
     let contexts = cluster::load_contexts().unwrap_or_default();
-    let current_context = contexts
+    let (context_name, context_namespace, namespace_from_context) = contexts
         .iter()
         .find(|c| c.is_current)
         .map(|c| {
-            (
-                c.name.clone(),
-                c.namespace.clone().unwrap_or_else(|| "default".into()),
-            )
+            let (ns, was_explicit) = c
+                .namespace
+                .clone()
+                .map(|ns| (ns, true))
+                .unwrap_or_else(|| ("default".into(), false));
+            (c.name.clone(), ns, was_explicit)
         })
-        .unwrap_or_else(|| ("unknown".into(), "default".into()));
+        .unwrap_or_else(|| ("unknown".into(), "default".into(), false));
 
-    // Resolve the CLI scope to a namespace for the watch and a display string for the UI.
-    let (watch_namespace, display_namespace) = match cli_scope {
-        NamespaceScope::One(ns) => (Some(ns.clone()), ns),
-        NamespaceScope::All => (None, "all namespaces".into()),
-        NamespaceScope::FromContext => (Some(current_context.1.clone()), current_context.1.clone()),
+    // Resolve the CLI scope to a namespace for the watch, display string for UI, and fallback flag.
+    // The fallback flag is true when we're watching the "default" namespace because the context
+    // didn't specify a namespace (not because the user chose it explicitly or via -n).
+    let (watch_namespace, display_namespace, is_fallback_namespace) = match cli_scope {
+        NamespaceScope::One(ns) => (Some(ns.clone()), ns, false),
+        NamespaceScope::All => (None, "all namespaces".into(), false),
+        NamespaceScope::FromContext => {
+            let is_fallback = !namespace_from_context && context_namespace == "default";
+            (
+                Some(context_namespace.clone()),
+                context_namespace,
+                is_fallback,
+            )
+        }
     };
 
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
@@ -307,14 +318,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             let chunks =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(f.area());
             render_table(f, chunks[0], &objects, &pod_gvk, &mut view, &mut hits);
+            let show_hint = should_hint_all_namespaces(is_fallback_namespace, objects.len());
             render_status(
                 f,
                 chunks[1],
-                &current_context.0,
+                &context_name,
                 &display_namespace,
                 status,
                 objects.len(),
                 last_error.as_deref(),
+                show_hint,
                 &mut hits,
             );
         })?;

@@ -27,6 +27,7 @@ pub fn render_status(
     status: WatchStatus,
     count: usize,
     error: Option<&str>,
+    show_all_namespaces_hint: bool,
     hits: &mut HitRegistry,
 ) {
     let (label, style) = status_label(status);
@@ -44,6 +45,12 @@ pub fn render_status(
     if let Some(e) = error {
         spans.push(Span::styled("  ", Style::default()));
         spans.push(Span::styled(e.to_string(), Style::default().fg(theme::ERR)));
+    } else if show_all_namespaces_hint {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            "no pods here — try -A for all namespaces",
+            Style::default().fg(theme::MUTED),
+        ));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -62,7 +69,7 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             render_status(
-                f, area, "prod-eu", "payments", status, count, error, &mut hits,
+                f, area, "prod-eu", "payments", status, count, error, false, &mut hits,
             );
         })
         .unwrap();
@@ -129,6 +136,7 @@ mod tests {
                 WatchStatus::Synced,
                 42,
                 None,
+                false,
                 &mut hits,
             );
         })
@@ -136,5 +144,90 @@ mod tests {
         let buf = term.backend().buffer();
         let text: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         assert!(text.contains("all namespaces"), "got: {text}");
+    }
+
+    #[test]
+    fn shows_hint_when_fallback_namespace_is_empty() {
+        // When watching default namespace (fallback) with zero items, show hint
+        let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_status(
+                f,
+                area,
+                "prod-eu",
+                "default",
+                WatchStatus::Synced,
+                0,
+                None,
+                true,
+                &mut hits,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..120).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(
+            text.contains("try -A"),
+            "hint should appear when default namespace is empty; got: {text}"
+        );
+    }
+
+    #[test]
+    fn hides_hint_when_namespace_has_items() {
+        // No hint when there are items in the namespace, even if was_fallback
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_status(
+                f,
+                area,
+                "prod-eu",
+                "default",
+                WatchStatus::Synced,
+                5,
+                None,
+                false,
+                &mut hits,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(
+            !text.contains("try -A"),
+            "hint should not appear when there are items; got: {text}"
+        );
+    }
+
+    #[test]
+    fn hides_hint_when_error_is_present() {
+        // Error message takes precedence over hint
+        let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_status(
+                f,
+                area,
+                "prod-eu",
+                "default",
+                WatchStatus::Failed,
+                0,
+                Some("forbidden"),
+                true,
+                &mut hits,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..120).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(text.contains("forbidden"), "error should appear");
+        assert!(
+            !text.contains("try -A"),
+            "hint should not appear when there's an error; got: {text}"
+        );
     }
 }

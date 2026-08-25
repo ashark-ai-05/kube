@@ -31,6 +31,16 @@ pub enum CliOutcome {
     Error(String),
 }
 
+/// Decide whether to show the "try -A for all namespaces" hint.
+///
+/// Shows the hint when the namespace was chosen via the default fallback (not
+/// explicitly set in kubeconfig or via `-n` flag) AND the watch has zero items.
+/// This helps users understand why their table appears empty when they're watching
+/// the "default" namespace on a cluster where default is empty.
+pub fn should_hint_all_namespaces(was_fallback: bool, item_count: usize) -> bool {
+    was_fallback && item_count == 0
+}
+
 /// Parse command-line arguments for namespace selection.
 ///
 /// Takes an iterator of string arguments (typically `std::env::args().skip(1)`).
@@ -192,5 +202,21 @@ mod tests {
             CliOutcome::Run(NamespaceScope::All),
             "-A always wins over -n regardless of order"
         );
+    }
+
+    #[test]
+    fn hint_shows_only_on_fallback_with_zero_items() {
+        // Hint should show: fallback to default, no items
+        assert!(should_hint_all_namespaces(true, 0));
+
+        // No hint: fallback but there are items (user knows namespace is not empty)
+        assert!(!should_hint_all_namespaces(true, 1));
+        assert!(!should_hint_all_namespaces(true, 100));
+
+        // No hint: not a fallback, even with zero items (user explicitly chose this namespace)
+        assert!(!should_hint_all_namespaces(false, 0));
+
+        // No hint: not a fallback and has items
+        assert!(!should_hint_all_namespaces(false, 1));
     }
 }
