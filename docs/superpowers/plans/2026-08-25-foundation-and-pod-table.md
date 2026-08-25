@@ -902,7 +902,7 @@ pub fn auth_method_for(kc: &Kubeconfig, user_name: &str) -> AuthMethod {
 }
 
 /// Options controlling how a client is built.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
     /// Kubeconfig files to load and merge, in precedence order.
     pub kubeconfig_paths: Vec<PathBuf>,
@@ -913,11 +913,8 @@ pub struct ConnectOptions {
     pub accept_invalid_certs: bool,
 }
 
-impl Default for ConnectOptions {
-    fn default() -> Self {
-        Self { kubeconfig_paths: Vec::new(), context: None, accept_invalid_certs: false }
-    }
-}
+// Derived rather than hand-written: every field's default is its type's
+// default, and clippy::derivable_impls rejects the manual form under -D warnings.
 
 /// Resolve which kubeconfig files to read, following KUBECONFIG semantics:
 /// a colon-separated list, falling back to ~/.kube/config.
