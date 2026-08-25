@@ -1,15 +1,38 @@
-use ratatui::layout::Rect;
-use ratatui::Frame;
 use crate::ui::hit::{HitRegistry, HitTarget};
+use crate::ui::theme;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::widgets::Block;
 
 pub const RIBBON_WIDTH: u16 = 1;
 
+/// Reserve the leftmost column for the ribbon.
 pub fn split_ribbon(area: Rect) -> (Rect, Rect) {
-    todo!()
+    let ribbon_w = RIBBON_WIDTH.min(area.width);
+    let ribbon = Rect { x: area.x, y: area.y, width: ribbon_w, height: area.height };
+    let rest = Rect {
+        x: area.x.saturating_add(ribbon_w),
+        y: area.y,
+        width: area.width.saturating_sub(ribbon_w),
+        height: area.height,
+    };
+    (ribbon, rest)
 }
 
+/// Paint the cluster spine.
+///
+/// With twenty-odd clusters, "which cluster am I in?" is the question that
+/// matters and the one people get wrong. A persistent colour answers it
+/// peripherally, without reading anything.
 pub fn render_ribbon(f: &mut Frame, area: Rect, cluster: Option<&str>, hits: &mut HitRegistry) {
-    todo!()
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let color = cluster.map(theme::cluster_hue).unwrap_or(theme::DUSK);
+    let block = Block::default().style(Style::default().fg(color).bg(color));
+    f.render_widget(block, area);
+    hits.push(area, 0, HitTarget::Ribbon);
 }
 
 #[cfg(test)]
@@ -17,7 +40,6 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use crate::ui::theme;
 
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect { Rect { x, y, width: w, height: h } }
 
