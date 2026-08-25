@@ -45,9 +45,9 @@ impl HitRegistry {
                 area.width > 0
                     && area.height > 0
                     && col >= area.x
-                    && col < area.x + area.width
+                    && col < area.x.saturating_add(area.width)
                     && row >= area.y
-                    && row < area.y + area.height
+                    && row < area.y.saturating_add(area.height)
             })
             .max_by_key(|(_, z, _)| *z)
             .map(|(_, _, target)| target)
@@ -134,5 +134,20 @@ mod tests {
         let mut r = HitRegistry::new();
         r.push(rect(3, 3, 0, 0), 0, HitTarget::TableRow(1));
         assert_eq!(r.hit(3, 3), None);
+    }
+
+    #[test]
+    fn a_zone_near_the_coordinate_limit_does_not_overflow() {
+        // Rect's fields are public, so a zone can be built by struct literal
+        // without Rect::new()'s clamping. Unchecked addition panics in debug
+        // and — worse — wraps silently in release, mis-targeting the click.
+        let mut r = HitRegistry::new();
+        r.push(rect(u16::MAX - 5, 0, 100, 1), 0, HitTarget::TableRow(0));
+        assert_eq!(
+            r.hit(u16::MAX - 3, 0),
+            Some(&HitTarget::TableRow(0)),
+            "inside the zone"
+        );
+        assert_eq!(r.hit(0, 0), None, "far outside must not wrap into a hit");
     }
 }
