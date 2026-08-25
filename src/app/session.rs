@@ -46,6 +46,26 @@ pub struct Session {
     /// sources of truth to be kept in sync — found in review of this
     /// session's own first version, which is exactly what this replaced.
     pub client: Client,
+    /// The namespace scope the CURRENT watch was started with. `None` means
+    /// every namespace.
+    ///
+    /// Lives here for the same reason `client` does, and written under the
+    /// same guard: it is *derived from* the watch that is actually running,
+    /// so anything that displays the scope must read it from here rather than
+    /// keep its own copy. A separate copy goes wrong on the first switch
+    /// anyone makes — `kube -n payments` on prod, pick dev, and the switch
+    /// deliberately watches all namespaces while the status bar still reads
+    /// `dev · payments`, naming a scope no watch is using.
+    pub namespace: Option<String>,
+    /// True only when `namespace` is the "default" we fell back to because
+    /// the context named none — the condition for the "try -A" hint.
+    ///
+    /// It can only ever be set by `Session::new`: every other way the scope
+    /// changes (`switch_cluster`, `restart_watch`) is a deliberate choice by
+    /// the user, and both clear it. That makes "hint showing after the user
+    /// picked a namespace" unrepresentable rather than something each call
+    /// site has to remember to reset.
+    pub namespace_is_fallback: bool,
     /// Bumped by every switch so a slow connect that has been superseded can
     /// tell it is stale and stand down.
     pub generation: u64,
@@ -60,12 +80,22 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(registry: ClusterRegistry, client: Client) -> Self {
+    /// `namespace` is the scope the initial watch is being started with —
+    /// `None` for all namespaces. `namespace_is_fallback` is true only when
+    /// that scope is a "default" nobody actually chose.
+    pub fn new(
+        registry: ClusterRegistry,
+        client: Client,
+        namespace: Option<String>,
+        namespace_is_fallback: bool,
+    ) -> Self {
         Self {
             registry,
             handles: WatchHandles::new(),
             store: Arc::new(RwLock::new(ResourceStore::new())),
             client,
+            namespace,
+            namespace_is_fallback,
             generation: 0,
             pending: HashMap::new(),
         }
@@ -103,13 +133,14 @@ pub type SharedSession = Arc<Mutex<Session>>;
 pub async fn switch_cluster<C, F, W>(
     session: SharedSession,
     id: ClusterId,
+    namespace: Option<String>,
     tx: UnboundedSender<AppEvent>,
     connect: C,
     spawn_watches: W,
 ) where
     C: FnOnce() -> F,
     F: Future<Output = anyhow::Result<Client>>,
-    W: FnOnce(Client, SharedStore) -> JoinHandle<()>,
+    W: FnOnce(Client, SharedStore, Option<String>) -> JoinHandle<()>,
 {
     // 1. Mark the TARGET as connecting. Nothing belonging to the cluster
     //    currently on screen is touched here — see the note above.
@@ -197,10 +228,18 @@ pub async fn switch_cluster<C, F, W>(
             // it, never a client for one cluster paired with another's id.
             s.client = client.clone();
 
+            // Likewise the scope: recorded here, and handed to
+            // `spawn_watches` as the SAME value, so what the session reports
+            // and what the watch actually watches cannot disagree. Picking a
+            // cluster is a deliberate choice of scope, so any "we fell back
+            // to default" hint from startup no longer applies.
+            s.namespace = namespace.clone();
+            s.namespace_is_fallback = false;
+
             // 6. Watch the store minted just above — never the one the previous
             //    cluster's watches were writing into.
             let store = s.store.clone();
-            let handle = spawn_watches(client, store);
+            let handle = spawn_watches(client, store, namespace);
             s.handles.push(handle);
 
             s.registry.set_active(&id);
@@ -245,16 +284,22 @@ pub async fn switch_cluster<C, F, W>(
 /// **`spawn_watches` is called with the session lock held**, the same
 /// constraint as `switch_cluster`'s: it must do no more than start the watch
 /// and hand back its handle.
-pub async fn restart_watch<W>(session: SharedSession, spawn_watches: W)
+pub async fn restart_watch<W>(session: SharedSession, namespace: Option<String>, spawn_watches: W)
 where
-    W: FnOnce(Client, SharedStore) -> JoinHandle<()>,
+    W: FnOnce(Client, SharedStore, Option<String>) -> JoinHandle<()>,
 {
     let mut s = session.lock().await;
     s.handles.abort_all();
     s.store = Arc::new(RwLock::new(ResourceStore::new()));
     let store = s.store.clone();
     let client = s.client.clone();
-    let handle = spawn_watches(client, store);
+    // Recorded under the same guard as the teardown, and handed to
+    // `spawn_watches` as the same value — the session's reported scope and
+    // the watch's actual scope are one fact, not two to keep in sync. The
+    // user chose this namespace, so the startup fallback hint is done.
+    s.namespace = namespace.clone();
+    s.namespace_is_fallback = false;
+    let handle = spawn_watches(client, store, namespace);
     s.handles.push(handle);
 }
 
@@ -302,6 +347,8 @@ mod tests {
         Arc::new(Mutex::new(Session::new(
             ClusterRegistry::from_contexts(contexts),
             offline_client(),
+            None,
+            false,
         )))
     }
 
@@ -412,9 +459,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
 
@@ -450,7 +498,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let recorder = {
             let seen = seen.clone();
-            move |_client, store: SharedStore| {
+            move |_client, store: SharedStore, _ns| {
                 *seen.lock().expect("uncontended in a test") = Some(store);
                 live_watch()
             }
@@ -458,6 +506,7 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(offline_client()) },
             recorder,
@@ -488,9 +537,10 @@ mod tests {
             switch_cluster(
                 session.clone(),
                 id("dev"),
+                None,
                 tx.clone(),
                 || async { Ok(offline_client()) },
-                |_, _| live_watch(),
+                |_, _, _| live_watch(),
             )
             .await;
         }
@@ -509,7 +559,7 @@ mod tests {
 
         let watcher_spawn = {
             let spawned = spawned.clone();
-            move |_client, _store| {
+            move |_client, _store, _ns| {
                 *spawned.lock().expect("uncontended in a test") = true;
                 live_watch()
             }
@@ -517,6 +567,7 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Err(anyhow::anyhow!("no route to host")) },
             watcher_spawn,
@@ -577,9 +628,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Err(anyhow::anyhow!("no route to host")) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
 
@@ -639,7 +691,10 @@ mod tests {
                 Ok(offline_client())
             }
         };
-        switch_cluster(session.clone(), id("dev"), tx, connect, |_, _| live_watch()).await;
+        switch_cluster(session.clone(), id("dev"), None, tx, connect, |_, _, _| {
+            live_watch()
+        })
+        .await;
 
         let observed = observed.lock().expect("uncontended in a test").clone();
         let (state, same_store) = observed.expect(
@@ -669,9 +724,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
 
@@ -713,13 +769,14 @@ mod tests {
                 switch_cluster(
                     session,
                     id("slow"),
+                    None,
                     tx,
                     || async move {
                         let _ = entered_tx.send(());
                         let _ = release_rx.await;
                         Ok(offline_client())
                     },
-                    move |_, _| {
+                    move |_, _, _| {
                         *slow_spawned.lock().expect("uncontended in a test") = true;
                         live_watch()
                     },
@@ -732,9 +789,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("quick"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
         let quicks_store = session.lock().await.store.clone();
@@ -789,13 +847,14 @@ mod tests {
             switch_cluster(
                 session,
                 target,
+                None,
                 tx,
                 || async move {
                     let _ = entered_tx.send(());
                     let _ = release_rx.await;
                     Ok(offline_client())
                 },
-                |_, _| live_watch(),
+                |_, _, _| live_watch(),
             )
             .await;
         });
@@ -819,9 +878,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
         let live_store = session.lock().await.store.clone();
@@ -902,9 +962,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("nope"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
 
@@ -936,9 +997,10 @@ mod tests {
         let handle: JoinHandle<()> = tokio::spawn(switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(offline_client()) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         ));
         handle.await.expect("the switch must not panic");
         assert_eq!(
@@ -963,9 +1025,10 @@ mod tests {
         switch_cluster(
             session.clone(),
             id("dev"),
+            None,
             tx,
             || async { Ok(tagged_client("dev-client")) },
-            |_, _| live_watch(),
+            |_, _, _| live_watch(),
         )
         .await;
         assert_eq!(
@@ -975,13 +1038,180 @@ mod tests {
         );
     }
 
+    /// A session started with `kube -n payments` on prod: a real namespace
+    /// scope, deliberately chosen, so any of it surviving a switch is
+    /// visible.
+    fn session_scoped_to(namespace: Option<&str>, is_fallback: bool) -> SharedSession {
+        Arc::new(Mutex::new(Session::new(
+            ClusterRegistry::from_contexts(vec![ctx("prod", true), ctx("dev", false)]),
+            offline_client(),
+            namespace.map(|s| s.to_string()),
+            is_fallback,
+        )))
+    }
+
+    #[tokio::test]
+    async fn a_switch_records_the_scope_the_new_watch_is_actually_started_with() {
+        // `kube -n payments` on prod, press c, pick dev. The switch
+        // deliberately watches ALL namespaces, so a scope tracked anywhere
+        // but here still reads `dev · payments · 412 items · live` — naming a
+        // namespace nothing is watching, over another cluster's data. First
+        // switch anyone makes.
+        let session = session_scoped_to(Some("payments"), false);
+        assert_eq!(
+            session.lock().await.namespace.as_deref(),
+            Some("payments"),
+            "sanity: the session starts on the -n scope"
+        );
+
+        let watched: Arc<StdMutex<Option<Option<String>>>> = Arc::new(StdMutex::new(None));
+        let recorder = {
+            let watched = watched.clone();
+            move |_client, _store, ns: Option<String>| {
+                *watched.lock().expect("uncontended in a test") = Some(ns);
+                live_watch()
+            }
+        };
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None, // the switch watches every namespace
+            tx,
+            || async { Ok(offline_client()) },
+            recorder,
+        )
+        .await;
+
+        assert_eq!(
+            session.lock().await.namespace,
+            None,
+            "the session must report the scope the new watch uses, not the one \
+             the previous cluster was on"
+        );
+        assert_eq!(
+            watched.lock().expect("uncontended in a test").clone(),
+            Some(None),
+            "and the watch must have been started with that same scope — one \
+             value, handed to both, so they cannot disagree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_a_namespaced_scope_records_that_namespace() {
+        // The other direction, so the test above cannot pass merely because
+        // something always writes `None`.
+        let session = session_scoped_to(None, false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            Some("kube-system".to_string()),
+            tx,
+            || async { Ok(offline_client()) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+        assert_eq!(
+            session.lock().await.namespace.as_deref(),
+            Some("kube-system")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_leaves_the_previous_scope_in_place() {
+        // Same rule as the store, the watches and the active cluster: a
+        // failed connect changes nothing. Reporting the target's scope over
+        // the cluster we are still on would misname the data on screen.
+        let session = session_scoped_to(Some("payments"), false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None,
+            tx,
+            || async { Err(anyhow::anyhow!("no route to host")) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+        assert_eq!(
+            session.lock().await.namespace.as_deref(),
+            Some("payments"),
+            "prod is still on screen, so prod's scope must still be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_clears_the_context_default_fallback_hint() {
+        // The hint says "no pods here — try -A", which only makes sense while
+        // the scope is a `default` nobody chose. Picking a cluster is a
+        // choice, and the switch watches all namespaces anyway: continuing to
+        // suggest -A there is advice to do what we already did.
+        let session = session_scoped_to(Some("default"), true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None,
+            tx,
+            || async { Ok(offline_client()) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+        assert!(
+            !session.lock().await.namespace_is_fallback,
+            "a deliberate switch must retire the startup fallback hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_records_the_scope_it_was_given() {
+        let session = session_scoped_to(Some("default"), true);
+        let watched: Arc<StdMutex<Option<Option<String>>>> = Arc::new(StdMutex::new(None));
+        let watched2 = watched.clone();
+        restart_watch(
+            session.clone(),
+            Some("payments".to_string()),
+            move |_client, _store, ns| {
+                *watched2.lock().expect("uncontended in a test") = Some(ns);
+                live_watch()
+            },
+        )
+        .await;
+
+        let s = session.lock().await;
+        assert_eq!(
+            s.namespace.as_deref(),
+            Some("payments"),
+            "the picked namespace must be what the session reports"
+        );
+        assert!(
+            !s.namespace_is_fallback,
+            "the user just chose a namespace, so the 'try -A' hint no longer applies"
+        );
+        drop(s);
+        assert_eq!(
+            watched.lock().expect("uncontended in a test").clone(),
+            Some(Some("payments".to_string())),
+            "and the watch must be started on that same namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_watch_to_all_namespaces_records_the_all_scope() {
+        let session = session_scoped_to(Some("payments"), false);
+        restart_watch(session.clone(), None, |_client, _store, _ns| live_watch()).await;
+        assert_eq!(session.lock().await.namespace, None);
+    }
+
     #[tokio::test]
     async fn restart_watch_tears_down_the_old_watch_and_replaces_the_store() {
         let session = session_over(&["prod"]);
         session.lock().await.handles.push(live_watch());
         let old_store = session.lock().await.store.clone();
 
-        restart_watch(session.clone(), |_client, _store| live_watch()).await;
+        restart_watch(session.clone(), None, |_client, _store, _ns| live_watch()).await;
 
         let s = session.lock().await;
         assert_eq!(
@@ -1002,10 +1232,12 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new(
             ClusterRegistry::from_contexts(vec![ctx("prod", true)]),
             tagged_client("prod-client"),
+            None,
+            false,
         )));
         let seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let seen2 = seen.clone();
-        restart_watch(session, move |client, _store| {
+        restart_watch(session, None, move |client, _store, _ns| {
             *seen2.lock().expect("uncontended in a test") =
                 Some(client.default_namespace().to_string());
             live_watch()
@@ -1096,7 +1328,7 @@ mod tests {
         // stale.
         let fixed_seen: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let fixed_seen2 = fixed_seen.clone();
-        restart_watch(session.clone(), move |client, _store| {
+        restart_watch(session.clone(), None, move |client, _store, _ns| {
             *fixed_seen2.lock().expect("uncontended in a test") =
                 Some(client.default_namespace().to_string());
             live_watch()
@@ -1128,13 +1360,14 @@ mod tests {
             switch_cluster(
                 session,
                 target,
+                None,
                 tx,
                 move || async move {
                     let _ = entered_tx.send(());
                     let _ = release_rx.await;
                     Ok(client)
                 },
-                |_, _| live_watch(),
+                |_, _, _| live_watch(),
             )
             .await;
         });

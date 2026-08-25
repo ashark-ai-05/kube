@@ -88,6 +88,16 @@ fn namespace_picker_items(objects: &[Arc<DynamicObject>]) -> Vec<PickerItem> {
     items
 }
 
+/// How a namespace scope reads in the status bar.
+///
+/// The inverse of `namespace_choice_from_label`: `None` is the all-namespaces
+/// scope, which has no namespace name to print. Derived from the session's
+/// scope on every frame rather than tracked alongside it, so the bar can
+/// never name a namespace no watch is actually watching.
+fn display_namespace(namespace: Option<&str>) -> &str {
+    namespace.unwrap_or(ALL_NAMESPACES_LABEL)
+}
+
 /// `None` means "all namespaces" — the sentinel label, not a real namespace.
 fn namespace_choice_from_label(label: &str) -> Option<String> {
     if label == ALL_NAMESPACES_LABEL {
@@ -347,19 +357,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| ("unknown".into(), "default".into(), false));
 
-    // Resolve the CLI scope to a namespace for the watch, display string for UI, and fallback flag.
-    // The fallback flag is true when we're watching the "default" namespace because the context
-    // didn't specify a namespace (not because the user chose it explicitly or via -n).
-    let (watch_namespace, mut display_namespace, mut is_fallback_namespace) = match cli_scope {
-        NamespaceScope::One(ns) => (Some(ns.clone()), ns, false),
-        NamespaceScope::All => (None, "all namespaces".into(), false),
+    // Resolve the CLI scope to the namespace the watch will use and whether
+    // that is a fallback. The fallback flag is true when we're watching the
+    // "default" namespace because the context didn't specify one (not because
+    // the user chose it explicitly or via -n); it is the only condition under
+    // which the "try -A" hint applies, and only until the user chooses a
+    // scope themselves. The DISPLAY string is not computed here — it is
+    // derived from the session on every frame, so it can never name a scope
+    // no watch is using.
+    let (watch_namespace, is_fallback_namespace) = match cli_scope {
+        NamespaceScope::One(ns) => (Some(ns), false),
+        NamespaceScope::All => (None, false),
         NamespaceScope::FromContext => {
             let is_fallback = !namespace_from_context && context_namespace == "default";
-            (
-                Some(context_namespace.clone()),
-                context_namespace,
-                is_fallback,
-            )
+            (Some(context_namespace), is_fallback)
         }
     };
 
@@ -369,10 +380,15 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // owns the Client for whichever cluster is active: a namespace switch
     // reads it from the SAME lock it uses to restart the watch (see
     // `restart_watch`), rather than from a separate cell elsewhere that
-    // could go stale relative to a concurrent cluster switch.
+    // could go stale relative to a concurrent cluster switch. The namespace
+    // scope lives there for the same reason: it describes the watch that is
+    // actually running, so it is read back from the session each frame
+    // rather than tracked alongside it.
     let session: SharedSession = Arc::new(Mutex::new(Session::new(
         ClusterRegistry::from_contexts(contexts),
         client.clone(),
+        watch_namespace.clone(),
+        is_fallback_namespace,
     )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
@@ -535,15 +551,22 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // The session guard is released before the store is locked — holding
         // it across an await would block `switch_cluster`, which needs it to
         // announce "connecting" while this loop is still running.
-        let (store, active_cluster, entries) = {
+        // The namespace scope and its fallback flag come from the same guard:
+        // a switch replaces all of these together, so reading any of them
+        // from a local would show the previous cluster's scope over the new
+        // cluster's data.
+        let (store, active_cluster, entries, namespace, namespace_is_fallback) = {
             let s = session.lock().await;
             (
                 s.store.clone(),
                 s.registry.active().map(|e| e.id.0.clone()),
                 s.registry.entries().to_vec(),
+                s.namespace.clone(),
+                s.namespace_is_fallback,
             )
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
+        let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
         // Read the store snapshot into locals before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
@@ -657,26 +680,26 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                         switch_cluster(
                                             session2,
                                             target,
+                                            // Contexts frequently set no namespace and
+                                            // `default` is empty on these clusters — so a
+                                            // switch overrides whatever `-A`/`-n` chose for
+                                            // the INITIAL connect with all-namespaces.
+                                            // `switch_cluster` records this scope on the
+                                            // session and hands the SAME value to the closure
+                                            // below, so what the status bar reports and what
+                                            // the watch actually watches cannot disagree.
+                                            None,
                                             tx2.clone(),
                                             move || async move {
                                                 cluster::connect_with(&switch_opts).await
                                             },
-                                            move |client, store| {
-                                                // Contexts frequently set no namespace and
-                                                // `default` is empty on these clusters — the
-                                                // picker overrides whatever `-A`/`-n` chose
-                                                // for the INITIAL connect with all-namespaces
-                                                // on every subsequent switch. `switch_cluster`
-                                                // itself records `client` on the session, under
-                                                // the same lock it uses to activate the cluster
-                                                // — see `restart_watch` below for why that
-                                                // matters.
+                                            move |client, store, ns| {
                                                 supervise(
                                                     "watch",
                                                     spawn_watch(
                                                         client,
                                                         pod_ar2,
-                                                        None,
+                                                        ns,
                                                         store,
                                                         tx2.clone(),
                                                     ),
@@ -693,31 +716,33 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                     let ns_choice = namespace_choice_from_label(&label);
                                     let pod_ar2 = pod_ar.clone();
                                     let tx2 = tx.clone();
-                                    let ns_choice2 = ns_choice.clone();
                                     // `restart_watch` reads the session's CURRENT client
                                     // from the same lock it uses to tear down and replace
                                     // the store — not a copy captured earlier, which could
                                     // have gone stale if a cluster switch completed in the
                                     // gap between capturing it and taking the lock. See
                                     // `Session::client`'s doc comment for the interleaving
-                                    // this closes.
-                                    restart_watch(session.clone(), move |client, store| {
-                                        supervise(
-                                            "watch",
-                                            spawn_watch(
-                                                client,
-                                                pod_ar2,
-                                                ns_choice2,
-                                                store,
-                                                tx2.clone(),
-                                            ),
-                                            tx2,
-                                        )
-                                    })
+                                    // this closes. It records the scope under that same
+                                    // guard and passes it on to the closure, so nothing
+                                    // here has to update a display copy afterwards.
+                                    restart_watch(
+                                        session.clone(),
+                                        ns_choice,
+                                        move |client, store, ns| {
+                                            supervise(
+                                                "watch",
+                                                spawn_watch(
+                                                    client,
+                                                    pod_ar2,
+                                                    ns,
+                                                    store,
+                                                    tx2.clone(),
+                                                ),
+                                                tx2,
+                                            )
+                                        },
+                                    )
                                     .await;
-                                    display_namespace = ns_choice
-                                        .unwrap_or_else(|| ALL_NAMESPACES_LABEL.to_string());
-                                    is_fallback_namespace = false;
                                 }
                             }
                             Overlay::None => {}
@@ -737,7 +762,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         needs_redraw = false;
 
         hits.clear();
-        let show_hint = should_hint_all_namespaces(is_fallback_namespace, objects.len());
+        let show_hint = should_hint_all_namespaces(namespace_is_fallback, objects.len());
         term.draw(|f| {
             render_frame(
                 f,
@@ -745,7 +770,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 &pod_gvk,
                 &mut view,
                 &context_name,
-                &display_namespace,
+                scope,
                 status,
                 last_error.as_deref(),
                 show_hint,
@@ -992,6 +1017,19 @@ mod tests {
                 vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
                 "all-namespaces sentinel first, then distinct namespaces sorted"
             );
+        }
+
+        #[test]
+        fn the_displayed_scope_for_all_namespaces_is_the_sentinel_not_a_namespace() {
+            // `None` is the all-namespaces scope. Printing an empty string or
+            // "default" here would name a scope nothing is watching.
+            assert_eq!(display_namespace(None), ALL_NAMESPACES_LABEL);
+        }
+
+        #[test]
+        fn the_displayed_scope_for_a_real_namespace_is_that_namespace() {
+            assert_eq!(display_namespace(Some("payments")), "payments");
+            assert_eq!(display_namespace(Some("kube-system")), "kube-system");
         }
 
         #[test]
