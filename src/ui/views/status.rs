@@ -112,4 +112,29 @@ mod tests {
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), 4, "statuses must be distinguishable");
     }
+
+    #[test]
+    fn shows_all_namespaces_when_watching_all() {
+        // When watching all namespaces, the status bar should show "all namespaces"
+        // This test verifies the display behavior when the namespace field is set to "all namespaces"
+        let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_status(
+                f,
+                area,
+                "prod-eu",
+                "all namespaces",
+                WatchStatus::Synced,
+                42,
+                None,
+                &mut hits,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(text.contains("all namespaces"), "got: {text}");
+    }
 }

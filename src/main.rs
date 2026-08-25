@@ -4,6 +4,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
+use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args};
 use kube_tui::cluster;
 use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
@@ -55,6 +56,32 @@ fn supervise(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse CLI arguments first, before any terminal setup.
+    // This allows us to handle --help and errors cleanly to stdout/stderr.
+    let cli_outcome = parse_args(std::env::args().skip(1));
+    match cli_outcome {
+        CliOutcome::Help => {
+            println!("Usage: kube [OPTIONS]");
+            println!();
+            println!("OPTIONS:");
+            println!("  -n, --namespace <namespace>   Watch a specific namespace");
+            println!("  -A, --all-namespaces          Watch all namespaces");
+            println!("  -h, --help                    Show this help message");
+            std::process::exit(0);
+        }
+        CliOutcome::Error(msg) => {
+            eprintln!("kube: {msg}");
+            std::process::exit(2);
+        }
+        CliOutcome::Run(scope) => {
+            // Continue with the parsed scope
+            run_with_scope(scope).await?;
+            return Ok(());
+        }
+    }
+}
+
+async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // First: a panic anywhere below must still leave the terminal usable.
     install_panic_hook();
 
@@ -86,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let contexts = cluster::load_contexts().unwrap_or_default();
-    let current = contexts
+    let current_context = contexts
         .iter()
         .find(|c| c.is_current)
         .map(|c| {
@@ -97,6 +124,13 @@ async fn main() -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| ("unknown".into(), "default".into()));
 
+    // Resolve the CLI scope to a namespace for the watch and a display string for the UI.
+    let (watch_namespace, display_namespace) = match cli_scope {
+        NamespaceScope::One(ns) => (Some(ns.clone()), ns),
+        NamespaceScope::All => (None, "all namespaces".into()),
+        NamespaceScope::FromContext => (Some(current_context.1.clone()), current_context.1.clone()),
+    };
+
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
@@ -105,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let watch_handle = spawn_watch(
         client.clone(),
         pod_ar,
-        Some(current.1.clone()),
+        watch_namespace,
         store.clone(),
         tx.clone(),
     );
@@ -276,8 +310,8 @@ async fn main() -> anyhow::Result<()> {
             render_status(
                 f,
                 chunks[1],
-                &current.0,
-                &current.1,
+                &current_context.0,
+                &display_namespace,
                 status,
                 objects.len(),
                 last_error.as_deref(),
