@@ -160,7 +160,32 @@ Run everything from the repo root.
    still updating live. Nothing about the working cluster should have paused or
    flickered during the failed attempt.
 
-6. **Client-race check: cluster switch immediately followed by a namespace pick.**
+6. **SSO cluster with an expired token: an actionable error, never a garbled screen.**
+   Pick a context that authenticates through a credential plugin (`kubelogin`,
+   `gke-gcloud-auth-plugin`, `aws-iam-authenticator` — anything under an `exec:` block
+   in your kubeconfig) and make sure its cached token is expired or absent first
+   (`kubelogin remove-cached-token`, `gcloud auth revoke`, or just wait one out).
+   Press `c` and select it. Expect: the switch fails within a second or two with an
+   error line in the status bar that **names the plugin** (`… — 'kubelogin' needs to
+   log in; run it in a shell first`), and the cluster you were already on keeps its
+   ribbon, its data and its live watch. The screen must stay intact: **no** login URL
+   or prompt printed into the table, no staircased text, no frozen UI swallowing your
+   keystrokes. Then run the plugin (or any `kubectl` command against that context) in
+   another terminal to refresh the credential, come back, and switch again — it should
+   now succeed normally. This is what `disable_interactive_exec` in
+   `src/cluster/auth.rs` exists to prevent: without it the plugin inherits our stdin
+   and stderr and does exactly the damage described above.
+
+7. **Picker scrolling with more contexts than fit on screen.**
+   You need a kubeconfig with more contexts than your terminal has rows for the picker
+   (roughly 20 in an 80×24 window; `KUBECONFIG` can point at a throwaway file with
+   twenty dummy contexts). Press `c`, then hold Down past the bottom of the list.
+   Expect: the list scrolls, the highlighted row stays visible at all times, and the
+   last context is reachable and highlighted. Then **click** it — the cluster you
+   clicked must be the one it tries to connect to. Every context must be reachable by
+   mouse alone.
+
+8. **Client-race check: cluster switch immediately followed by a namespace pick.**
    Press `c`, select a different reachable cluster, and — without waiting for
    `connecting…` to resolve — as soon as (or just after) the table repopulates, press
    `n` and pick a namespace. Expect: the resulting table contains only objects from
@@ -169,7 +194,7 @@ Run everything from the repo root.
    client used for the new watch. (This is the race `restart_watch` reading `client`
    from the same lock guard as the teardown, in `src/app/session.rs`, exists to close.)
 
-7. **Namespace picker.**
+9. **Namespace picker.**
    Press `n`. Expect: a picker listing "all namespaces" plus every namespace *actually
    present among the pods currently loaded* — not a full cluster-wide namespace list.
    If you're already watching all namespaces this is complete; if you're scoped to one
@@ -177,7 +202,7 @@ Run everything from the repo root.
    behaviour, not a bug — there's no separate `Namespace` watch backing this yet.
    Select a different namespace: the table re-scopes to it.
 
-8. **Scroll and click accuracy on a large table.**
+10. **Scroll and click accuracy on a large table.**
    Point `kind`, or any cluster, at a namespace with several hundred pods (a
    `kubectl scale` on `dev-cluster.sh`'s `web` deployment, or your own test fixture,
    works). Scroll through the table with the mouse wheel — expect smooth, responsive
@@ -188,13 +213,13 @@ Run everything from the repo root.
    the one above or below it. Repeat after scrolling to a different offset to confirm
    it isn't a coincidence of the first screen position.
 
-9. **Quit leaves the shell intact.**
+11. **Quit leaves the shell intact.**
    Press `q`. Expect: the alternate screen closes, the terminal returns to its normal
    contents, and the shell prompt is back with no leftover raw-mode weirdness — type a
    few characters and confirm they echo normally, press Enter and confirm the prompt
    redraws normally.
 
-10. **Panic still restores the terminal (optional, don't commit the trigger).**
+12. **Panic still restores the terminal (optional, don't commit the trigger).**
     To confirm the panic hook actually works rather than trusting that it does:
     temporarily add `panic!("manual test")` somewhere it's guaranteed to run early in
     `run_with_scope` (`src/main.rs`, after `install_panic_hook()`), `cargo run`, and

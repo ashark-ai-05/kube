@@ -10,7 +10,7 @@ use kube_tui::app::session::{
 };
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::cluster::{ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
+use kube_tui::cluster::{AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
 use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
@@ -154,6 +154,27 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
         .get(filtered_index)
         .and_then(|&real| picker.items.get(real))
         .map(|item| item.label.clone())
+}
+
+/// Turn a failed connect into something the user can act on.
+///
+/// Connects made from inside the TUI forbid exec plugins from prompting (see
+/// `ConnectOptions::allow_interactive_auth`), so on a cluster behind SSO the
+/// usual failure is not "wrong password" but "this credential needed a login
+/// and we would not let it ask". The status bar has room for one line, and
+/// the plugin's own name is the difference between a mystery and an
+/// instruction — the fix is always to run it, or any `kubectl` command, in a
+/// real shell and come back.
+///
+/// A blank command (`exec:` with no `command:`) yields no hint: naming
+/// nothing helps nobody.
+fn connect_failure_hint(auth: &AuthMethod, error: &str) -> String {
+    match auth {
+        AuthMethod::Exec { command } if !command.is_empty() => {
+            format!("{error} — '{command}' needs to log in; run it in a shell first")
+        }
+        _ => error.to_string(),
+    }
 }
 
 /// The error the status bar should show after this batch of events.
@@ -383,8 +404,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     };
 
     // The terminal has not been touched yet, so on failure this prints
-    // straight to stderr rather than corrupting an alternate screen.
-    let client = match cluster::connect_with(&opts).await {
+    // straight to stderr rather than corrupting an alternate screen — and,
+    // for the same reason, this is the ONE connect where an exec credential
+    // plugin may legitimately take stdin and stderr and walk the user
+    // through an SSO login. `opts` itself keeps the safe default, so the
+    // clone every cluster switch takes cannot inherit this permission.
+    let startup_opts = cluster::ConnectOptions {
+        allow_interactive_auth: true,
+        ..opts.clone()
+    };
+    let client = match cluster::connect_with(&startup_opts).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("kube: could not connect to a cluster: {e:#}");
@@ -719,8 +748,21 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             Overlay::ClusterPicker(p) => {
                                 if let Some(label) = resolve_picker_choice(&p, i) {
                                     let target = ClusterId(label);
+                                    // Inherits `allow_interactive_auth: false`
+                                    // from `opts`: this connect runs with the
+                                    // alternate screen live, so no exec plugin
+                                    // may prompt into it. See
+                                    // `ConnectOptions::allow_interactive_auth`.
                                     let mut switch_opts = opts.clone();
                                     switch_opts.context = Some(target.0.clone());
+                                    // How the target authenticates, so a
+                                    // refusal to prompt can say which command
+                                    // to run instead of just failing.
+                                    let target_auth = entries
+                                        .iter()
+                                        .find(|e| e.id == target)
+                                        .map(|e| e.context.auth.clone())
+                                        .unwrap_or(AuthMethod::None);
                                     let session2 = session.clone();
                                     let tx2 = tx.clone();
                                     let pod_ar2 = pod_ar.clone();
@@ -739,7 +781,14 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                             None,
                                             tx2.clone(),
                                             move || async move {
-                                                cluster::connect_with(&switch_opts).await
+                                                cluster::connect_with(&switch_opts).await.map_err(
+                                                    |e| {
+                                                        anyhow::anyhow!(connect_failure_hint(
+                                                            &target_auth,
+                                                            &format!("{e:#}")
+                                                        ))
+                                                    },
+                                                )
                                             },
                                             move |client, store, ns| {
                                                 supervise(
@@ -1064,6 +1113,70 @@ mod tests {
                 labels,
                 vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
                 "all-namespaces sentinel first, then distinct namespaces sorted"
+            );
+        }
+
+        // --- A refused exec login must say what to run ---
+
+        #[test]
+        fn a_failed_connect_to_an_exec_cluster_names_the_plugin_to_run() {
+            // Switching to an SSO cluster with an expired token now fails
+            // cleanly rather than printing the plugin's login URL into our
+            // alternate screen. That is only an improvement if the user can
+            // tell what to do about it, and the command name is the whole
+            // instruction.
+            let hint = connect_failure_hint(
+                &AuthMethod::Exec {
+                    command: "kubelogin".to_string(),
+                },
+                "building config for context 'prod-eu': auth exec command failed",
+            );
+            assert!(
+                hint.contains("kubelogin"),
+                "the plugin to run must be named; got {hint}"
+            );
+            assert!(
+                hint.contains("auth exec command failed"),
+                "the underlying cause must survive; got {hint}"
+            );
+        }
+
+        #[test]
+        fn a_failed_connect_to_a_non_exec_cluster_is_left_exactly_as_it_was() {
+            // A cert or token cluster's failure has nothing to do with a
+            // credential plugin, and inventing advice about one would send
+            // someone chasing the wrong thing.
+            let original = "no route to host";
+            for auth in [
+                AuthMethod::ClientCert,
+                AuthMethod::Token,
+                AuthMethod::None,
+                AuthMethod::AuthProvider {
+                    name: "oidc".to_string(),
+                },
+            ] {
+                assert_eq!(
+                    connect_failure_hint(&auth, original),
+                    original,
+                    "{auth:?} must not gain an exec hint"
+                );
+            }
+        }
+
+        #[test]
+        fn an_exec_block_with_no_command_adds_no_empty_hint() {
+            // `exec.command` is optional in the schema and `auth_method_for`
+            // defaults it to "". Advising the user to run '' is worse than
+            // saying nothing.
+            let original = "no route to host";
+            assert_eq!(
+                connect_failure_hint(
+                    &AuthMethod::Exec {
+                        command: String::new()
+                    },
+                    original
+                ),
+                original
             );
         }
 
