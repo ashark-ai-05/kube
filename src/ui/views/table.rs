@@ -122,6 +122,7 @@ pub fn render_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::columns::Column;
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::ApiResource;
     use ratatui::Terminal;
@@ -324,5 +325,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_visible_window_covers_only_rows_that_fit() {
+        // A 10-row area spends 1 line on the top border, 1 on the header and
+        // 1 on the bottom border, leaving 7 data rows.
+        assert_eq!(visible_window(0, 10, 100), 0..7);
+    }
+
+    #[test]
+    fn the_visible_window_follows_the_scroll_offset() {
+        assert_eq!(visible_window(24, 10, 100), 24..31);
+    }
+
+    #[test]
+    fn the_visible_window_is_clamped_to_the_object_count() {
+        assert_eq!(
+            visible_window(0, 10, 3),
+            0..3,
+            "must not run past the end of the list"
+        );
+        assert_eq!(visible_window(98, 10, 100), 98..100);
+    }
+
+    #[test]
+    fn a_viewport_with_no_room_for_rows_yields_an_empty_window() {
+        for h in [0u16, 1, 2, 3] {
+            let w = visible_window(0, h, 100);
+            assert!(w.start >= w.end || w.len() <= 1, "height {h} produced {w:?}");
+        }
+        assert!(visible_window(0, 0, 100).is_empty());
+    }
+
+    #[test]
+    fn an_offset_past_the_end_yields_an_empty_window_rather_than_panicking() {
+        assert!(visible_window(500, 10, 100).is_empty());
+    }
+
+    #[test]
+    fn only_visible_rows_are_formatted() {
+        // The guarantee this task exists for: a 5000-object list in a small
+        // viewport must format tens of rows, not thousands.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FORMATS: AtomicUsize = AtomicUsize::new(0);
+
+        fn counting_extract(_o: &DynamicObject) -> String {
+            FORMATS.fetch_add(1, Ordering::SeqCst);
+            "x".to_string()
+        }
+
+        let pods: Vec<_> = (0..5000).map(|i| pod(&format!("p{i}"), "Running")).collect();
+        let cols = vec![Column {
+            header: "NAME",
+            width: Constraint::Fill(1),
+            extract: counting_extract,
+        }];
+
+        FORMATS.store(0, Ordering::SeqCst);
+        let window = visible_window(0, 20, pods.len());
+        for obj in &pods[window] {
+            for c in &cols {
+                let _ = (c.extract)(obj);
+            }
+        }
+
+        let n = FORMATS.load(Ordering::SeqCst);
+        assert!(
+            n <= 20,
+            "formatted {n} rows for a 20-row viewport; expected at most 20"
+        );
     }
 }
