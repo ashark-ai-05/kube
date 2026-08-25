@@ -60,6 +60,20 @@ impl ResourceStore {
 
 pub type SharedStore = Arc<RwLock<ResourceStore>>;
 
+/// Threshold: a watch that fails this many times in a row is likely RBAC denial,
+/// not a transient network blip. Escalate to Failed so the UI can show "unavailable"
+/// instead of permanent "reconnecting".
+const FAILURE_ESCALATION_THRESHOLD: u32 = 3;
+
+/// Status for a watch that has failed `consecutive_errors` times in a row.
+pub fn status_for_failure_count(consecutive_errors: u32) -> WatchStatus {
+    if consecutive_errors >= FAILURE_ESCALATION_THRESHOLD {
+        WatchStatus::Failed
+    } else {
+        WatchStatus::Reconnecting
+    }
+}
+
 /// Drive a watcher for one kind into the store, emitting an event after each delta.
 ///
 /// `watcher` already handles relist-on-410-Gone internally, so this loop only
@@ -81,9 +95,15 @@ pub fn spawn_watch(
         let stream = watcher::watcher(api, watcher::Config::default());
         futures::pin_mut!(stream);
 
+        // A watch that keeps failing is usually RBAC denial, not a network
+        // blip. Escalating after a few consecutive errors lets the UI say
+        // "unavailable" instead of lying with a permanent "reconnecting".
+        let mut consecutive_errors: u32 = 0;
+
         while let Some(result) = stream.next().await {
             match result {
                 Ok(event) => {
+                    consecutive_errors = 0;
                     let synced =
                         matches!(event, watcher::Event::InitDone | watcher::Event::Apply(_));
                     store.write().await.apply(&gvk, &ar, event);
@@ -100,18 +120,33 @@ pub fn spawn_watch(
                     let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
                 }
                 Err(e) => {
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Reconnecting);
+                    consecutive_errors += 1;
+                    let status = status_for_failure_count(consecutive_errors);
+                    store.write().await.set_status(gvk.clone(), status);
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
-                        status: WatchStatus::Reconnecting,
+                        status,
                     });
                     let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
                 }
             }
         }
+
+        // The watcher is designed to be infinite; if the stream ends, the watch
+        // is dead and the view is now stale. Say so rather than leaving the last
+        // status showing as if it were live.
+        store
+            .write()
+            .await
+            .set_status(gvk.clone(), WatchStatus::Failed);
+        let _ = tx.send(AppEvent::WatchStatus {
+            gvk: gvk.clone(),
+            status: WatchStatus::Failed,
+        });
+        let _ = tx.send(AppEvent::Error(format!(
+            "watch {} ended unexpectedly",
+            ar.kind
+        )));
     })
 }
 
@@ -162,5 +197,44 @@ mod tests {
             WatchStatus::Initialising,
             "one kind's health must not mask another's"
         );
+    }
+
+    #[test]
+    fn objects_are_isolated_per_kind() {
+        let mut store = ResourceStore::new();
+        let pod_ar = ApiResource::erase::<Pod>(&());
+        let deploy_gvk = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let deploy_ar = ApiResource::from_gvk(&deploy_gvk);
+
+        store.apply(&pod_gvk(), &pod_ar, watcher::Event::Apply(pod("p1")));
+        store.apply(&pod_gvk(), &pod_ar, watcher::Event::Apply(pod("p2")));
+        store.apply(
+            &deploy_gvk,
+            &deploy_ar,
+            watcher::Event::Apply(DynamicObject::new("d1", &deploy_ar).within("default")),
+        );
+
+        assert_eq!(
+            store.objects(&pod_gvk()).len(),
+            2,
+            "pods must not include deployments"
+        );
+        assert_eq!(
+            store.objects(&deploy_gvk).len(),
+            1,
+            "deployments must not include pods"
+        );
+    }
+
+    #[test]
+    fn transient_errors_report_reconnecting_but_repeated_ones_report_failed() {
+        assert_eq!(status_for_failure_count(1), WatchStatus::Reconnecting);
+        assert_eq!(status_for_failure_count(2), WatchStatus::Reconnecting);
+        assert_eq!(
+            status_for_failure_count(3),
+            WatchStatus::Failed,
+            "a persistently failing watch is usually RBAC denial, not a blip"
+        );
+        assert_eq!(status_for_failure_count(99), WatchStatus::Failed);
     }
 }
