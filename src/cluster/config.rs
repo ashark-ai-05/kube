@@ -83,9 +83,10 @@ users: []
     #[test]
     fn parses_all_contexts() {
         let ctxs = contexts_from_yaml(SAMPLE).unwrap();
-        assert_eq!(ctxs.len(), 2);
+        assert_eq!(ctxs.len(), 3);
         assert_eq!(ctxs[0].name, "prod-eu");
         assert_eq!(ctxs[1].name, "dev");
+        assert_eq!(ctxs[2].name, "empty-ns");
     }
 
     #[test]
@@ -93,6 +94,22 @@ users: []
         let ctxs = contexts_from_yaml(SAMPLE).unwrap();
         assert!(ctxs[0].is_current, "prod-eu is current-context");
         assert!(!ctxs[1].is_current);
+    }
+
+    #[test]
+    fn an_explicitly_empty_namespace_becomes_none() {
+        // An explicit `namespace: ""` deserializes to Some("") — the filter in
+        // flatten() is what normalises it. Without this case that filter is
+        // unguarded and can be deleted without failing any test.
+        let ctxs = contexts_from_yaml(SAMPLE).unwrap();
+        let empty = ctxs
+            .iter()
+            .find(|c| c.name == "empty-ns")
+            .expect("empty-ns context");
+        assert_eq!(
+            empty.namespace, None,
+            "empty string must normalise to None, not Some(\"\")"
+        );
     }
 
     #[test]
