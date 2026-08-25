@@ -3,6 +3,7 @@ use crate::cluster::{ClusterId, ClusterRegistry, ConnectionState};
 use crate::store::handles::WatchHandles;
 use crate::store::watch::{ResourceStore, SharedStore};
 use kube::Client;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -35,6 +36,14 @@ pub struct Session {
     /// Bumped by every switch so a slow connect that has been superseded can
     /// tell it is stale and stand down.
     pub generation: u64,
+    /// Which attempt owns each cluster's `Connecting` marker, by generation.
+    ///
+    /// A superseded attempt must retract only the marker it set itself. The
+    /// user can pick the *same* slow cluster twice, so by the time the first
+    /// attempt returns the entry may be `Connecting` again — or `Connected`
+    /// and streaming — on behalf of a later attempt. Bookkeeping only: the
+    /// registry remains the source of truth for what to display.
+    pub pending: HashMap<ClusterId, u64>,
 }
 
 impl Session {
@@ -44,6 +53,7 @@ impl Session {
             handles: WatchHandles::new(),
             store: Arc::new(RwLock::new(ResourceStore::new())),
             generation: 0,
+            pending: HashMap::new(),
         }
     }
 }
@@ -65,6 +75,11 @@ pub type SharedSession = Arc<Mutex<Session>>;
 /// `connect` and `spawn_watches` are injected rather than called directly so
 /// that switching is testable without a cluster, a network or a kubeconfig.
 /// `main` passes `cluster::connect_with` and `store::watch::spawn_watch`.
+///
+/// **`spawn_watches` is called with the session lock held.** It must do no more
+/// than start the watch and hand back its handle: acquiring the session lock
+/// inside it — directly, or by awaiting anything that does — deadlocks the
+/// switch and, with it, the event loop.
 ///
 /// Run this on a spawned task. It awaits `connect`, which for a cluster the
 /// current VPN cannot reach takes tens of seconds; called inline from the
@@ -107,7 +122,12 @@ pub async fn switch_cluster<C, F, W>(
         // stale success would otherwise tear down the cluster the user is on
         // now in order to install an obsolete one.
         s.generation += 1;
-        s.generation
+        let generation = s.generation;
+
+        // Record that the marker just written belongs to THIS attempt, so a
+        // later one targeting the same cluster can take ownership of it.
+        s.pending.insert(id.clone(), generation);
+        generation
     };
 
     // 2. Announce the wait and arm a redraw before the attempt begins.
@@ -122,9 +142,23 @@ pub async fn switch_cluster<C, F, W>(
         // dropped here rather than used: the session belongs to another cluster
         // now, and both reporting this one as connected and tearing that
         // cluster down to install this one would be wrong.
-        s.registry.set_state(&id, ConnectionState::Disconnected);
+        //
+        // A superseded attempt may retract only the marker it set ITSELF. The
+        // user can pick the same slow cluster twice, so this entry may by now
+        // be `Connected` and streaming on behalf of a later attempt — writing
+        // `Disconnected` over that is a permanent lie about the cluster the
+        // user is actually on, with nothing to reset it until the next switch
+        // — or `Connecting` for a later attempt still in flight, where it
+        // would erase the indicator mid-attempt.
+        if s.pending.get(&id) == Some(&generation) {
+            s.pending.remove(&id);
+            s.registry.set_state(&id, ConnectionState::Disconnected);
+        }
         return;
     }
+    // Not superseded, so nothing can have taken the marker: this attempt still
+    // owns it and is about to replace it with its own outcome.
+    s.pending.remove(&id);
 
     match connected {
         Ok(client) => {
@@ -666,6 +700,127 @@ mod tests {
             "teardown happens on success, so a stale success must not tear down \
              the cluster the user is actually on"
         );
+    }
+
+    /// Start a switch to `id` whose connect blocks until released, and wait
+    /// until it is actually inside the connect. Returns (task, release).
+    ///
+    /// The two tests below both target the SAME cluster twice, which is what
+    /// makes a superseded attempt dangerous: the entry it marked `Connecting`
+    /// is no longer its own by the time it returns.
+    fn stalled_switch(
+        session: SharedSession,
+        target: ClusterId,
+        tx: UnboundedSender<AppEvent>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            switch_cluster(
+                session,
+                target,
+                tx,
+                || async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(offline_client())
+                },
+                |_, _| live_watch(),
+            )
+            .await;
+        });
+        (entered_rx, release_tx, task)
+    }
+
+    #[tokio::test]
+    async fn a_superseded_connect_does_not_disconnect_a_now_live_cluster() {
+        // The user picks a VPN-slow cluster, gets impatient, and picks the SAME
+        // one again. The second attempt succeeds and the table fills. When the
+        // first attempt finally returns it must not mark that live, streaming
+        // cluster as disconnected — a state nothing resets until the next
+        // switch, and one Task 9 renders in its own colour.
+        let session = session_over(&["prod", "dev"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let (entered, release_first, first) =
+            stalled_switch(session.clone(), id("dev"), tx.clone());
+        entered.await.expect("the first attempt must start");
+
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            tx,
+            || async { Ok(offline_client()) },
+            |_, _| live_watch(),
+        )
+        .await;
+        let live_store = session.lock().await.store.clone();
+
+        let _ = release_first.send(());
+        first.await.expect("the superseded attempt must not panic");
+
+        let s = session.lock().await;
+        assert_eq!(
+            s.registry.find(&id("dev")).expect("dev is known").state,
+            ConnectionState::Connected,
+            "the cluster the user is on is live and streaming; a stale attempt \
+             must not report it as disconnected"
+        );
+        assert_eq!(s.registry.active().map(|e| e.id.0.as_str()), Some("dev"));
+        assert_eq!(
+            s.handles.len(),
+            1,
+            "one live watch, from the second attempt"
+        );
+        assert!(
+            Arc::ptr_eq(&s.store, &live_store),
+            "the stale attempt must not have touched the live store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_connect_does_not_erase_a_later_attempts_connecting_marker() {
+        // Same cluster twice, but this time the first attempt returns while the
+        // second is still connecting. Retracting the marker here would blank
+        // the "connecting" indicator mid-attempt — hazard 3's symptom, arriving
+        // through the back door.
+        let session = session_over(&["prod", "dev"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let (entered_a, release_a, first) = stalled_switch(session.clone(), id("dev"), tx.clone());
+        entered_a.await.expect("the first attempt must start");
+        let (entered_b, release_b, second) = stalled_switch(session.clone(), id("dev"), tx.clone());
+        entered_b.await.expect("the second attempt must start");
+
+        let _ = release_a.send(());
+        first.await.expect("the superseded attempt must not panic");
+
+        assert_eq!(
+            session
+                .lock()
+                .await
+                .registry
+                .find(&id("dev"))
+                .expect("dev is known")
+                .state,
+            ConnectionState::Connecting,
+            "the second attempt is still connecting; the first must not retract \
+             a marker that is no longer its own"
+        );
+
+        // And the attempt that owns it still completes normally.
+        let _ = release_b.send(());
+        second.await.expect("the live attempt must not panic");
+        let s = session.lock().await;
+        assert_eq!(
+            s.registry.find(&id("dev")).expect("dev is known").state,
+            ConnectionState::Connected
+        );
+        assert_eq!(s.registry.active().map(|e| e.id.0.as_str()), Some("dev"));
     }
 
     #[tokio::test]
