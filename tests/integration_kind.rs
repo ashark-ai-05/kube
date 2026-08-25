@@ -6,13 +6,32 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use kube_tui::app::event::{AppEvent, WatchStatus};
 use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, MutexGuard, RwLock, mpsc};
+
+/// The two tests share the `demo` namespace and its deployment: one asserts a
+/// pod count while the other deletes a pod. Rust runs tests in parallel by
+/// default, so they must be serialised against each other. A mutex enforces
+/// this in the code rather than relying on someone remembering
+/// `--test-threads=1`.
+///
+/// This is `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
+/// across `.await` points in both tests (connecting, watching, deleting), and
+/// holding a blocking std mutex across an await is a real hazard — clippy's
+/// `await_holding_lock` lint (denied via `-D warnings`) catches exactly this.
+/// A useful side effect: `tokio::sync::Mutex` never poisons, so a panic in
+/// one test simply drops the guard and the next test acquires cleanly —
+/// no `PoisonError` recovery needed.
+async fn cluster_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
 
 #[tokio::test]
 #[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn watch_populates_the_store_from_a_real_cluster() {
+    let _serial = cluster_lock().await;
     let client = kube_tui::cluster::connect()
         .await
         .expect("connect to cluster");
@@ -57,6 +76,7 @@ async fn watch_populates_the_store_from_a_real_cluster() {
 #[tokio::test]
 #[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn store_reflects_a_deletion_made_during_the_watch() {
+    let _serial = cluster_lock().await;
     let client = kube_tui::cluster::connect().await.expect("connect");
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
