@@ -72,6 +72,11 @@ contexts:
   context:
     cluster: dev-cluster
     user: dev-user
+- name: empty-ns
+  context:
+    cluster: dev-cluster
+    user: dev-user
+    namespace: ""
 users: []
 "#;
 
