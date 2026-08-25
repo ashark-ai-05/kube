@@ -1036,7 +1036,95 @@ Expected: FAIL — `cannot find type Picker`.
 
 - [ ] **Step 3: Write the implementation**
 
-Use `ratatui::widgets::Clear` before drawing the block — see the API reference section D13 for the verified call. Style with `theme::border_style(true)`, `theme::header_style()` for the title, `theme::muted_style()` for details, and paint each item's `accent` when present (the cluster picker passes `cluster_hue`). Register a `PickerRow(filtered_index)` zone per visible row at z-index 1 so the overlay wins over the table beneath.
+```rust
+/// Case-insensitive substring match over item labels.
+pub fn filtered_indices(items: &[PickerItem], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let needle = filter.to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.label.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A centred rectangle occupying the given percentage of `area`.
+pub fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let w = (area.width as u32 * pct_w as u32 / 100) as u16;
+    let h = (area.height as u32 * pct_h as u32 / 100) as u16;
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
+}
+
+pub fn render_picker(f: &mut Frame, area: Rect, picker: &Picker, hits: &mut HitRegistry) {
+    let matches = filtered_indices(&picker.items, &picker.filter);
+
+    // Clear first: without it the frame beneath shows through the modal.
+    f.render_widget(Clear, area);
+
+    let title = format!(" {} ", picker.title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border_style(true))
+        .title(Span::styled(title, theme::header_style()))
+        .style(Style::default().bg(theme::ABYSS));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Filter line, then the list beneath it.
+    let filter_line = Line::from(vec![
+        Span::styled("⌕ ", theme::label_style()),
+        Span::styled(picker.filter.clone(), theme::text_style()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line),
+        Rect { height: 1, ..inner },
+    );
+
+    let list_y = inner.y.saturating_add(1);
+    let rows = inner.height.saturating_sub(1);
+    for (row, &item_idx) in matches.iter().take(rows as usize).enumerate() {
+        let y = list_y + row as u16;
+        let item = &picker.items[item_idx];
+        let selected = row == picker.selected;
+
+        let accent = item.accent.unwrap_or(theme::MIST);
+        let mut style = Style::default().fg(theme::PAPER);
+        if selected {
+            style = style.bg(theme::DUSK).add_modifier(Modifier::BOLD);
+        }
+
+        let line = Line::from(vec![
+            Span::styled("▊ ", Style::default().fg(accent)),
+            Span::styled(item.label.clone(), style),
+            Span::styled(
+                if item.detail.is_empty() { String::new() } else { format!("  {}", item.detail) },
+                theme::muted_style(),
+            ),
+        ]);
+        let row_area = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        f.render_widget(Paragraph::new(line).style(style), row_area);
+
+        // z=1 so the overlay wins over the table beneath. The index is into
+        // the FILTERED list, because that is what the user actually clicked.
+        hits.push(row_area, 1, HitTarget::PickerRow(row));
+    }
+}
+```
+
+Each item's `accent` is painted on the `▊` marker — the cluster picker passes `cluster_hue(name)` so a cluster's colour is the same in the picker, the ribbon, and the status bar.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1180,7 +1268,98 @@ Add to `Cargo.toml`:
 http = "1"
 ```
 
-Implement per the API reference's verified snippet. Ragged rows must be padded and over-long rows truncated — a CRD's printer columns and its actual rows are not guaranteed to agree, and a mismatch must not panic mid-render.
+```rust
+use anyhow::{Context as _, anyhow};
+use kube::Client;
+use kube::api::ListParams;
+use kube::core::Request as KubeRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumn {
+    pub name: String,
+    /// kubectl shows priority 0 always, and >0 only under `-o wide`.
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TableData {
+    pub columns: Vec<TableColumn>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Render one Table cell. Cells are heterogeneous — strings, integers for
+/// restart counts, nulls, occasionally nested objects — and none may vanish.
+pub fn cell_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Decode a `meta.k8s.io/v1 Table` response.
+///
+/// A CRD's declared printer columns and the rows the server returns are not
+/// guaranteed to agree in length, so ragged rows are padded and over-long
+/// rows truncated. Getting this wrong panics mid-render on someone's CRD.
+pub fn decode_table(json: &serde_json::Value) -> anyhow::Result<TableData> {
+    let defs = json
+        .get("columnDefinitions")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("response has no columnDefinitions; not a Table"))?;
+
+    let columns: Vec<TableColumn> = defs
+        .iter()
+        .map(|d| TableColumn {
+            name: d.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+            priority: d.get("priority").and_then(|p| p.as_i64()).unwrap_or(0) as i32,
+        })
+        .collect();
+
+    let width = columns.len();
+    let rows = json
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut cells: Vec<String> = row
+                        .get("cells")
+                        .and_then(|c| c.as_array())
+                        .map(|c| c.iter().map(cell_to_string).collect())
+                        .unwrap_or_default();
+                    cells.resize(width, String::new());
+                    cells
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(TableData { columns, rows })
+}
+
+/// Ask the API server to render a resource the way kubectl does.
+///
+/// kube 4.2 has no Table support, so this builds the request by hand and
+/// sets the Accept header itself. Verified against kube 4.2; see
+/// `docs/superpowers/plan2-api-reference.md` section B4.
+pub async fn fetch_table(client: &Client, resource_url: &str) -> anyhow::Result<TableData> {
+    let mut req = KubeRequest::new(resource_url)
+        .list(&ListParams::default())
+        .context("building the list request")?;
+    req.headers_mut().insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static("application/json;as=Table;v=1;g=meta.k8s.io"),
+    );
+    let json: serde_json::Value = client
+        .request(req)
+        .await
+        .with_context(|| format!("requesting a Table for {resource_url}"))?;
+    decode_table(&json)
+}
+```
+
+Note `cells.resize(width, ..)` handles both padding and truncation in one call.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
