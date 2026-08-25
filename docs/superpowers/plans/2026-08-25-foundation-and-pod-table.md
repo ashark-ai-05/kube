@@ -16,7 +16,7 @@ These apply to every task. Every task's requirements implicitly include this sec
 
 - **Rust edition 2024.** Minimum toolchain 1.85.
 - **Exact dependency versions:** `kube = "4.2"` (features `runtime`, `client`, `derive`), `k8s-openapi = "0.28"` (feature `latest`), `ratatui = "0.30"`, `crossterm = "0.29"` (feature `event-stream`), `tokio = "1"` (feature `full`), `futures = "0.3"`, `serde_json = "1"`, `indexmap = "2"`, `chrono = "0.4"`, `anyhow = "1"`, `thiserror = "2"`.
-- **The UI layer never performs I/O and never `.await`s.** Any task that makes the render path async is wrong.
+- **The render closure passed to `term.draw` must be synchronous.** It must not perform I/O and must not acquire a lock. The event loop may `.await` on the event channel and on the store lock, but must never hold a lock across a draw. Reading a snapshot out of the store *before* calling `term.draw`, and drawing from that snapshot, is the intended pattern.
 - **Never render on a fixed tick.** Rendering happens only after the event channel drains.
 - **Never write to stdout/stderr while the alternate screen is active.** Use the error channel.
 - **Every panic path must restore the terminal first.**
@@ -1616,9 +1616,13 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_viewport_renders_without_panicking() {
+    fn a_tiny_viewport_renders_exactly_the_available_lines() {
+        // A terminal too small for the header plus any row is a real crash
+        // source in layout code; this pins both non-panic and correct extent.
         let pods = vec![pod("a", "Running"), pod("b", "Running")];
-        let (_, _) = render(&pods, 12, 3);
+        let (text, _) = render(&pods, 12, 3);
+        assert_eq!(text.lines().count(), 3, "must fill exactly the viewport height");
+        assert!(text.lines().all(|l| l.chars().count() == 12), "no line may exceed the width");
     }
 
     #[test]
@@ -2300,7 +2304,7 @@ git commit -m "feat: status bar and full application wiring"
 
 ### Task 11: Integration against a real cluster
 
-The unit tests prove the logic. Only a real API server proves the watch behaves, and this is the first point where the binary is run against real data.
+The unit tests prove the logic. Only a real API server proves the watch behaves, and this is the first point where the binary is run against real data. These tests are marked `#[ignore]` so the default `cargo test` stays green without a cluster.
 
 **Files:**
 - Create: `tests/integration_kind.rs`
@@ -2355,8 +2359,9 @@ Expected: `Cluster 'kube-tui-dev' ready with 3 pods in namespace 'demo'.`
 Create `tests/integration_kind.rs`:
 
 ```rust
-//! Cluster-backed tests. Skipped unless KUBE_TUI_IT=1 so `cargo test` stays
-//! green on machines with no cluster.
+//! Cluster-backed tests, marked #[ignore] so `cargo test` stays green on
+//! machines with no cluster. Run them with:
+//!   ./scripts/dev-cluster.sh && cargo test -- --ignored
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
@@ -2366,17 +2371,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
-fn enabled() -> bool {
-    std::env::var("KUBE_TUI_IT").as_deref() == Ok("1")
-}
-
 #[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn watch_populates_the_store_from_a_real_cluster() {
-    if !enabled() {
-        eprintln!("skipping: set KUBE_TUI_IT=1 and run scripts/dev-cluster.sh");
-        return;
-    }
-
     let client = kube_tui::cluster::connect().await.expect("connect to cluster");
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -2413,12 +2410,8 @@ async fn watch_populates_the_store_from_a_real_cluster() {
 }
 
 #[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn store_reflects_a_deletion_made_during_the_watch() {
-    if !enabled() {
-        eprintln!("skipping: set KUBE_TUI_IT=1");
-        return;
-    }
-
     let client = kube_tui::cluster::connect().await.expect("connect");
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -2497,9 +2490,9 @@ use kube_tui::{app, cluster, store, terminal, ui};
 - [ ] **Step 4: Run the test to verify it fails without a cluster, then passes with one**
 
 Run: `cargo test --test integration_kind`
-Expected: PASS trivially, printing the skip message.
+Expected: PASS with `0 passed; 2 ignored` — no cluster contacted.
 
-Run: `KUBE_TUI_IT=1 cargo test --test integration_kind -- --nocapture`
+Run: `cargo test --test integration_kind -- --ignored --nocapture`
 Expected: PASS — both tests, with the store reporting at least 3 pods.
 
 - [ ] **Step 5: Run the application against the real cluster**
@@ -2528,7 +2521,7 @@ git commit -m "test: cluster-backed integration tests against kind"
 ## Definition of Done
 
 - [ ] `cargo test` passes with no cluster present.
-- [ ] `KUBE_TUI_IT=1 cargo test` passes against a kind cluster.
+- [ ] `cargo test -- --ignored` passes against a kind cluster.
 - [ ] `cargo clippy -- -D warnings` is clean.
 - [ ] `cargo fmt --check` is clean.
 - [ ] `cargo run` shows live pods, navigable by mouse and keyboard.
