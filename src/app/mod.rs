@@ -2,6 +2,52 @@ pub mod event;
 pub mod input;
 pub mod session;
 
+use crate::ui::views::picker::Picker;
+
+/// A modal overlay drawn on top of the table. At most one is ever open —
+/// opening one replaces whatever was open before.
+///
+/// `action_for` only needs to know THAT a picker is open (`is_open`), not
+/// which: deciding what a keystroke means while a picker has focus (Esc
+/// closes it, everything else is filter text) doesn't depend on whether
+/// it's clusters or namespaces. What DOES depend on which picker is open is
+/// what a confirmed selection actually does — connect to a cluster, or
+/// restart the watch in a different namespace — and that dispatch belongs
+/// to the caller (`main.rs`), the only place that knows how to do either.
+#[derive(Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    ClusterPicker(Picker),
+    NamespacePicker(Picker),
+}
+
+impl Overlay {
+    /// Whether a picker currently has input focus.
+    pub fn is_open(&self) -> bool {
+        !matches!(self, Overlay::None)
+    }
+
+    /// The picker underneath, regardless of which kind — for code that reads
+    /// picker state (filter, selection, items) without caring what a
+    /// confirmed choice will do.
+    pub fn picker(&self) -> Option<&Picker> {
+        match self {
+            Overlay::None => None,
+            Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => Some(p),
+        }
+    }
+
+    /// As `picker`, but mutable — for routing filter keystrokes and
+    /// navigation into whichever picker is open.
+    pub fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match self {
+            Overlay::None => None,
+            Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => Some(p),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,27 +12,50 @@ pub enum Action {
     ScrollBy(i32),
     SortByColumn(usize),
     Quit,
+    OpenClusterPicker,
+    OpenNamespacePicker,
+    /// Index into the picker's FILTERED list — the caller must map it back
+    /// through `filtered_indices` before acting on it.
+    PickerSelect(usize),
+    /// Enter: confirm whatever row the picker currently has highlighted
+    /// (`Picker::selected`, also a filtered-list index).
+    PickerConfirm,
+    PickerFilterChar(char),
+    PickerBackspace,
+    ClosePicker,
     None,
 }
 
 /// Translate a raw input event into an action, resolving mouse position
 /// through the current frame's hit registry.
-pub fn action_for(event: &CtEvent, hits: &HitRegistry) -> Action {
+///
+/// `overlay_open` is an explicit parameter rather than state this function
+/// tracks itself. Whether a picker has input focus changes what almost
+/// every key means — `Esc` closes it instead of quitting, and every
+/// character (including `j`, `k`, `c`, `n`, `q`) becomes filter text
+/// instead of navigation, open, or quit — so the caller, which owns that
+/// state, passes it in rather than reinterpreting a stateless mapper's
+/// output after the fact.
+pub fn action_for(event: &CtEvent, hits: &HitRegistry, overlay_open: bool) -> Action {
     match event {
         CtEvent::Mouse(m) => match m.kind {
             MouseEventKind::Down(MouseButton::Left) => match hits.hit(m.column, m.row) {
-                Some(HitTarget::TableRow(i)) => Action::SelectRow(*i),
-                Some(HitTarget::ColumnHeader(i)) => Action::SortByColumn(*i),
+                Some(HitTarget::PickerRow(i)) => Action::PickerSelect(*i),
+                Some(HitTarget::Ribbon) => Action::OpenClusterPicker,
+                Some(HitTarget::TableRow(i)) if !overlay_open => Action::SelectRow(*i),
+                Some(HitTarget::ColumnHeader(i)) if !overlay_open => Action::SortByColumn(*i),
                 _ => Action::None,
             },
-            // Scroll applies to whatever is under the cursor, not to focus.
-            MouseEventKind::ScrollDown => match hits.hit(m.column, m.row) {
+            // Scroll applies to whatever is under the cursor, not to focus —
+            // but suppressed while a picker is open: the table beneath it is
+            // not what the user is looking at.
+            MouseEventKind::ScrollDown if !overlay_open => match hits.hit(m.column, m.row) {
                 Some(HitTarget::TableRow(_)) | Some(HitTarget::ColumnHeader(_)) => {
                     Action::ScrollBy(SCROLL_STEP)
                 }
                 _ => Action::None,
             },
-            MouseEventKind::ScrollUp => match hits.hit(m.column, m.row) {
+            MouseEventKind::ScrollUp if !overlay_open => match hits.hit(m.column, m.row) {
                 Some(HitTarget::TableRow(_)) | Some(HitTarget::ColumnHeader(_)) => {
                     Action::ScrollBy(-SCROLL_STEP)
                 }
@@ -40,13 +63,38 @@ pub fn action_for(event: &CtEvent, hits: &HitRegistry) -> Action {
             },
             _ => Action::None,
         },
-        CtEvent::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-            KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
-            KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            _ => Action::None,
-        },
+        CtEvent::Key(k) if k.kind == KeyEventKind::Press => {
+            // Raw mode disables the terminal's own SIGINT handling, so
+            // Ctrl-C must keep working as an emergency quit no matter what
+            // has focus.
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                return Action::Quit;
+            }
+            if overlay_open {
+                match k.code {
+                    KeyCode::Esc => Action::ClosePicker,
+                    KeyCode::Backspace => Action::PickerBackspace,
+                    KeyCode::Enter => Action::PickerConfirm,
+                    KeyCode::Up => Action::ScrollBy(-1),
+                    KeyCode::Down => Action::ScrollBy(1),
+                    // Every other character — including j, k, c, n, q — is
+                    // filter text, not a binding. A picker whose own
+                    // alphabet doubled as bindings would make some cluster
+                    // names untypeable.
+                    KeyCode::Char(c) => Action::PickerFilterChar(c),
+                    _ => Action::None,
+                }
+            } else {
+                match k.code {
+                    KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
+                    KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
+                    KeyCode::Char('c') => Action::OpenClusterPicker,
+                    KeyCode::Char('n') => Action::OpenNamespacePicker,
+                    KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+                    _ => Action::None,
+                }
+            }
+        }
         _ => Action::None,
     }
 }
@@ -168,7 +216,11 @@ mod tests {
     #[test]
     fn scrolling_over_the_table_scrolls_it() {
         assert_eq!(
-            action_for(&scroll(MouseEventKind::ScrollDown, 5, 3), &registry(), false),
+            action_for(
+                &scroll(MouseEventKind::ScrollDown, 5, 3),
+                &registry(),
+                false
+            ),
             Action::ScrollBy(3)
         );
         assert_eq!(
@@ -180,7 +232,11 @@ mod tests {
     #[test]
     fn scrolling_over_nothing_does_nothing() {
         assert_eq!(
-            action_for(&scroll(MouseEventKind::ScrollDown, 5, 40), &registry(), false),
+            action_for(
+                &scroll(MouseEventKind::ScrollDown, 5, 40),
+                &registry(),
+                false
+            ),
             Action::None,
             "scroll targets the region under the cursor, not the focused pane"
         );
@@ -246,15 +302,27 @@ mod tests {
         // single keystroke. Acting on both moves the selection two rows per press.
         let r = registry();
         assert_eq!(
-            action_for(&key_kind(KeyCode::Char('j'), KeyEventKind::Press), &r, false),
+            action_for(
+                &key_kind(KeyCode::Char('j'), KeyEventKind::Press),
+                &r,
+                false
+            ),
             Action::ScrollBy(1)
         );
         assert_eq!(
-            action_for(&key_kind(KeyCode::Char('j'), KeyEventKind::Release), &r, false),
+            action_for(
+                &key_kind(KeyCode::Char('j'), KeyEventKind::Release),
+                &r,
+                false
+            ),
             Action::None
         );
         assert_eq!(
-            action_for(&key_kind(KeyCode::Char('q'), KeyEventKind::Release), &r, false),
+            action_for(
+                &key_kind(KeyCode::Char('q'), KeyEventKind::Release),
+                &r,
+                false
+            ),
             Action::None
         );
     }
@@ -355,10 +423,7 @@ mod tests {
             1,
             HitTarget::PickerRow(3),
         );
-        assert_eq!(
-            action_for(&click(20, 5), &r, true),
-            Action::PickerSelect(3)
-        );
+        assert_eq!(action_for(&click(20, 5), &r, true), Action::PickerSelect(3));
     }
 
     #[test]
@@ -406,8 +471,14 @@ mod tests {
     #[test]
     fn up_and_down_navigate_the_open_picker_rather_than_typing() {
         let r = registry();
-        assert_eq!(action_for(&key(KeyCode::Down), &r, true), Action::ScrollBy(1));
-        assert_eq!(action_for(&key(KeyCode::Up), &r, true), Action::ScrollBy(-1));
+        assert_eq!(
+            action_for(&key(KeyCode::Down), &r, true),
+            Action::ScrollBy(1)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Up), &r, true),
+            Action::ScrollBy(-1)
+        );
     }
 
     #[test]

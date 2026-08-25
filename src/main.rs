@@ -1,24 +1,189 @@
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{ApiResource, GroupVersionKind};
+use kube::Client;
+use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube_tui::app::Overlay;
 use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
-use kube_tui::app::session::{Session, SessionEvent, SharedSession, is_deliberate_abort};
+use kube_tui::app::session::{
+    Session, SessionEvent, SharedSession, is_deliberate_abort, switch_cluster,
+};
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::cluster::ClusterRegistry;
-use kube_tui::store::watch::spawn_watch;
+use kube_tui::cluster::{ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
+use kube_tui::store::watch::{ResourceStore, spawn_watch};
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
+use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
+use kube_tui::ui::theme;
+use kube_tui::ui::views::picker::{Picker, PickerItem, centered, filtered_indices, render_picker};
 use kube_tui::ui::views::status::render_status;
 use kube_tui::ui::views::table::{TableView, render_table};
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
+
+/// A namespace choice meaning "watch everything", not a literal namespace.
+/// Not a valid Kubernetes namespace name (it contains a space), so it can
+/// never collide with a real one.
+const ALL_NAMESPACES_LABEL: &str = "all namespaces";
+
+/// Build the cluster picker's item list fresh from the registry.
+///
+/// The registry is the only source of truth for connection state —
+/// `SessionEvent`s are emitted after the session lock is released, so
+/// concurrent switches can emit them in an order that disagrees with the
+/// registry. Reading state through events here instead would risk showing a
+/// cluster as connected when a later, still-in-flight attempt has already
+/// superseded it.
+fn cluster_picker_items(entries: &[ClusterEntry]) -> Vec<PickerItem> {
+    entries
+        .iter()
+        .map(|e| {
+            let detail = match &e.state {
+                ConnectionState::Disconnected => String::new(),
+                ConnectionState::Connecting => "connecting…".to_string(),
+                ConnectionState::Connected => "connected".to_string(),
+                ConnectionState::Failed { reason } => format!("failed: {reason}"),
+            };
+            PickerItem {
+                label: e.id.0.clone(),
+                detail,
+                accent: Some(theme::cluster_hue(&e.id.0)),
+            }
+        })
+        .collect()
+}
+
+/// Build the namespace picker's item list from the namespaces actually
+/// present in the objects currently loaded, plus an "all namespaces" entry.
+///
+/// There is no cluster-wide namespace listing wired up (that would be its
+/// own `Namespace` watch) — this reflects what the current watch has
+/// actually seen, which is complete whenever the default all-namespaces
+/// scope is active and partial otherwise.
+fn namespace_picker_items(objects: &[Arc<DynamicObject>]) -> Vec<PickerItem> {
+    let names: BTreeSet<String> = objects
+        .iter()
+        .filter_map(|o| o.metadata.namespace.clone())
+        .collect();
+    let mut items = Vec::with_capacity(names.len() + 1);
+    items.push(PickerItem {
+        label: ALL_NAMESPACES_LABEL.to_string(),
+        detail: "watch every namespace".to_string(),
+        accent: None,
+    });
+    items.extend(names.into_iter().map(|n| PickerItem {
+        label: n,
+        detail: String::new(),
+        accent: None,
+    }));
+    items
+}
+
+/// `None` means "all namespaces" — the sentinel label, not a real namespace.
+fn namespace_choice_from_label(label: &str) -> Option<String> {
+    if label == ALL_NAMESPACES_LABEL {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Resolve a filtered-list index back to the item it actually refers to.
+///
+/// `HitTarget::PickerRow` and `Picker::selected` both carry an index into
+/// the FILTERED list, not the full item list — mapping through
+/// `filtered_indices` is what makes a filtered click (or Enter) act on the
+/// row actually shown rather than on whatever unfiltered index happens to
+/// share that number. Getting this wrong is how a filtered click selects
+/// the wrong cluster.
+fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<String> {
+    let matches = filtered_indices(&picker.items, &picker.filter);
+    matches
+        .get(filtered_index)
+        .and_then(|&real| picker.items.get(real))
+        .map(|item| item.label.clone())
+}
+
+/// Record the client currently in use for the active cluster.
+///
+/// `Session` holds the store, the watch handles and the registry, but not
+/// the `Client` itself — nothing needed it before namespace switching, which
+/// restarts the watch against the SAME cluster without reconnecting. A
+/// cluster switch mints a fresh `Client`, reachable only inside the closure
+/// `switch_cluster` hands it to; this cell is how that value survives past
+/// the switch for a later namespace change to reuse. `std::sync::Mutex`
+/// rather than the session's `tokio::sync::Mutex`: writes happen inside
+/// `switch_cluster`'s `spawn_watches` closure, which the session lock is
+/// held across — a second lock acquired and released synchronously, with no
+/// `.await` in between, cannot deadlock that.
+fn set_current_client(cell: &StdMutex<Client>, client: Client) {
+    match cell.lock() {
+        Ok(mut guard) => *guard = client,
+        Err(poisoned) => *poisoned.into_inner() = client,
+    }
+}
+
+fn get_current_client(cell: &StdMutex<Client>) -> Client {
+    match cell.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Draw one frame: the ribbon, then the table and status bar, then the
+/// overlay LAST — so its z=1 hit zones (registered by `render_picker`)
+/// resolve above the table's z=0 zones wherever the two overlap, and its
+/// own content (behind a `Clear`) paints over whatever the table left in
+/// that region.
+#[allow(clippy::too_many_arguments)]
+fn render_frame(
+    f: &mut Frame,
+    objects: &[Arc<DynamicObject>],
+    gvk: &GroupVersionKind,
+    view: &mut TableView,
+    context_name: &str,
+    display_namespace: &str,
+    status: WatchStatus,
+    last_error: Option<&str>,
+    show_hint: bool,
+    connecting: Option<&str>,
+    overlay: &Overlay,
+    hits: &mut HitRegistry,
+) {
+    let full = f.area();
+    let (ribbon_area, rest) = split_ribbon(full);
+    render_ribbon(f, ribbon_area, Some(context_name), hits);
+
+    let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(rest);
+    render_table(f, chunks[0], objects, gvk, view, hits);
+    render_status(
+        f,
+        chunks[1],
+        context_name,
+        display_namespace,
+        status,
+        objects.len(),
+        last_error,
+        show_hint,
+        connecting,
+        hits,
+    );
+
+    if let Some(picker) = overlay.picker() {
+        let area = centered(f.area(), 60, 60);
+        render_picker(f, area, picker, hits);
+    }
+}
 
 /// Describe why a supervised task stopped, including the panic message.
 ///
@@ -158,7 +323,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // Resolve the CLI scope to a namespace for the watch, display string for UI, and fallback flag.
     // The fallback flag is true when we're watching the "default" namespace because the context
     // didn't specify a namespace (not because the user chose it explicitly or via -n).
-    let (watch_namespace, display_namespace, is_fallback_namespace) = match cli_scope {
+    let (watch_namespace, mut display_namespace, mut is_fallback_namespace) = match cli_scope {
         NamespaceScope::One(ns) => (Some(ns.clone()), ns, false),
         NamespaceScope::All => (None, "all namespaces".into(), false),
         NamespaceScope::FromContext => {
@@ -179,11 +344,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
+    // Tracks the Client for whichever cluster is currently active. `Session`
+    // holds the store, the handles and the registry, but not the Client
+    // itself — nothing needed it before namespace switching, which restarts
+    // the watch against the SAME cluster without reconnecting. A cluster
+    // switch (via `switch_cluster`) mints a fresh Client reachable only
+    // inside the closure it is handed to; this cell is how that value
+    // survives past the switch for a later namespace change to reuse.
+    let current_client: Arc<StdMutex<Client>> = Arc::new(StdMutex::new(client.clone()));
+
     let pod_ar = ApiResource::erase::<Pod>(&());
     let pod_gvk = GroupVersionKind::gvk("", "v1", "Pod");
     let watch_handle = spawn_watch(
         client.clone(),
-        pod_ar,
+        pod_ar.clone(),
         watch_namespace,
         session.lock().await.store.clone(),
         tx.clone(),
@@ -284,6 +458,10 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     let mut hits = HitRegistry::new();
     let mut last_error: Option<String> = None;
     let mut status = WatchStatus::Initialising;
+    // At most one picker is ever open; opening one replaces whatever was
+    // open before. Neither cluster nor namespace picking touched a network
+    // before this task — this is what makes them reachable.
+    let mut overlay = Overlay::None;
     // Nothing has been painted yet, so the first batch must draw whatever it is.
     let mut needs_redraw = true;
 
@@ -333,14 +511,36 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // The session guard is released before the store is locked — holding
         // it across an await would block `switch_cluster`, which needs it to
         // announce "connecting" while this loop is still running.
-        let (store, active_cluster) = {
+        let (store, active_cluster, entries) = {
             let s = session.lock().await;
-            (s.store.clone(), s.registry.active().map(|e| e.id.0.clone()))
+            (
+                s.store.clone(),
+                s.registry.active().map(|e| e.id.0.clone()),
+                s.registry.entries().to_vec(),
+            )
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
+        // A connect in flight leaves the active cluster as the OLD one until
+        // it succeeds (Task 8: teardown only happens on success), so
+        // `context_name` alone shows no sign of the attempt. Scanning the
+        // registry for a `Connecting` entry is what makes it visible.
+        let connecting_name = entries
+            .iter()
+            .find(|e| matches!(e.state, ConnectionState::Connecting))
+            .map(|e| e.id.0.clone());
         // Read the store snapshot into a local Vec before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
         let objects = store.read().await.objects(&pod_gvk);
+
+        // Keep an open picker's items current: the registry (cluster
+        // states) and the object list (namespaces seen) can both change
+        // while it's on screen, and it must reflect that rather than a
+        // snapshot taken at open time. Filter and selection are untouched.
+        match &mut overlay {
+            Overlay::ClusterPicker(p) => p.items = cluster_picker_items(&entries),
+            Overlay::NamespacePicker(p) => p.items = namespace_picker_items(&objects),
+            Overlay::None => {}
+        }
 
         let mut quit = false;
         for input in &batch.inputs {
@@ -353,17 +553,145 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             // arrives after the last draw, so on the very first iteration the
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
-            match action_for(input, &hits) {
+            let action = action_for(input, &hits, overlay.is_open());
+            // Enter and a picker-row click both confirm a choice; they carry
+            // the chosen row differently (Enter uses the picker's own
+            // highlighted position, a click carries the filtered index it
+            // actually landed on) but resolve identically from there.
+            let confirm_index = match action {
+                Action::PickerSelect(i) => Some(i),
+                Action::PickerConfirm => overlay.picker().map(|p| p.selected),
+                _ => None,
+            };
+            match action {
                 Action::Quit => quit = true,
                 Action::SelectRow(i) => {
                     view.selected = i.min(objects.len().saturating_sub(1));
                     needs_redraw = true;
                 }
                 Action::ScrollBy(d) => {
-                    view.selected = apply_selection(view.selected, d, objects.len());
+                    match &mut overlay {
+                        Overlay::None => {
+                            view.selected = apply_selection(view.selected, d, objects.len());
+                        }
+                        Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => {
+                            let n = filtered_indices(&p.items, &p.filter).len();
+                            p.selected = apply_selection(p.selected, d, n);
+                        }
+                    }
                     needs_redraw = true;
                 }
                 Action::SortByColumn(_) => needs_redraw = true,
+                Action::OpenClusterPicker => {
+                    overlay = Overlay::ClusterPicker(Picker {
+                        title: "Clusters".into(),
+                        items: cluster_picker_items(&entries),
+                        filter: String::new(),
+                        selected: 0,
+                    });
+                    needs_redraw = true;
+                }
+                Action::OpenNamespacePicker => {
+                    overlay = Overlay::NamespacePicker(Picker {
+                        title: "Namespaces".into(),
+                        items: namespace_picker_items(&objects),
+                        filter: String::new(),
+                        selected: 0,
+                    });
+                    needs_redraw = true;
+                }
+                Action::ClosePicker => {
+                    overlay = Overlay::None;
+                    needs_redraw = true;
+                }
+                Action::PickerFilterChar(c) => {
+                    if let Some(p) = overlay.picker_mut() {
+                        p.filter.push(c);
+                        p.selected = 0;
+                        needs_redraw = true;
+                    }
+                }
+                Action::PickerBackspace => {
+                    if let Some(p) = overlay.picker_mut() {
+                        p.filter.pop();
+                        p.selected = 0;
+                        needs_redraw = true;
+                    }
+                }
+                Action::PickerSelect(_) | Action::PickerConfirm => {
+                    if let Some(i) = confirm_index {
+                        match std::mem::take(&mut overlay) {
+                            Overlay::ClusterPicker(p) => {
+                                if let Some(label) = resolve_picker_choice(&p, i) {
+                                    let target = ClusterId(label);
+                                    let mut switch_opts = opts.clone();
+                                    switch_opts.context = Some(target.0.clone());
+                                    let session2 = session.clone();
+                                    let tx2 = tx.clone();
+                                    let pod_ar2 = pod_ar.clone();
+                                    let current_client2 = current_client.clone();
+                                    tokio::spawn(async move {
+                                        switch_cluster(
+                                            session2,
+                                            target,
+                                            tx2.clone(),
+                                            move || async move {
+                                                cluster::connect_with(&switch_opts).await
+                                            },
+                                            move |client, store| {
+                                                set_current_client(
+                                                    &current_client2,
+                                                    client.clone(),
+                                                );
+                                                // Contexts frequently set no namespace and
+                                                // `default` is empty on these clusters — the
+                                                // picker overrides whatever `-A`/`-n` chose
+                                                // for the INITIAL connect with all-namespaces
+                                                // on every subsequent switch.
+                                                supervise(
+                                                    "watch",
+                                                    spawn_watch(
+                                                        client,
+                                                        pod_ar2,
+                                                        None,
+                                                        store,
+                                                        tx2.clone(),
+                                                    ),
+                                                    tx2,
+                                                )
+                                            },
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                            Overlay::NamespacePicker(p) => {
+                                if let Some(label) = resolve_picker_choice(&p, i) {
+                                    let ns_choice = namespace_choice_from_label(&label);
+                                    let client_now = get_current_client(&current_client);
+                                    let mut s = session.lock().await;
+                                    s.handles.abort_all();
+                                    s.store = Arc::new(RwLock::new(ResourceStore::new()));
+                                    let new_store = s.store.clone();
+                                    let handle = spawn_watch(
+                                        client_now,
+                                        pod_ar.clone(),
+                                        ns_choice.clone(),
+                                        new_store,
+                                        tx.clone(),
+                                    );
+                                    s.handles.push(supervise("watch", handle, tx.clone()));
+                                    drop(s);
+                                    display_namespace = ns_choice
+                                        .unwrap_or_else(|| ALL_NAMESPACES_LABEL.to_string());
+                                    is_fallback_namespace = false;
+                                }
+                            }
+                            Overlay::None => {}
+                        }
+                        needs_redraw = true;
+                    }
+                }
                 Action::None => {}
             }
         }
@@ -376,20 +704,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         needs_redraw = false;
 
         hits.clear();
+        let show_hint = should_hint_all_namespaces(is_fallback_namespace, objects.len());
         term.draw(|f| {
-            let chunks =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(f.area());
-            render_table(f, chunks[0], &objects, &pod_gvk, &mut view, &mut hits);
-            let show_hint = should_hint_all_namespaces(is_fallback_namespace, objects.len());
-            render_status(
+            render_frame(
                 f,
-                chunks[1],
+                &objects,
+                &pod_gvk,
+                &mut view,
                 &context_name,
                 &display_namespace,
                 status,
-                objects.len(),
                 last_error.as_deref(),
                 show_hint,
+                connecting_name.as_deref(),
+                &overlay,
                 &mut hits,
             );
         })?;
@@ -554,16 +882,17 @@ mod tests {
     mod overlay_wiring {
         use super::*;
         use k8s_openapi::api::core::v1::Pod;
+        use kube::Client;
         use kube::api::{ApiResource, DynamicObject};
         use kube_tui::app::Overlay;
         use kube_tui::app::event::WatchStatus;
-        use kube_tui::cluster::{AuthMethod, ClusterEntry, ClusterId, ConnectionState, ContextInfo};
+        use kube_tui::cluster::{
+            AuthMethod, ClusterEntry, ClusterId, ConnectionState, ContextInfo,
+        };
         use kube_tui::ui::hit::HitTarget;
         use kube_tui::ui::theme;
         use kube_tui::ui::views::picker::{Picker, PickerItem};
-        use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use kube::Client;
 
         fn entry(name: &str, state: ConnectionState) -> ClusterEntry {
             ClusterEntry {
@@ -693,15 +1022,18 @@ mod tests {
             Client::try_from(kube::Config::new(uri)).expect("building a client performs no I/O")
         }
 
-        #[test]
-        fn current_client_round_trips_through_the_cell() {
+        // `Client::try_from` spawns an internal tower buffer task even
+        // though it performs no I/O itself, so it needs a Tokio runtime —
+        // matching session.rs's own `offline_client` tests.
+        #[tokio::test]
+        async fn current_client_round_trips_through_the_cell() {
             let cell = StdMutex::new(offline_client());
             set_current_client(&cell, offline_client());
             let _ = get_current_client(&cell); // must not panic
         }
 
-        #[test]
-        fn get_current_client_recovers_from_a_poisoned_mutex() {
+        #[tokio::test]
+        async fn get_current_client_recovers_from_a_poisoned_mutex() {
             let cell = StdMutex::new(offline_client());
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _guard = cell.lock().expect("not yet poisoned");

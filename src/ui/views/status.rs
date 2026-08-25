@@ -28,6 +28,14 @@ pub fn render_status(
     count: usize,
     error: Option<&str>,
     show_all_namespaces_hint: bool,
+    // Name of the cluster a switch is connecting to, if any — the registry
+    // is the only source of truth for this, so it must come from a scan of
+    // `ConnectionState::Connecting` entries, not from `context`.
+    //
+    // While a connect is in flight the active cluster is still the OLD one
+    // (teardown only happens on success), so `context` alone shows no sign
+    // of the attempt in progress — this is what makes that visible.
+    connecting: Option<&str>,
     hits: &mut HitRegistry,
 ) {
     let (label, style) = status_label(status);
@@ -35,7 +43,7 @@ pub fn render_status(
     let mut spans = vec![
         Span::styled(
             format!(" {context} "),
-            Style::default().fg(theme::PERIWINKLE),
+            Style::default().fg(theme::cluster_hue(context)),
         ),
         Span::styled("· ", Style::default().fg(theme::MIST)),
         Span::styled(format!("{namespace} "), Style::default().fg(theme::PAPER)),
@@ -44,6 +52,14 @@ pub fn render_status(
         Span::styled("· ", Style::default().fg(theme::MIST)),
         Span::styled(label, style),
     ];
+
+    if let Some(name) = connecting {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            format!("connecting to {name}…"),
+            Style::default().fg(theme::AMBER),
+        ));
+    }
 
     if let Some(e) = error {
         spans.push(Span::styled("  ", Style::default()));
@@ -330,7 +346,9 @@ mod tests {
             })
             .unwrap();
             let buf = term.backend().buffer();
-            (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect::<String>()
+            (0..80)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
         };
         assert!(
             text.contains("connecting") && text.contains("dev"),
