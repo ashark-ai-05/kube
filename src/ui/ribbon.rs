@@ -10,7 +10,12 @@ pub const RIBBON_WIDTH: u16 = 1;
 /// Reserve the leftmost column for the ribbon.
 pub fn split_ribbon(area: Rect) -> (Rect, Rect) {
     let ribbon_w = RIBBON_WIDTH.min(area.width);
-    let ribbon = Rect { x: area.x, y: area.y, width: ribbon_w, height: area.height };
+    let ribbon = Rect {
+        x: area.x,
+        y: area.y,
+        width: ribbon_w,
+        height: area.height,
+    };
     let rest = Rect {
         x: area.x.saturating_add(ribbon_w),
         y: area.y,
@@ -41,7 +46,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect { Rect { x, y, width: w, height: h } }
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
 
     #[test]
     fn split_reserves_exactly_one_column_for_the_ribbon() {
@@ -49,7 +61,10 @@ mod tests {
         assert_eq!(ribbon.width, RIBBON_WIDTH);
         assert_eq!(ribbon.height, 24);
         assert_eq!(rest.x, RIBBON_WIDTH);
-        assert_eq!(rest.width, 79, "the rest of the screen must lose exactly the ribbon column");
+        assert_eq!(
+            rest.width, 79,
+            "the rest of the screen must lose exactly the ribbon column"
+        );
     }
 
     #[test]
@@ -66,12 +81,17 @@ mod tests {
         term.draw(|f| {
             let (ribbon, _) = split_ribbon(f.area());
             render_ribbon(f, ribbon, Some("tst-wsdc"), &mut hits);
-        }).unwrap();
+        })
+        .unwrap();
 
         let buf = term.backend().buffer();
         let expected = theme::cluster_hue("tst-wsdc");
         for y in 0..5 {
-            assert_eq!(buf[(0, y)].style().fg, Some(expected), "ribbon row {y} was not the cluster hue");
+            assert_eq!(
+                buf[(0, y)].style().fg,
+                Some(expected),
+                "ribbon row {y} was not the cluster hue"
+            );
         }
     }
 
@@ -83,7 +103,8 @@ mod tests {
             term.draw(|f| {
                 let (ribbon, _) = split_ribbon(f.area());
                 render_ribbon(f, ribbon, Some(name), &mut hits);
-            }).unwrap();
+            })
+            .unwrap();
             term.backend().buffer()[(0, 0)].style().fg
         };
         assert_ne!(paint("prod-eu"), paint("staging"));
@@ -96,8 +117,12 @@ mod tests {
         term.draw(|f| {
             let (ribbon, _) = split_ribbon(f.area());
             render_ribbon(f, ribbon, None, &mut hits);
-        }).unwrap();
-        assert_eq!(term.backend().buffer()[(0, 0)].style().fg, Some(theme::DUSK));
+        })
+        .unwrap();
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].style().fg,
+            Some(theme::DUSK)
+        );
     }
 
     #[test]
@@ -107,9 +132,14 @@ mod tests {
         term.draw(|f| {
             let (ribbon, _) = split_ribbon(f.area());
             render_ribbon(f, ribbon, Some("prod"), &mut hits);
-        }).unwrap();
+        })
+        .unwrap();
         for y in 0..5 {
-            assert_eq!(hits.hit(0, y), Some(&HitTarget::Ribbon), "ribbon not clickable at y={y}");
+            assert_eq!(
+                hits.hit(0, y),
+                Some(&HitTarget::Ribbon),
+                "ribbon not clickable at y={y}"
+            );
         }
     }
 }
