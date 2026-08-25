@@ -75,7 +75,7 @@ mod tests {
         term.draw(|f| {
             let area = f.area();
             render_status(
-                f, area, "prod-eu", "payments", status, count, error, false, &mut hits,
+                f, area, "prod-eu", "payments", status, count, error, false, None, &mut hits,
             );
         })
         .unwrap();
@@ -143,6 +143,7 @@ mod tests {
                 42,
                 None,
                 false,
+                None,
                 &mut hits,
             );
         })
@@ -168,6 +169,7 @@ mod tests {
                 0,
                 None,
                 true,
+                None,
                 &mut hits,
             );
         })
@@ -196,6 +198,7 @@ mod tests {
                 5,
                 None,
                 false,
+                None,
                 &mut hits,
             );
         })
@@ -224,6 +227,7 @@ mod tests {
                 0,
                 Some("forbidden"),
                 true,
+                None,
                 &mut hits,
             );
         })
@@ -234,6 +238,112 @@ mod tests {
         assert!(
             !text.contains("try -A"),
             "hint should not appear when there's an error; got: {text}"
+        );
+    }
+
+    // --- Task 9: cluster hue in the status bar and "connecting" visibility ---
+
+    #[test]
+    fn the_cluster_name_renders_in_its_own_hue_not_a_fixed_chrome_colour() {
+        let text_style_at = |context: &str| {
+            let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            let mut hits = HitRegistry::new();
+            term.draw(|f| {
+                let area = f.area();
+                render_status(
+                    f,
+                    area,
+                    context,
+                    "payments",
+                    WatchStatus::Synced,
+                    1,
+                    None,
+                    false,
+                    None,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+            term.backend().buffer()[(0, 0)].style().fg
+        };
+        assert_eq!(
+            text_style_at("prod-eu"),
+            Some(theme::cluster_hue("prod-eu")),
+            "the context name must render in that cluster's own hue"
+        );
+        assert_ne!(
+            text_style_at("prod-eu"),
+            Some(theme::PERIWINKLE),
+            "PERIWINKLE is chrome, not a cluster hue — the old fixed colour must be gone"
+        );
+    }
+
+    #[test]
+    fn two_different_clusters_show_different_name_colours() {
+        let fg_for = |context: &str| {
+            let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            let mut hits = HitRegistry::new();
+            term.draw(|f| {
+                let area = f.area();
+                render_status(
+                    f,
+                    area,
+                    context,
+                    "payments",
+                    WatchStatus::Synced,
+                    1,
+                    None,
+                    false,
+                    None,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+            term.backend().buffer()[(0, 0)].style().fg
+        };
+        assert_ne!(fg_for("prod-eu"), fg_for("staging"));
+    }
+
+    #[test]
+    fn a_connecting_switch_is_visible_even_though_the_active_cluster_is_still_the_old_one() {
+        // Task 8's hazard 2: while a connect is in flight the active cluster
+        // is still the OLD one, so a status bar driven only by `context` would
+        // show no sign of the attempt. The caller is expected to scan the
+        // registry for a `Connecting` entry and pass its name here.
+        let text = {
+            let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            let mut hits = HitRegistry::new();
+            term.draw(|f| {
+                let area = f.area();
+                render_status(
+                    f,
+                    area,
+                    "prod-eu", // still the OLD active cluster
+                    "payments",
+                    WatchStatus::Synced,
+                    1,
+                    None,
+                    false,
+                    Some("dev"), // switching TO dev
+                    &mut hits,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect::<String>()
+        };
+        assert!(
+            text.contains("connecting") && text.contains("dev"),
+            "connecting state must be visible; got: {text}"
+        );
+    }
+
+    #[test]
+    fn with_no_switch_in_progress_no_connecting_text_appears() {
+        let text = render(WatchStatus::Synced, 42, None);
+        assert!(
+            !text.contains("connecting"),
+            "must not claim a connection is in progress when none is; got: {text}"
         );
     }
 }

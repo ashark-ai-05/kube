@@ -548,4 +548,275 @@ mod tests {
             "aborting the supervisor must cancel its watch, not detach it"
         );
     }
+
+    // --- Task 9: overlays, focus, and input ---
+
+    mod overlay_wiring {
+        use super::*;
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::api::{ApiResource, DynamicObject};
+        use kube_tui::app::Overlay;
+        use kube_tui::app::event::WatchStatus;
+        use kube_tui::cluster::{AuthMethod, ClusterEntry, ClusterId, ConnectionState, ContextInfo};
+        use kube_tui::ui::hit::HitTarget;
+        use kube_tui::ui::theme;
+        use kube_tui::ui::views::picker::{Picker, PickerItem};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use kube::Client;
+
+        fn entry(name: &str, state: ConnectionState) -> ClusterEntry {
+            ClusterEntry {
+                id: ClusterId(name.to_string()),
+                context: ContextInfo {
+                    name: name.to_string(),
+                    cluster: format!("{name}-cluster"),
+                    namespace: None,
+                    is_current: false,
+                    auth: AuthMethod::None,
+                },
+                state,
+            }
+        }
+
+        fn pod_in(name: &str, ns: &str) -> Arc<DynamicObject> {
+            Arc::new(DynamicObject::new(name, &ApiResource::erase::<Pod>(&())).within(ns))
+        }
+
+        #[test]
+        fn cluster_picker_items_reflect_the_registry_not_a_guess() {
+            let entries = vec![
+                entry("prod", ConnectionState::Disconnected),
+                entry("dev", ConnectionState::Connecting),
+                entry(
+                    "staging",
+                    ConnectionState::Failed {
+                        reason: "no route to host".into(),
+                    },
+                ),
+            ];
+            let items = cluster_picker_items(&entries);
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0].label, "prod");
+            assert_eq!(items[0].detail, "");
+            assert_eq!(items[1].label, "dev");
+            assert!(
+                items[1].detail.contains("connecting"),
+                "got {:?}",
+                items[1].detail
+            );
+            assert_eq!(items[2].label, "staging");
+            assert!(
+                items[2].detail.contains("no route to host"),
+                "a failure reason must reach the picker, got {:?}",
+                items[2].detail
+            );
+            assert_eq!(items[0].accent, Some(theme::cluster_hue("prod")));
+        }
+
+        #[test]
+        fn namespace_picker_items_list_distinct_namespaces_plus_all_namespaces() {
+            // Namespaces out of alphabetical order and repeated across
+            // objects, so dedup and sort are both actually exercised.
+            let objects = vec![
+                pod_in("a", "zeta"),
+                pod_in("b", "alpha"),
+                pod_in("c", "zeta"),
+                pod_in("d", "prod"),
+            ];
+            let items = namespace_picker_items(&objects);
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
+                "all-namespaces sentinel first, then distinct namespaces sorted"
+            );
+        }
+
+        #[test]
+        fn the_all_namespaces_label_maps_to_none() {
+            assert_eq!(namespace_choice_from_label(ALL_NAMESPACES_LABEL), None);
+        }
+
+        #[test]
+        fn a_real_namespace_label_maps_to_itself() {
+            assert_eq!(
+                namespace_choice_from_label("payments"),
+                Some("payments".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_picker_choice_maps_the_filtered_index_not_the_raw_one() {
+            // Matches picker.rs's own non-vacuous fixture: "wsdc" matches only
+            // the item at unfiltered index 4, rendered at filtered position 0.
+            // A wrong implementation that skipped filtered_indices would
+            // return items[0] ("prod-eu") instead of items[4] ("tst-wsdc").
+            let picker = Picker {
+                title: "Clusters".into(),
+                items: ["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]
+                    .iter()
+                    .map(|n| PickerItem {
+                        label: n.to_string(),
+                        detail: String::new(),
+                        accent: None,
+                    })
+                    .collect(),
+                filter: "wsdc".into(),
+                selected: 0,
+            };
+            assert_eq!(
+                resolve_picker_choice(&picker, 0),
+                Some("tst-wsdc".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_picker_choice_out_of_range_is_none_not_a_panic() {
+            let picker = Picker {
+                title: "T".into(),
+                items: vec![PickerItem {
+                    label: "only".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 0,
+            };
+            assert_eq!(resolve_picker_choice(&picker, 5), None);
+        }
+
+        fn offline_client() -> Client {
+            let uri: http::Uri = "http://127.0.0.1:1/"
+                .parse()
+                .expect("a static, well-formed URI");
+            Client::try_from(kube::Config::new(uri)).expect("building a client performs no I/O")
+        }
+
+        #[test]
+        fn current_client_round_trips_through_the_cell() {
+            let cell = StdMutex::new(offline_client());
+            set_current_client(&cell, offline_client());
+            let _ = get_current_client(&cell); // must not panic
+        }
+
+        #[test]
+        fn get_current_client_recovers_from_a_poisoned_mutex() {
+            let cell = StdMutex::new(offline_client());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = cell.lock().expect("not yet poisoned");
+                panic!("poison it");
+            }));
+            // Must recover the value rather than panicking a second time.
+            let _ = get_current_client(&cell);
+            set_current_client(&cell, offline_client());
+        }
+
+        #[test]
+        fn render_frame_paints_the_ribbon_in_the_active_clusters_hue() {
+            let pods = vec![pod_in("a", "default")];
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let mut view = TableView::new();
+            let mut hits = HitRegistry::new();
+            let overlay = Overlay::None;
+
+            let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            term.draw(|f| {
+                render_frame(
+                    f,
+                    &pods,
+                    &gvk,
+                    &mut view,
+                    "prod-eu",
+                    "default",
+                    WatchStatus::Synced,
+                    None,
+                    false,
+                    None,
+                    &overlay,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+
+            let buf = term.backend().buffer();
+            assert_eq!(
+                buf[(0, 0)].style().fg,
+                Some(theme::cluster_hue("prod-eu")),
+                "the ribbon must be wired into the real draw sequence"
+            );
+        }
+
+        #[test]
+        fn the_overlay_paints_over_the_table_and_status_drawn_before_it() {
+            // Draw order is ribbon, table, status, THEN the overlay last. If
+            // the overlay were drawn first instead, the table's own row text
+            // (drawn afterward, over the same region) would overwrite the
+            // picker's glyphs — HitRegistry's z-index still resolves
+            // PickerRow correctly either way (z=1 always beats z=0
+            // regardless of draw order), so this must be a VISUAL check, not
+            // a hit-resolution one, to actually catch that mutation.
+            let pods: Vec<Arc<DynamicObject>> = (0..30)
+                .map(|i| pod_in(&format!("pod-{i}"), "default"))
+                .collect();
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let mut view = TableView::new();
+            let mut hits = HitRegistry::new();
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items: vec![PickerItem {
+                    label: "prod".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 0,
+            });
+
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| {
+                render_frame(
+                    f,
+                    &pods,
+                    &gvk,
+                    &mut view,
+                    "prod",
+                    "default",
+                    WatchStatus::Synced,
+                    None,
+                    false,
+                    None,
+                    &overlay,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+
+            let buf = term.backend().buffer();
+            let mut text = String::new();
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    text.push_str(buf[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            assert!(
+                text.contains("Clusters"),
+                "the picker's title must survive on top of the table drawn beneath it:\n{text}"
+            );
+
+            let mut found_picker_row = false;
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    if matches!(hits.hit(x, y), Some(HitTarget::PickerRow(_))) {
+                        found_picker_row = true;
+                    }
+                }
+            }
+            assert!(
+                found_picker_row,
+                "the picker's hit zones must resolve over the table's"
+            );
+        }
+    }
 }
