@@ -27,6 +27,24 @@ impl TableView {
     }
 }
 
+/// The half-open range of object indices that can actually be drawn.
+///
+/// Formatting the whole list every frame costs O(objects); this is meant to
+/// make it O(viewport). The block border takes one line at the top and one at
+/// the bottom, and the header takes one more, leaving `height - 3` data rows.
+///
+/// NOT WIRED INTO `render_table` — see the doc comment on `render_table` and
+/// task-4-report.md for why. This is kept as a tested, standalone primitive
+/// rather than deleted, because the window math itself is correct and useful;
+/// what's unsafe is handing ratatui's `Table` a *shorter* row list than the
+/// object count while `TableState::selected` holds an absolute index.
+pub fn visible_window(offset: usize, area_height: u16, total: usize) -> std::ops::Range<usize> {
+    let rows = area_height.saturating_sub(3) as usize;
+    let start = offset.min(total);
+    let end = start.saturating_add(rows).min(total);
+    start..end
+}
+
 /// Render the resource table and register a clickable zone for every visible row.
 ///
 /// Rows are registered against the same geometry ratatui uses to lay them out:
@@ -36,6 +54,23 @@ impl TableView {
 /// Zones map screen rows to the *visible window*, not to absolute object
 /// indices: ratatui scrolls `TableState::offset` to keep the selection on
 /// screen, so the object drawn at `area.y + 2` is `offset`, not `0`.
+///
+/// This still formats every object every frame — see `visible_window` above.
+/// Task 4 ("viewport-only formatting") asked for row construction to be
+/// windowed to only the visible slice, passing that shorter `Vec<Row>` to
+/// `Table` while keeping `view.state.selected` as an absolute object index.
+/// That combination was tested empirically (see task-4-report.md) and does
+/// not work: `ratatui::widgets::Table::render` clamps
+/// `state.selected` to `rows.len() - 1` whenever `selected >= rows.len()`, so
+/// handing it a windowed (shorter) row list silently corrupts the real,
+/// absolute selection the rest of the app depends on — not just a rendering
+/// glitch, but wrong data. There is no offset value that fixes this: the
+/// clamp fires purely off `rows.len()`. Translating `selected` into a
+/// window-relative index before the call avoids the clamp, but the task
+/// brief explicitly rules that out, and doing it anyway would resurrect the
+/// exact class of "absolute vs. window-relative index" defect Plan 1 shipped
+/// and this file's own tests exist to guard against. Reported
+/// DONE_WITH_CONCERNS rather than forcing a fit.
 pub fn render_table(
     f: &mut Frame,
     area: Rect,
@@ -353,7 +388,10 @@ mod tests {
     fn a_viewport_with_no_room_for_rows_yields_an_empty_window() {
         for h in [0u16, 1, 2, 3] {
             let w = visible_window(0, h, 100);
-            assert!(w.start >= w.end || w.len() <= 1, "height {h} produced {w:?}");
+            assert!(
+                w.start >= w.end || w.len() <= 1,
+                "height {h} produced {w:?}"
+            );
         }
         assert!(visible_window(0, 0, 100).is_empty());
     }
@@ -375,7 +413,9 @@ mod tests {
             "x".to_string()
         }
 
-        let pods: Vec<_> = (0..5000).map(|i| pod(&format!("p{i}"), "Running")).collect();
+        let pods: Vec<_> = (0..5000)
+            .map(|i| pod(&format!("p{i}"), "Running"))
+            .collect();
         let cols = vec![Column {
             header: "NAME",
             width: Constraint::Fill(1),
