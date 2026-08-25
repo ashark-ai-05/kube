@@ -50,7 +50,17 @@ impl Session {
 
 pub type SharedSession = Arc<Mutex<Session>>;
 
-/// Tear down the active cluster's watches, connect to `id`, and start again.
+/// Connect to `id` and, only once that has succeeded, replace the session:
+/// tear down the outgoing cluster's watches, mint a fresh store, and watch it.
+///
+/// **Connect first, tear down second.** Committing to the switch before
+/// knowing it will work leaves a failed attempt showing the old cluster's name
+/// above an empty table with nothing watching it — a state worse than either
+/// endpoint. On a corporate kubeconfig where some clusters are permanently
+/// unreachable behind the VPN that is a routine path, not an edge case, so a
+/// failure here changes nothing at all: the old cluster keeps its store, its
+/// watches and its place in the status bar. The cost is one extra live
+/// connection for the duration of the attempt.
 ///
 /// `connect` and `spawn_watches` are injected rather than called directly so
 /// that switching is testable without a cluster, a network or a kubeconfig.
@@ -72,12 +82,14 @@ pub async fn switch_cluster<C, F, W>(
     F: Future<Output = anyhow::Result<Client>>,
     W: FnOnce(Client, SharedStore) -> JoinHandle<()>,
 {
+    // 1. Mark the TARGET as connecting. Nothing belonging to the cluster
+    //    currently on screen is touched here — see the note above.
     let generation = {
         let mut s = session.lock().await;
 
-        // `set_active` rejects an id the registry does not know, so tearing the
-        // session down for one would leave the user with an empty table, no
-        // watches, and no way back to the cluster they were reading.
+        // `set_active` rejects an id the registry does not know, so a switch to
+        // one could never complete. Say so now rather than spending a
+        // thirty-second connect attempt discovering it.
         if s.registry.find(&id).is_none() {
             drop(s);
             let reason = format!("unknown cluster '{}'", id.0);
@@ -88,57 +100,63 @@ pub async fn switch_cluster<C, F, W>(
             return;
         }
 
-        // 1. Stop every watch belonging to the outgoing cluster.
-        s.handles.abort_all();
-
-        // 2. Replace the store; never clear and reuse it. `abort()` takes
-        //    effect at the task's next suspension point, so a watch that has
-        //    already read an event off its stream can finish its `apply` after
-        //    `abort_all()` has returned. Against a reused store that write
-        //    surfaces as an object from the old cluster listed under the new
-        //    one; against a replaced store it lands somewhere nobody reads,
-        //    and the race stops mattering instead of needing to be timed.
-        s.store = Arc::new(RwLock::new(ResourceStore::new()));
-
         s.registry.set_state(&id, ConnectionState::Connecting);
 
         // A second switch started while this one is still connecting must win.
-        // Without this, a slow cluster's connect could come back minutes later
-        // and start a watch writing into whichever store is current by then.
+        // Re-checked after the connect, which is where it does the real work: a
+        // stale success would otherwise tear down the cluster the user is on
+        // now in order to install an obsolete one.
         s.generation += 1;
         s.generation
     };
 
-    // 3. Announce the wait and arm a redraw before the attempt begins.
+    // 2. Announce the wait and arm a redraw before the attempt begins.
     let _ = tx.send(AppEvent::Session(SessionEvent::Connecting(id.clone())));
 
-    // 4. Connect with no lock held. See the note on this function.
+    // 3. Connect with no lock held. See the note on this function.
     let connected = connect().await;
 
     let mut s = session.lock().await;
     if s.generation != generation {
         // Superseded while we were connecting. Any client we obtained is
-        // dropped here rather than used: the session belongs to another
-        // cluster now, and reporting this one as connected would be a lie.
+        // dropped here rather than used: the session belongs to another cluster
+        // now, and both reporting this one as connected and tearing that
+        // cluster down to install this one would be wrong.
         s.registry.set_state(&id, ConnectionState::Disconnected);
         return;
     }
 
     match connected {
         Ok(client) => {
-            // 5. Adopt the cluster and watch the store minted above — not the
-            //    one the previous cluster's watches were writing into.
-            s.registry.set_state(&id, ConnectionState::Connected);
-            s.registry.set_active(&id);
+            // 4. The new cluster is reachable, so now — and only now — the old
+            //    one can go. Stop its watches first.
+            s.handles.abort_all();
+
+            // 5. Replace the store; never clear and reuse it. `abort()` takes
+            //    effect at the task's next suspension point, so a watch that
+            //    has already read an event off its stream can finish its
+            //    `apply` after `abort_all()` has returned. Against a reused
+            //    store that write surfaces as an object from the old cluster
+            //    listed under the new one; against a replaced store it lands
+            //    somewhere nobody reads, and the race stops mattering instead
+            //    of needing to be timed.
+            s.store = Arc::new(RwLock::new(ResourceStore::new()));
+
+            // 6. Watch the store minted just above — never the one the previous
+            //    cluster's watches were writing into.
             let store = s.store.clone();
             let handle = spawn_watches(client, store);
             s.handles.push(handle);
+
+            s.registry.set_active(&id);
+            s.registry.set_state(&id, ConnectionState::Connected);
             drop(s);
             let _ = tx.send(AppEvent::Session(SessionEvent::Connected(id)));
         }
         Err(e) => {
-            // The previous cluster stays active: a failed connection must not
-            // strand the user with no cluster selected at all.
+            // Nothing else changes. The previous cluster keeps its store, its
+            // watches and its place in the status bar: a failed connection must
+            // leave the user working with what they already had.
             let reason = format!("{e:#}");
             s.registry.set_state(
                 &id,
@@ -437,6 +455,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_connect_leaves_the_previous_cluster_working() {
+        // Tearing down before knowing the new cluster is reachable strands the
+        // user on a live cluster name with an empty table and nothing watching
+        // it. On a corporate kubeconfig some clusters are permanently
+        // unreachable behind the VPN, so this is a routine path, not an edge
+        // case: a failed switch must change nothing at all.
+        let session = session_over(&["prod", "dev"]);
+        let gvk = pod_gvk();
+
+        // Cluster A as the user left it: data on screen and a live watch.
+        let store_before = session.lock().await.store.clone();
+        store_before
+            .write()
+            .await
+            .apply(&gvk, &pod_ar(), watcher::Event::Apply(pod("prod-pod")));
+        session.lock().await.handles.push(live_watch());
+        let handles_before = session.lock().await.handles.len();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            tx,
+            || async { Err(anyhow::anyhow!("no route to host")) },
+            |_, _| live_watch(),
+        )
+        .await;
+
+        let (active, store_after, handles_after) = {
+            let s = session.lock().await;
+            (
+                s.registry.active().map(|e| e.id.0.clone()),
+                s.store.clone(),
+                s.handles.len(),
+            )
+        };
+        assert_eq!(
+            active.as_deref(),
+            Some("prod"),
+            "a failed switch must not change the active cluster"
+        );
+        assert!(
+            !store_after.read().await.objects(&gvk).is_empty(),
+            "prod's data must survive a failed switch to dev"
+        );
+        assert_eq!(
+            handles_after, handles_before,
+            "prod's watches must not be torn down by a failed switch"
+        );
+        assert!(
+            Arc::ptr_eq(&store_after, &store_before),
+            "prod's store must not even have been replaced"
+        );
+    }
+
+    #[tokio::test]
     async fn connecting_is_announced_and_the_lock_released_before_the_attempt() {
         // Some of these clusters sit behind a VPN and take tens of seconds to
         // fail. The UI must already say "connecting", and the session lock —
@@ -477,8 +551,9 @@ mod tests {
             "the cluster must already read as connecting when the attempt starts"
         );
         assert!(
-            !same_store,
-            "the store must already have been replaced when the attempt starts"
+            same_store,
+            "the previous cluster's store must still be intact while we connect: \
+             nothing is torn down until the new cluster answers"
         );
         assert_eq!(
             session_events(&mut rx).first(),
@@ -562,6 +637,7 @@ mod tests {
             |_, _| live_watch(),
         )
         .await;
+        let quicks_store = session.lock().await.store.clone();
         let _ = release_tx.send(());
         slow.await.expect("the superseded switch must not panic");
 
@@ -584,6 +660,11 @@ mod tests {
         assert!(
             !*slow_spawned.lock().expect("uncontended in a test"),
             "the superseded switch must not watch the new cluster's store"
+        );
+        assert!(
+            Arc::ptr_eq(&s.store, &quicks_store),
+            "teardown happens on success, so a stale success must not tear down \
+             the cluster the user is actually on"
         );
     }
 
