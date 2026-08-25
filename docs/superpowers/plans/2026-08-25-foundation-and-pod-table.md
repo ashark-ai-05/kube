@@ -55,7 +55,8 @@ These signatures were verified by compiling against the real crates on 2026-08-2
 | File | Responsibility |
 |---|---|
 | `Cargo.toml` | Dependencies, pinned per Global Constraints |
-| `src/main.rs` | Entry point; wires terminal guard, event loop, store |
+| `src/lib.rs` | Library root; declares every module (integration tests and the binary both link against it) |
+| `src/main.rs` | Binary entry point; wires terminal guard, event loop, store |
 | `src/terminal.rs` | Terminal lifecycle: raw mode, alt screen, mouse capture, panic hook, restore guard |
 | `src/app/mod.rs` | `App` state struct; owns store handle and UI state |
 | `src/app/event.rs` | `Event` enum, channel plumbing, drain-and-coalesce logic |
@@ -82,6 +83,7 @@ The design separates *policy* (when to restore) from *I/O* (how to restore) behi
 
 **Files:**
 - Create: `Cargo.toml`
+- Create: `src/lib.rs`
 - Create: `src/main.rs`
 - Create: `src/terminal.rs`
 
@@ -106,6 +108,10 @@ Replace `Cargo.toml` with:
 name = "kube-tui"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "kube_tui"
+path = "src/lib.rs"
 
 [[bin]]
 name = "kube"
@@ -244,12 +250,19 @@ Expected: PASS — 2 tests.
 
 - [ ] **Step 6: Wire up main.rs**
 
+Create `src/lib.rs`:
+
+```rust
+pub mod terminal;
+```
+
+The binary links against this library rather than re-declaring modules, so each
+module is compiled exactly once and integration tests (Task 11) can reach them.
+
 Replace `src/main.rs`:
 
 ```rust
-mod terminal;
-
-use terminal::{install_panic_hook, RealTerminal, TerminalGuard};
+use kube_tui::terminal::{install_panic_hook, RealTerminal, TerminalGuard};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -460,7 +473,7 @@ Create `src/app/mod.rs`:
 pub mod event;
 ```
 
-Add `mod app;` to `src/main.rs`.
+Add `pub mod app;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -621,7 +634,7 @@ pub mod config;
 pub use config::{connect, contexts_from_yaml, load_contexts, ContextInfo};
 ```
 
-Add `mod cluster;` to `src/main.rs`.
+Add `pub mod cluster;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -866,7 +879,7 @@ pub mod cache;
 pub use cache::{key_of, KindCache, ObjKey};
 ```
 
-Add `mod store;` to `src/main.rs`.
+Add `pub mod store;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1490,7 +1503,7 @@ pub mod hit;
 pub use hit::{HitRegistry, HitTarget};
 ```
 
-Add `mod ui;` to `src/main.rs`.
+Add `pub mod ui;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -2155,26 +2168,21 @@ Expected: PASS — 5 tests.
 Replace `src/main.rs`:
 
 ```rust
-mod app;
-mod cluster;
-mod store;
-mod terminal;
-mod ui;
-
-use app::event::{coalesce, AppEvent, WatchStatus};
-use app::input::{action_for, apply_selection, Action};
+use kube_tui::app::event::{coalesce, AppEvent, WatchStatus};
+use kube_tui::app::input::{action_for, apply_selection, Action};
+use kube_tui::{cluster, store, terminal, ui};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use ratatui::layout::{Constraint, Layout};
-use store::watch::{spawn_watch, ResourceStore, SharedStore};
+use kube_tui::store::watch::{spawn_watch, ResourceStore, SharedStore};
 use std::sync::Arc;
-use terminal::{install_panic_hook, RealTerminal, TerminalGuard};
+use kube_tui::terminal::{install_panic_hook, RealTerminal, TerminalGuard};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use ui::hit::HitRegistry;
-use ui::views::status::render_status;
-use ui::views::table::{render_table, TableView};
+use kube_tui::ui::hit::HitRegistry;
+use kube_tui::ui::views::status::render_status;
+use kube_tui::ui::views::table::{render_table, TableView};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -2461,9 +2469,10 @@ async fn store_reflects_a_deletion_made_during_the_watch() {
 }
 ```
 
-- [ ] **Step 3: Expose the modules to integration tests**
+- [ ] **Step 3: Confirm the library exposes every module**
 
-Integration tests link against the library target, so the crate needs one. Create `src/lib.rs`:
+The library target was created in Task 1 and each task added its module to it.
+Confirm `src/lib.rs` reads:
 
 ```rust
 pub mod app;
@@ -2473,19 +2482,8 @@ pub mod terminal;
 pub mod ui;
 ```
 
-Add to `Cargo.toml`:
-
-```toml
-[lib]
-name = "kube_tui"
-path = "src/lib.rs"
-```
-
-In `src/main.rs`, replace the five `mod ...;` declarations with:
-
-```rust
-use kube_tui::{app, cluster, store, terminal, ui};
-```
+Integration tests link against this library. No `Cargo.toml` change is needed —
+the `[lib]` section already exists from Task 1.
 
 - [ ] **Step 4: Run the test to verify it fails without a cluster, then passes with one**
 
