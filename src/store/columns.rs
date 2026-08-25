@@ -34,7 +34,7 @@ pub fn pod_restarts(obj: &DynamicObject) -> String {
     let total: i64 = container_statuses(obj)
         .iter()
         .filter_map(|c| c.get("restartCount").and_then(|r| r.as_i64()))
-        .sum();
+        .fold(0i64, |acc, n| acc.saturating_add(n));
     total.to_string()
 }
 
@@ -218,5 +218,23 @@ mod tests {
             vec!["NAME", "AGE"],
             "unknown kinds still render something useful"
         );
+    }
+
+    #[test]
+    fn age_unit_thresholds_are_exact_at_the_boundaries() {
+        // One second either side of each unit change. An off-by-one here is
+        // invisible in review but wrong on every row of every table.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        let at = |secs: i64| {
+            let t = now - chrono::Duration::seconds(secs);
+            format_age(&t.to_rfc3339(), now)
+        };
+
+        assert_eq!(at(59), "59s", "just under a minute stays in seconds");
+        assert_eq!(at(60), "1m", "exactly one minute switches to minutes");
+        assert_eq!(at(3_599), "59m", "just under an hour stays in minutes");
+        assert_eq!(at(3_600), "1h", "exactly one hour switches to hours");
+        assert_eq!(at(86_399), "23h", "just under a day stays in hours");
+        assert_eq!(at(86_400), "1d", "exactly one day switches to days");
     }
 }
