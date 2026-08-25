@@ -15,8 +15,8 @@ This is plan 1 of 4 for v1. Plans 2-4 (full browsing UI, logs, query) build on t
 These apply to every task. Every task's requirements implicitly include this section.
 
 - **Rust edition 2024.** Minimum toolchain 1.85.
-- **Exact dependency versions:** `kube = "4.2"` (features `runtime`, `client`, `derive`), `k8s-openapi = "0.28"` (feature `latest`), `ratatui = "0.30"`, `crossterm = "0.29"` (feature `event-stream`), `tokio = "1"` (feature `full`), `futures = "0.3"`, `serde_json = "1"`, `indexmap = "2"`, `chrono = "0.4"`, `anyhow = "1"`, `thiserror = "2"`.
-- **The UI layer never performs I/O and never `.await`s.** Any task that makes the render path async is wrong.
+- **Exact dependency versions:** `kube = "4.2"` (features `runtime`, `client`, `derive`, `oidc`, `http-proxy`, `socks5`, `gzip` — the last four support corporate SSO, proxies and compression), `k8s-openapi = "0.28"` (feature `latest`), `ratatui = "0.30"`, `crossterm = "0.29"` (feature `event-stream`), `tokio = "1"` (feature `full`), `futures = "0.3"`, `serde_json = "1"`, `indexmap = "2"`, `chrono = "0.4"`, `anyhow = "1"`, `thiserror = "2"`.
+- **The render closure passed to `term.draw` must be synchronous.** It must not perform I/O and must not acquire a lock. The event loop may `.await` on the event channel and on the store lock, but must never hold a lock across a draw. Reading a snapshot out of the store *before* calling `term.draw`, and drawing from that snapshot, is the intended pattern.
 - **Never render on a fixed tick.** Rendering happens only after the event channel drains.
 - **Never write to stdout/stderr while the alternate screen is active.** Use the error channel.
 - **Every panic path must restore the terminal first.**
@@ -55,7 +55,8 @@ These signatures were verified by compiling against the real crates on 2026-08-2
 | File | Responsibility |
 |---|---|
 | `Cargo.toml` | Dependencies, pinned per Global Constraints |
-| `src/main.rs` | Entry point; wires terminal guard, event loop, store |
+| `src/lib.rs` | Library root; declares every module (integration tests and the binary both link against it) |
+| `src/main.rs` | Binary entry point; wires terminal guard, event loop, store |
 | `src/terminal.rs` | Terminal lifecycle: raw mode, alt screen, mouse capture, panic hook, restore guard |
 | `src/app/mod.rs` | `App` state struct; owns store handle and UI state |
 | `src/app/event.rs` | `Event` enum, channel plumbing, drain-and-coalesce logic |
@@ -82,6 +83,7 @@ The design separates *policy* (when to restore) from *I/O* (how to restore) behi
 
 **Files:**
 - Create: `Cargo.toml`
+- Create: `src/lib.rs`
 - Create: `src/main.rs`
 - Create: `src/terminal.rs`
 
@@ -107,12 +109,16 @@ name = "kube-tui"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "kube_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kube"
 path = "src/main.rs"
 
 [dependencies]
-kube = { version = "4.2", features = ["runtime", "client", "derive"] }
+kube = { version = "4.2", features = ["runtime", "client", "derive", "oidc", "http-proxy", "socks5", "gzip"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
@@ -244,12 +250,19 @@ Expected: PASS — 2 tests.
 
 - [ ] **Step 6: Wire up main.rs**
 
+Create `src/lib.rs`:
+
+```rust
+pub mod terminal;
+```
+
+The binary links against this library rather than re-declaring modules, so each
+module is compiled exactly once and integration tests (Task 11) can reach them.
+
 Replace `src/main.rs`:
 
 ```rust
-mod terminal;
-
-use terminal::{install_panic_hook, RealTerminal, TerminalGuard};
+use kube_tui::terminal::{install_panic_hook, RealTerminal, TerminalGuard};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -294,7 +307,7 @@ The performance property "a watch storm of 10,000 deltas produces one repaint" l
 **Files:**
 - Create: `src/app/mod.rs`
 - Create: `src/app/event.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod app;`)
 
 **Interfaces:**
 - Consumes: nothing from Task 1.
@@ -460,7 +473,7 @@ Create `src/app/mod.rs`:
 pub mod event;
 ```
 
-Add `mod app;` to `src/main.rs`.
+Add `pub mod app;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -481,7 +494,7 @@ git commit -m "feat: event types with drain-and-coalesce for burst absorption"
 **Files:**
 - Create: `src/cluster/mod.rs`
 - Create: `src/cluster/config.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod cluster;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -521,15 +534,21 @@ contexts:
   context:
     cluster: dev-cluster
     user: dev-user
+- name: empty-ns
+  context:
+    cluster: dev-cluster
+    user: dev-user
+    namespace: ""
 users: []
 "#;
 
     #[test]
     fn parses_all_contexts() {
         let ctxs = contexts_from_yaml(SAMPLE).unwrap();
-        assert_eq!(ctxs.len(), 2);
+        assert_eq!(ctxs.len(), 3);
         assert_eq!(ctxs[0].name, "prod-eu");
         assert_eq!(ctxs[1].name, "dev");
+        assert_eq!(ctxs[2].name, "empty-ns");
     }
 
     #[test]
@@ -545,6 +564,16 @@ users: []
         assert_eq!(ctxs[0].cluster, "prod-cluster");
         assert_eq!(ctxs[0].namespace.as_deref(), Some("payments"));
         assert_eq!(ctxs[1].namespace, None, "absent namespace stays None, not empty string");
+    }
+
+    #[test]
+    fn an_explicitly_empty_namespace_becomes_none() {
+        // An explicit `namespace: ""` deserializes to Some("") — the filter in
+        // flatten() is what normalises it. Without this case that filter is
+        // unguarded and can be deleted without failing any test.
+        let ctxs = contexts_from_yaml(SAMPLE).unwrap();
+        let empty = ctxs.iter().find(|c| c.name == "empty-ns").expect("empty-ns context");
+        assert_eq!(empty.namespace, None, "empty string must normalise to None, not Some(\"\")");
     }
 
     #[test]
@@ -621,12 +650,12 @@ pub mod config;
 pub use config::{connect, contexts_from_yaml, load_contexts, ContextInfo};
 ```
 
-Add `mod cluster;` to `src/main.rs`.
+Add `pub mod cluster;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --lib cluster`
-Expected: PASS — 4 tests.
+Expected: PASS — 5 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -634,6 +663,366 @@ Expected: PASS — 4 tests.
 git add src/cluster src/main.rs
 git commit -m "feat: kubeconfig context parsing and client construction"
 ```
+
+---
+
+### Task 3b: Multi-cluster connection and configurable auth
+
+Added after Task 3 in response to a deployment constraint: this runs in a corporate
+domain against a single unified kubeconfig that defines many clusters, and the auth
+method varies per cluster — client certificates, static tokens, OIDC/SSO, and `exec`
+credential plugins must all work.
+
+Task 3 already parses every context from the kubeconfig. What is missing is the
+ability to connect to an *arbitrary named* context rather than only the current one,
+to merge several kubeconfig files the way `KUBECONFIG` does, and to report which auth
+method each context uses so the UI can show it and so failures are diagnosable.
+
+**Files:**
+- Create: `src/cluster/auth.rs`
+- Modify: `src/cluster/config.rs`
+- Modify: `src/cluster/mod.rs`
+- Modify: `Cargo.toml` (kube features — already listed in Global Constraints)
+
+**Interfaces:**
+- Consumes: `ContextInfo`, `contexts_from_yaml` (Task 3).
+- Produces:
+  - `enum AuthMethod { ClientCert, Token, Exec { command: String }, AuthProvider { name: String }, None }`
+  - `fn auth_method_for(kc: &Kubeconfig, user_name: &str) -> AuthMethod`
+  - `struct ConnectOptions { pub kubeconfig_paths: Vec<PathBuf>, pub context: Option<String>, pub accept_invalid_certs: bool }` with a `Default` impl
+  - `fn kubeconfig_paths_from_env(var: Option<&str>, home: &Path) -> Vec<PathBuf>`
+  - `fn merge_kubeconfigs(configs: Vec<Kubeconfig>) -> anyhow::Result<Kubeconfig>`
+  - `async fn connect_with(opts: &ConnectOptions) -> anyhow::Result<kube::Client>`
+  - `ContextInfo` gains a `pub auth: AuthMethod` field
+
+**Verified API notes** (confirmed by compiling against kube 4.2 — do not substitute):
+- `Config::from_custom_kubeconfig(kc, &KubeConfigOptions { context, cluster, user }).await?` selects a named context.
+- `Kubeconfig::read_from(path)?` reads one file; `a.merge(b)?` merges two, with `a` winning on conflict.
+- `named.auth_info` is `Option<AuthInfo>`; `ai.exec` is `Option<ExecConfig>` whose `.command` is `Option<String>` and `.args` is `Option<Vec<String>>`.
+- `ai.auth_provider` is `Option<AuthProviderConfig>` whose `.name` is `String`.
+- `ai.token` is an opaque secret type — only ever call `.is_some()` on it, never read or log its value.
+- `context.user` is `Option<String>`; `context.cluster` is `String`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/cluster/auth.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const MULTI: &str = r#"
+apiVersion: v1
+kind: Config
+current-context: prod
+clusters:
+- name: prod-cluster
+  cluster:
+    server: https://prod.corp.example.com
+contexts:
+- name: prod
+  context:
+    cluster: prod-cluster
+    user: cert-user
+- name: sso
+  context:
+    cluster: prod-cluster
+    user: oidc-user
+- name: cli
+  context:
+    cluster: prod-cluster
+    user: exec-user
+users:
+- name: cert-user
+  user:
+    client-certificate-data: Zm9v
+    client-key-data: YmFy
+- name: oidc-user
+  user:
+    auth-provider:
+      name: oidc
+      config:
+        idp-issuer-url: https://sso.corp.example.com
+- name: exec-user
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: kubelogin
+      args: ["get-token", "--server-id", "abc"]
+- name: token-user
+  user:
+    token: abcdef123456
+"#;
+
+    fn kc() -> kube::config::Kubeconfig {
+        kube::config::Kubeconfig::from_yaml(MULTI).expect("valid kubeconfig")
+    }
+
+    #[test]
+    fn detects_client_certificate_auth() {
+        assert_eq!(auth_method_for(&kc(), "cert-user"), AuthMethod::ClientCert);
+    }
+
+    #[test]
+    fn detects_oidc_auth_provider_by_name() {
+        assert_eq!(
+            auth_method_for(&kc(), "oidc-user"),
+            AuthMethod::AuthProvider { name: "oidc".to_string() }
+        );
+    }
+
+    #[test]
+    fn detects_exec_plugin_and_captures_the_command() {
+        assert_eq!(
+            auth_method_for(&kc(), "exec-user"),
+            AuthMethod::Exec { command: "kubelogin".to_string() },
+            "the helper binary name must be surfaced so a missing PATH entry is diagnosable"
+        );
+    }
+
+    #[test]
+    fn detects_static_token_auth() {
+        assert_eq!(auth_method_for(&kc(), "token-user"), AuthMethod::Token);
+    }
+
+    #[test]
+    fn an_unknown_user_reports_none_rather_than_panicking() {
+        assert_eq!(auth_method_for(&kc(), "nobody"), AuthMethod::None);
+    }
+
+    #[test]
+    fn kubeconfig_paths_split_on_colon_like_the_kubeconfig_env_var() {
+        let home = PathBuf::from("/home/u");
+        let paths = kubeconfig_paths_from_env(Some("/a/one.yaml:/b/two.yaml"), &home);
+        assert_eq!(paths, vec![PathBuf::from("/a/one.yaml"), PathBuf::from("/b/two.yaml")]);
+    }
+
+    #[test]
+    fn kubeconfig_paths_default_to_home_when_env_is_unset() {
+        let home = PathBuf::from("/home/u");
+        let paths = kubeconfig_paths_from_env(None, &home);
+        assert_eq!(paths, vec![PathBuf::from("/home/u/.kube/config")]);
+    }
+
+    #[test]
+    fn empty_segments_in_the_env_var_are_ignored() {
+        let home = PathBuf::from("/home/u");
+        let paths = kubeconfig_paths_from_env(Some("/a/one.yaml::"), &home);
+        assert_eq!(paths, vec![PathBuf::from("/a/one.yaml")], "a trailing colon must not yield an empty path");
+    }
+
+    #[test]
+    fn merging_keeps_contexts_from_every_file() {
+        let a = kube::config::Kubeconfig::from_yaml(
+            "apiVersion: v1\nkind: Config\ncontexts:\n- name: alpha\n  context:\n    cluster: c1\n    user: u1\nclusters: []\nusers: []\n",
+        )
+        .unwrap();
+        let b = kube::config::Kubeconfig::from_yaml(
+            "apiVersion: v1\nkind: Config\ncontexts:\n- name: beta\n  context:\n    cluster: c2\n    user: u2\nclusters: []\nusers: []\n",
+        )
+        .unwrap();
+        let merged = merge_kubeconfigs(vec![a, b]).unwrap();
+        let names: Vec<String> = merged.contexts.iter().map(|c| c.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_string()), "got {names:?}");
+        assert!(names.contains(&"beta".to_string()), "got {names:?}");
+    }
+
+    #[test]
+    fn merging_an_empty_list_is_an_error_not_a_panic() {
+        assert!(merge_kubeconfigs(vec![]).is_err());
+    }
+
+    #[test]
+    fn connect_options_default_to_current_context_and_secure_tls() {
+        let o = ConnectOptions::default();
+        assert_eq!(o.context, None, "None means: use the kubeconfig's current-context");
+        assert!(!o.accept_invalid_certs, "TLS verification must default to on");
+    }
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --lib auth`
+Expected: FAIL — `cannot find type AuthMethod`.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Prepend to `src/cluster/auth.rs`:
+
+```rust
+use anyhow::{anyhow, Context as _};
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use std::path::{Path, PathBuf};
+
+/// How a context authenticates. Surfaced in the UI so that an auth failure
+/// points at a cause rather than a generic 401.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthMethod {
+    ClientCert,
+    Token,
+    /// A credential plugin such as kubelogin or aws-iam-authenticator. The
+    /// command is captured because "binary not on PATH" is the usual failure.
+    Exec { command: String },
+    /// An auth-provider block, most commonly OIDC/SSO.
+    AuthProvider { name: String },
+    None,
+}
+
+/// Determine how a named user authenticates.
+///
+/// Order matters: exec and auth-provider are checked before the credential
+/// fields, because a kubeconfig may carry a stale cached token alongside the
+/// plugin that is actually used to refresh it.
+pub fn auth_method_for(kc: &Kubeconfig, user_name: &str) -> AuthMethod {
+    let Some(named) = kc.auth_infos.iter().find(|u| u.name == user_name) else {
+        return AuthMethod::None;
+    };
+    let Some(ai) = &named.auth_info else {
+        return AuthMethod::None;
+    };
+
+    if let Some(exec) = &ai.exec {
+        return AuthMethod::Exec {
+            command: exec.command.clone().unwrap_or_default(),
+        };
+    }
+    if let Some(provider) = &ai.auth_provider {
+        return AuthMethod::AuthProvider { name: provider.name.clone() };
+    }
+    if ai.client_certificate_data.is_some() || ai.client_certificate.is_some() {
+        return AuthMethod::ClientCert;
+    }
+    if ai.token.is_some() || ai.token_file.is_some() {
+        return AuthMethod::Token;
+    }
+    AuthMethod::None
+}
+
+/// Options controlling how a client is built.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOptions {
+    /// Kubeconfig files to load and merge, in precedence order.
+    pub kubeconfig_paths: Vec<PathBuf>,
+    /// Context to connect to. `None` uses the kubeconfig's current-context.
+    pub context: Option<String>,
+    /// Skip TLS verification. Defaults to false and should stay that way
+    /// outside deliberate debugging.
+    pub accept_invalid_certs: bool,
+}
+
+// Derived rather than hand-written: every field's default is its type's
+// default, and clippy::derivable_impls rejects the manual form under -D warnings.
+
+/// Resolve which kubeconfig files to read, following KUBECONFIG semantics:
+/// a colon-separated list, falling back to ~/.kube/config.
+pub fn kubeconfig_paths_from_env(var: Option<&str>, home: &Path) -> Vec<PathBuf> {
+    match var {
+        Some(v) if !v.trim().is_empty() => v
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => vec![home.join(".kube").join("config")],
+    }
+}
+
+/// Merge kubeconfigs in precedence order; earlier entries win on conflict.
+pub fn merge_kubeconfigs(configs: Vec<Kubeconfig>) -> anyhow::Result<Kubeconfig> {
+    let mut iter = configs.into_iter();
+    let first = iter.next().ok_or_else(|| anyhow!("no kubeconfig files to merge"))?;
+    iter.try_fold(first, |acc, next| {
+        acc.merge(next).context("merging kubeconfig files")
+    })
+}
+
+/// Build a client for the requested context, merging every configured
+/// kubeconfig first so one unified file (or several) can define many clusters.
+pub async fn connect_with(opts: &ConnectOptions) -> anyhow::Result<kube::Client> {
+    let mut loaded = Vec::new();
+    for path in &opts.kubeconfig_paths {
+        loaded.push(
+            Kubeconfig::read_from(path)
+                .with_context(|| format!("reading kubeconfig {}", path.display()))?,
+        );
+    }
+    let merged = if loaded.is_empty() {
+        Kubeconfig::read().context("reading kubeconfig")?
+    } else {
+        merge_kubeconfigs(loaded)?
+    };
+
+    let kco = KubeConfigOptions {
+        context: opts.context.clone(),
+        cluster: None,
+        user: None,
+    };
+    let mut cfg = kube::Config::from_custom_kubeconfig(merged, &kco)
+        .await
+        .with_context(|| match &opts.context {
+            Some(c) => format!("building config for context '{c}'"),
+            None => "building config for the current context".to_string(),
+        })?;
+    cfg.accept_invalid_certs = opts.accept_invalid_certs;
+
+    kube::Client::try_from(cfg).context("building Kubernetes client")
+}
+```
+
+- [ ] **Step 4: Attach the auth method to each context**
+
+In `src/cluster/config.rs`, add `pub auth: AuthMethod` to `ContextInfo` and populate it
+in `flatten` from the context's user name. The `user` field is `Option<String>`, so an
+absent user yields `AuthMethod::None`:
+
+```rust
+use crate::cluster::auth::{auth_method_for, AuthMethod};
+```
+
+Inside `flatten`, when building each `ContextInfo`:
+
+```rust
+            let user = ctx.as_ref().and_then(|c| c.user.clone());
+            let auth = match user {
+                Some(u) => auth_method_for(&kc_for_auth, &u),
+                None => AuthMethod::None,
+            };
+```
+
+`flatten` must therefore borrow the `Kubeconfig` before consuming its contexts — clone
+the `auth_infos` list up front, or restructure `flatten` to take `&Kubeconfig`. Adjust
+the existing Task 3 tests so each constructed `ContextInfo` includes the new field.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test --lib cluster`
+Expected: PASS — the 5 Task 3 tests plus 11 new ones.
+
+- [ ] **Step 6: Export from the module**
+
+Update `src/cluster/mod.rs`:
+
+```rust
+pub mod auth;
+pub mod config;
+pub use auth::{connect_with, kubeconfig_paths_from_env, merge_kubeconfigs, AuthMethod, ConnectOptions};
+pub use config::{connect, contexts_from_yaml, load_contexts, ContextInfo};
+```
+
+- [ ] **Step 7: Verify the whole suite and lints**
+
+Run: `cargo test`, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`
+Expected: all pass, no warnings.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/cluster Cargo.toml Cargo.lock
+git commit -m "feat: multi-cluster connection with configurable auth"
+```
+
 
 ---
 
@@ -646,7 +1035,7 @@ The fix is to accumulate init objects into a staging buffer and swap atomically 
 **Files:**
 - Create: `src/store/mod.rs`
 - Create: `src/store/cache.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod store;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -866,7 +1255,7 @@ pub mod cache;
 pub use cache::{key_of, KindCache, ObjKey};
 ```
 
-Add `mod store;` to `src/main.rs`.
+Add `pub mod store;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1330,7 +1719,7 @@ Ratatui is immediate-mode, so a click at `(col, row)` carries no meaning by itse
 **Files:**
 - Create: `src/ui/mod.rs`
 - Create: `src/ui/hit.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod ui;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1490,7 +1879,7 @@ pub mod hit;
 pub use hit::{HitRegistry, HitTarget};
 ```
 
-Add `mod ui;` to `src/main.rs`.
+Add `pub mod ui;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1616,9 +2005,13 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_viewport_renders_without_panicking() {
+    fn a_tiny_viewport_renders_exactly_the_available_lines() {
+        // A terminal too small for the header plus any row is a real crash
+        // source in layout code; this pins both non-panic and correct extent.
         let pods = vec![pod("a", "Running"), pod("b", "Running")];
-        let (_, _) = render(&pods, 12, 3);
+        let (text, _) = render(&pods, 12, 3);
+        assert_eq!(text.lines().count(), 3, "must fill exactly the viewport height");
+        assert!(text.lines().all(|l| l.chars().count() == 12), "no line may exceed the width");
     }
 
     #[test]
@@ -2151,26 +2544,21 @@ Expected: PASS — 5 tests.
 Replace `src/main.rs`:
 
 ```rust
-mod app;
-mod cluster;
-mod store;
-mod terminal;
-mod ui;
-
-use app::event::{coalesce, AppEvent, WatchStatus};
-use app::input::{action_for, apply_selection, Action};
+use kube_tui::app::event::{coalesce, AppEvent, WatchStatus};
+use kube_tui::app::input::{action_for, apply_selection, Action};
+use kube_tui::{cluster, store, terminal, ui};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use ratatui::layout::{Constraint, Layout};
-use store::watch::{spawn_watch, ResourceStore, SharedStore};
+use kube_tui::store::watch::{spawn_watch, ResourceStore, SharedStore};
 use std::sync::Arc;
-use terminal::{install_panic_hook, RealTerminal, TerminalGuard};
+use kube_tui::terminal::{install_panic_hook, RealTerminal, TerminalGuard};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use ui::hit::HitRegistry;
-use ui::views::status::render_status;
-use ui::views::table::{render_table, TableView};
+use kube_tui::ui::hit::HitRegistry;
+use kube_tui::ui::views::status::render_status;
+use kube_tui::ui::views::table::{render_table, TableView};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -2300,7 +2688,7 @@ git commit -m "feat: status bar and full application wiring"
 
 ### Task 11: Integration against a real cluster
 
-The unit tests prove the logic. Only a real API server proves the watch behaves, and this is the first point where the binary is run against real data.
+The unit tests prove the logic. Only a real API server proves the watch behaves, and this is the first point where the binary is run against real data. These tests are marked `#[ignore]` so the default `cargo test` stays green without a cluster.
 
 **Files:**
 - Create: `tests/integration_kind.rs`
@@ -2355,8 +2743,9 @@ Expected: `Cluster 'kube-tui-dev' ready with 3 pods in namespace 'demo'.`
 Create `tests/integration_kind.rs`:
 
 ```rust
-//! Cluster-backed tests. Skipped unless KUBE_TUI_IT=1 so `cargo test` stays
-//! green on machines with no cluster.
+//! Cluster-backed tests, marked #[ignore] so `cargo test` stays green on
+//! machines with no cluster. Run them with:
+//!   ./scripts/dev-cluster.sh && cargo test -- --ignored
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
@@ -2366,17 +2755,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
-fn enabled() -> bool {
-    std::env::var("KUBE_TUI_IT").as_deref() == Ok("1")
-}
-
 #[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn watch_populates_the_store_from_a_real_cluster() {
-    if !enabled() {
-        eprintln!("skipping: set KUBE_TUI_IT=1 and run scripts/dev-cluster.sh");
-        return;
-    }
-
     let client = kube_tui::cluster::connect().await.expect("connect to cluster");
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -2413,12 +2794,8 @@ async fn watch_populates_the_store_from_a_real_cluster() {
 }
 
 #[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
 async fn store_reflects_a_deletion_made_during_the_watch() {
-    if !enabled() {
-        eprintln!("skipping: set KUBE_TUI_IT=1");
-        return;
-    }
-
     let client = kube_tui::cluster::connect().await.expect("connect");
     let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -2468,9 +2845,10 @@ async fn store_reflects_a_deletion_made_during_the_watch() {
 }
 ```
 
-- [ ] **Step 3: Expose the modules to integration tests**
+- [ ] **Step 3: Confirm the library exposes every module**
 
-Integration tests link against the library target, so the crate needs one. Create `src/lib.rs`:
+The library target was created in Task 1 and each task added its module to it.
+Confirm `src/lib.rs` reads:
 
 ```rust
 pub mod app;
@@ -2480,26 +2858,15 @@ pub mod terminal;
 pub mod ui;
 ```
 
-Add to `Cargo.toml`:
-
-```toml
-[lib]
-name = "kube_tui"
-path = "src/lib.rs"
-```
-
-In `src/main.rs`, replace the five `mod ...;` declarations with:
-
-```rust
-use kube_tui::{app, cluster, store, terminal, ui};
-```
+Integration tests link against this library. No `Cargo.toml` change is needed —
+the `[lib]` section already exists from Task 1.
 
 - [ ] **Step 4: Run the test to verify it fails without a cluster, then passes with one**
 
 Run: `cargo test --test integration_kind`
-Expected: PASS trivially, printing the skip message.
+Expected: PASS with `0 passed; 2 ignored` — no cluster contacted.
 
-Run: `KUBE_TUI_IT=1 cargo test --test integration_kind -- --nocapture`
+Run: `cargo test --test integration_kind -- --ignored --nocapture`
 Expected: PASS — both tests, with the store reporting at least 3 pods.
 
 - [ ] **Step 5: Run the application against the real cluster**
@@ -2528,7 +2895,7 @@ git commit -m "test: cluster-backed integration tests against kind"
 ## Definition of Done
 
 - [ ] `cargo test` passes with no cluster present.
-- [ ] `KUBE_TUI_IT=1 cargo test` passes against a kind cluster.
+- [ ] `cargo test -- --ignored` passes against a kind cluster.
 - [ ] `cargo clippy -- -D warnings` is clean.
 - [ ] `cargo fmt --check` is clean.
 - [ ] `cargo run` shows live pods, navigable by mouse and keyboard.

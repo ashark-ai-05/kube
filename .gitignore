@@ -6,7 +6,13 @@
 /logs-export/
 *.log
 
-# Local cluster / kubeconfig artifacts — never commit cluster credentials
-kubeconfig
-*.kubeconfig
+# Local cluster / kubeconfig artifacts — never commit cluster credentials.
+# `kind get kubeconfig > kubeconfig.yaml` is this project's own idiom and
+# produces a stageable cluster-admin credential, so cover the suffixed and
+# prefixed spellings as well as the bare name. `*kubeconfig*` rather than a
+# prefix/suffix pair because the substring can land in the middle
+# (`kind-kubeconfig.yaml`). No bare `config` pattern: it would ignore
+# legitimate files.
+*kubeconfig*
+admin.conf
 .kube/
