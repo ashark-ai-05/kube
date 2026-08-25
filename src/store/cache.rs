@@ -202,4 +202,27 @@ mod tests {
         ));
         assert_eq!(c.len(), 2, "namespace is part of identity");
     }
+
+    #[test]
+    fn a_second_init_discards_a_partial_first_resync() {
+        // A failed list/watch attempt re-emits Init after some InitApply events
+        // have already arrived (kube-runtime resets InitPage/InitialWatch errors
+        // to Empty). The partial attempt's objects must not leak into the retry.
+        let mut c = KindCache::new(pod_ar());
+        c.apply(watcher::Event::Apply(pod("live")));
+
+        c.apply(watcher::Event::Init);
+        c.apply(watcher::Event::InitApply(pod("partial")));
+
+        // Connection drops mid-resync; the watcher restarts the sequence.
+        c.apply(watcher::Event::Init);
+        c.apply(watcher::Event::InitApply(pod("real")));
+        c.apply(watcher::Event::InitDone);
+
+        assert_eq!(
+            names(&c),
+            vec!["real"],
+            "objects from the abandoned first resync must not survive"
+        );
+    }
 }
