@@ -7,6 +7,7 @@ pub enum HitTarget {
     ColumnHeader(usize),
     StatusBar,
     Background,
+    Ribbon,
 }
 
 /// Maps screen coordinates back to meaning.
