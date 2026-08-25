@@ -1,3 +1,4 @@
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
@@ -9,6 +10,8 @@ use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::views::status::render_status;
 use kube_tui::ui::views::table::{TableView, render_table};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -120,11 +123,21 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut term = ratatui::init();
-    // The guard must exist before any fallible call that can `?`-return: once
-    // `ratatui::init()` has entered the alternate screen and raw mode, nothing
-    // else restores the terminal until this guard drops.
-    let mut guard = TerminalGuard::new(RealTerminal);
+    // Deliberately NOT `ratatui::init()`: it calls `std::panic::take_hook()`
+    // and installs a hook that restores the terminal from *any* thread, which
+    // both discards the hook installed above and tears the screen down under a
+    // still-running render loop when a background task panics. Manual setup
+    // installs no hook, and `TerminalGuard` already covers everything
+    // `ratatui::init()` gave us.
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    // The guard must exist before any further fallible call that can
+    // `?`-return: raw mode and the alternate screen are now on, and nothing
+    // else restores the terminal until this guard drops. It is installed
+    // before mouse capture so no successful setup step is ever left un-undone.
+    let _guard = TerminalGuard::new(RealTerminal);
+    let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
 
     let mut view = TableView::new();
@@ -204,8 +217,10 @@ async fn main() -> anyhow::Result<()> {
         })?;
     }
 
-    guard.disarm();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-    ratatui::restore();
+    // No explicit teardown: dropping `term` shows the cursor again and then
+    // `_guard` runs `RealTerminal::restore()`, which is exactly the disable
+    // mouse capture / leave alternate screen / disable raw mode sequence the
+    // old `ratatui::restore()` path performed. Normal exit and panic exit now
+    // share one restoration implementation, so neither can drift from the other.
     Ok(())
 }
