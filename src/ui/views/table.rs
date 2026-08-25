@@ -99,6 +99,10 @@ pub fn render_table(
     view: &mut TableView,
     hits: &mut HitRegistry,
 ) {
+    // Objects can shrink between frames (a pod is deleted), leaving `selected`
+    // past the end. Clamp here so no caller has to remember to.
+    view.selected = view.selected.min(objects.len().saturating_sub(1));
+
     let columns = columns_for(gvk);
     let widths: Vec<Constraint> = columns.iter().map(|c| c.width).collect();
 
@@ -385,6 +389,40 @@ mod tests {
         assert!(
             !is_bold(2),
             "an unselected row (pod-0, drawn at y=2) must not be bold"
+        );
+    }
+
+    #[test]
+    fn a_selection_past_the_end_is_clamped_when_the_list_shrinks() {
+        // A watch delete can drop objects out from under the selection.
+        let pods: Vec<_> = (0..3)
+            .map(|i| pod(&format!("pod-{i}"), "Running"))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 99;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
+            .unwrap();
+        assert_eq!(
+            view.selected, 2,
+            "selection must clamp to the last remaining object"
+        );
+    }
+
+    #[test]
+    fn rendering_an_empty_list_leaves_the_selection_at_zero() {
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 5;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &[], &gvk, &mut view, &mut hits))
+            .unwrap();
+        assert_eq!(
+            view.selected, 0,
+            "an empty list must not leave a dangling selection"
         );
     }
 

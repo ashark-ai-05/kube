@@ -237,7 +237,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 
     let mut view = TableView::new();
     let mut hits = HitRegistry::new();
-    let mut selected: usize = 0;
     let mut last_error: Option<String> = None;
     let mut status = WatchStatus::Initialising;
     // Nothing has been painted yet, so the first batch must draw whatever it is.
@@ -288,11 +287,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             match action_for(input, &hits) {
                 Action::Quit => quit = true,
                 Action::SelectRow(i) => {
-                    selected = i.min(objects.len().saturating_sub(1));
+                    view.selected = i.min(objects.len().saturating_sub(1));
                     needs_redraw = true;
                 }
                 Action::ScrollBy(d) => {
-                    selected = apply_selection(selected, d, objects.len());
+                    view.selected = apply_selection(view.selected, d, objects.len());
                     needs_redraw = true;
                 }
                 Action::SortByColumn(_) => needs_redraw = true,
@@ -306,12 +305,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             continue;
         }
         needs_redraw = false;
-
-        view.selected = if objects.is_empty() {
-            0
-        } else {
-            selected.min(objects.len() - 1)
-        };
 
         hits.clear();
         term.draw(|f| {
