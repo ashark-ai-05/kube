@@ -3,6 +3,10 @@ name = "kube-tui"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "kube_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kube"
 path = "src/main.rs"

@@ -1,6 +1,4 @@
-mod terminal;
-
-use terminal::{RealTerminal, TerminalGuard, install_panic_hook};
+use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
