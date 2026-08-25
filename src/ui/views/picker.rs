@@ -104,7 +104,7 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, hits: &mut 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(theme::border_style(true))
+        .border_style(theme::border_style())
         .title(Span::styled(title, theme::header_style()))
         .style(Style::default().bg(theme::ABYSS));
     let inner = block.inner(area);

@@ -133,7 +133,7 @@ pub fn render_table(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(theme::border_style(true))
+                .border_style(theme::border_style())
                 .title(gvk.kind.clone()),
         );
 

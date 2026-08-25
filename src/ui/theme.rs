@@ -59,8 +59,18 @@ pub fn phase_style(phase: &str) -> Style {
     Style::default().fg(color)
 }
 
-pub fn border_style(focused: bool) -> Style {
-    Style::default().fg(if focused { INDIGO } else { DUSK })
+/// The colour every border renders in.
+///
+/// This took a `focused: bool` until every production call site was found to
+/// pass `true` — there is no focus concept in the app, so the unfocused
+/// branch was unreachable, and it carried a known contrast problem with it
+/// (Task 1 measured DUSK at 1.91:1 against INK, far below legible). An
+/// unreachable branch holding a defect is worse than no branch: it reads as
+/// a supported state, and it would have shipped the moment focus was wired
+/// up. Introducing real focus is Plan 3 scope; when it arrives it should
+/// bring a recessive colour that has actually been measured.
+pub fn border_style() -> Style {
+    Style::default().fg(INDIGO)
 }
 
 pub fn header_style() -> Style {
@@ -152,7 +162,25 @@ mod tests {
     }
 
     #[test]
-    fn focus_is_visible_in_the_border() {
-        assert_ne!(border_style(true), border_style(false));
+    fn borders_never_render_in_the_token_that_failed_contrast() {
+        // Replaces `focus_is_visible_in_the_border`, which asserted that
+        // `border_style(true) != border_style(false)` — a difference no
+        // production call site could ever produce, since every one passed
+        // `true`. What is worth pinning instead is the outcome that made the
+        // unfocused branch a problem: DUSK measures 1.91:1 against INK, so
+        // no border may render in it. (DUSK survives as the picker's
+        // selected-row BACKGROUND, where it sits behind PAPER text and the
+        // contrast question is a different one.)
+        assert_ne!(
+            border_style().fg,
+            Some(DUSK),
+            "1.91:1 against INK is not a legible border"
+        );
+        assert_eq!(
+            border_style().fg,
+            Some(INDIGO),
+            "borders use the chrome token Task 1 measured at 4.28:1, which it \
+             recorded as acceptable for borders and bold text"
+        );
     }
 }
