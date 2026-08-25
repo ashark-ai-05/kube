@@ -18,8 +18,12 @@ pub enum SessionEvent {
 }
 
 /// Distinguish "we aborted this watch on purpose" from "this watch died".
-pub fn is_deliberate_abort(_e: &tokio::task::JoinError) -> bool {
-    todo!("is_deliberate_abort")
+///
+/// Aborting a task makes its `JoinHandle` resolve to `Err`, exactly as a panic
+/// does. A supervisor that cannot tell the two apart would quit the app on the
+/// first cluster switch, because switching is implemented by aborting watches.
+pub fn is_deliberate_abort(e: &tokio::task::JoinError) -> bool {
+    e.is_cancelled()
 }
 
 /// Everything that belongs to the cluster currently on screen.
@@ -47,18 +51,108 @@ impl Session {
 pub type SharedSession = Arc<Mutex<Session>>;
 
 /// Tear down the active cluster's watches, connect to `id`, and start again.
+///
+/// `connect` and `spawn_watches` are injected rather than called directly so
+/// that switching is testable without a cluster, a network or a kubeconfig.
+/// `main` passes `cluster::connect_with` and `store::watch::spawn_watch`.
+///
+/// Run this on a spawned task. It awaits `connect`, which for a cluster the
+/// current VPN cannot reach takes tens of seconds; called inline from the
+/// event loop it would freeze the UI for the whole attempt. The session lock
+/// is deliberately released before that await for the same reason — the event
+/// loop takes it on every pass to read the store.
 pub async fn switch_cluster<C, F, W>(
-    _session: SharedSession,
-    _id: ClusterId,
-    _tx: UnboundedSender<AppEvent>,
-    _connect: C,
-    _spawn_watches: W,
+    session: SharedSession,
+    id: ClusterId,
+    tx: UnboundedSender<AppEvent>,
+    connect: C,
+    spawn_watches: W,
 ) where
     C: FnOnce() -> F,
     F: Future<Output = anyhow::Result<Client>>,
     W: FnOnce(Client, SharedStore) -> JoinHandle<()>,
 {
-    todo!("switch_cluster")
+    let generation = {
+        let mut s = session.lock().await;
+
+        // `set_active` rejects an id the registry does not know, so tearing the
+        // session down for one would leave the user with an empty table, no
+        // watches, and no way back to the cluster they were reading.
+        if s.registry.find(&id).is_none() {
+            drop(s);
+            let reason = format!("unknown cluster '{}'", id.0);
+            let _ = tx.send(AppEvent::Session(SessionEvent::ConnectFailed {
+                id,
+                reason,
+            }));
+            return;
+        }
+
+        // 1. Stop every watch belonging to the outgoing cluster.
+        s.handles.abort_all();
+
+        // 2. Replace the store; never clear and reuse it. `abort()` takes
+        //    effect at the task's next suspension point, so a watch that has
+        //    already read an event off its stream can finish its `apply` after
+        //    `abort_all()` has returned. Against a reused store that write
+        //    surfaces as an object from the old cluster listed under the new
+        //    one; against a replaced store it lands somewhere nobody reads,
+        //    and the race stops mattering instead of needing to be timed.
+        s.store = Arc::new(RwLock::new(ResourceStore::new()));
+
+        s.registry.set_state(&id, ConnectionState::Connecting);
+
+        // A second switch started while this one is still connecting must win.
+        // Without this, a slow cluster's connect could come back minutes later
+        // and start a watch writing into whichever store is current by then.
+        s.generation += 1;
+        s.generation
+    };
+
+    // 3. Announce the wait and arm a redraw before the attempt begins.
+    let _ = tx.send(AppEvent::Session(SessionEvent::Connecting(id.clone())));
+
+    // 4. Connect with no lock held. See the note on this function.
+    let connected = connect().await;
+
+    let mut s = session.lock().await;
+    if s.generation != generation {
+        // Superseded while we were connecting. Any client we obtained is
+        // dropped here rather than used: the session belongs to another
+        // cluster now, and reporting this one as connected would be a lie.
+        s.registry.set_state(&id, ConnectionState::Disconnected);
+        return;
+    }
+
+    match connected {
+        Ok(client) => {
+            // 5. Adopt the cluster and watch the store minted above — not the
+            //    one the previous cluster's watches were writing into.
+            s.registry.set_state(&id, ConnectionState::Connected);
+            s.registry.set_active(&id);
+            let store = s.store.clone();
+            let handle = spawn_watches(client, store);
+            s.handles.push(handle);
+            drop(s);
+            let _ = tx.send(AppEvent::Session(SessionEvent::Connected(id)));
+        }
+        Err(e) => {
+            // The previous cluster stays active: a failed connection must not
+            // strand the user with no cluster selected at all.
+            let reason = format!("{e:#}");
+            s.registry.set_state(
+                &id,
+                ConnectionState::Failed {
+                    reason: reason.clone(),
+                },
+            );
+            drop(s);
+            let _ = tx.send(AppEvent::Session(SessionEvent::ConnectFailed {
+                id,
+                reason,
+            }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +314,9 @@ mod tests {
             old.len(),
             2,
             "the stale write must actually have landed — in the OLD store, got {:?}",
-            old.iter().map(|o| o.metadata.name.clone()).collect::<Vec<_>>()
+            old.iter()
+                .map(|o| o.metadata.name.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -348,8 +444,10 @@ mod tests {
         // must be free, or the whole app freezes for the duration.
         let session = session_over(&["prod", "dev"]);
         let old_store = session.lock().await.store.clone();
-        let observed: Arc<StdMutex<Option<(Option<ConnectionState>, bool)>>> =
-            Arc::new(StdMutex::new(None));
+        // What the connect attempt saw: the target's state and whether the
+        // store was still the old one. `None` overall means the lock was held.
+        type Snapshot = Option<(Option<ConnectionState>, bool)>;
+        let observed: Arc<StdMutex<Snapshot>> = Arc::new(StdMutex::new(None));
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let connect = {
@@ -542,7 +640,12 @@ mod tests {
         ));
         handle.await.expect("the switch must not panic");
         assert_eq!(
-            session.lock().await.registry.active().map(|e| e.id.0.as_str()),
+            session
+                .lock()
+                .await
+                .registry
+                .active()
+                .map(|e| e.id.0.as_str()),
             Some("dev")
         );
     }

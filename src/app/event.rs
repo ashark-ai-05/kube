@@ -61,7 +61,7 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
             AppEvent::WatchStatus { gvk, status } => {
                 statuses.insert(gvk, status);
             }
-            AppEvent::Session(_) => {}
+            AppEvent::Session(s) => out.session_events.push(s),
             AppEvent::Error(e) => out.errors.push(e),
             AppEvent::Quit => out.quit = true,
         }

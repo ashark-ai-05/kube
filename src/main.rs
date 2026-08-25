@@ -4,9 +4,11 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
+use kube_tui::app::session::{Session, SessionEvent, SharedSession, is_deliberate_abort};
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
+use kube_tui::cluster::ClusterRegistry;
+use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::views::status::render_status;
@@ -15,7 +17,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 /// Describe why a supervised task stopped, including the panic message.
@@ -37,19 +39,46 @@ fn join_failure_detail(task: &str, e: tokio::task::JoinError) -> String {
     }
 }
 
+/// Cancels the task it holds when dropped.
+///
+/// Dropping a `JoinHandle` *detaches* its task rather than cancelling it, so a
+/// supervisor that is aborted while awaiting one would leave the watch beneath
+/// it running — the exact leak `WatchHandles` exists to prevent.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Watch a background task and turn its death into a visible error plus a quit.
 ///
 /// Tokio swallows a panicking task at the `JoinHandle` boundary; without this
 /// the UI keeps drawing as if everything were still live.
+///
+/// Returns the supervisor's own handle. Only one owner can await a
+/// `JoinHandle`, and observing a panic requires owning it, so the supervisor
+/// takes the watch and this handle is what goes into `WatchHandles`; aborting
+/// it cancels the watch underneath through `AbortOnDrop`.
 fn supervise(
     task: &'static str,
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    let abort_watch = handle.abort_handle();
     tokio::spawn(async move {
-        if let Err(e) = handle.await {
-            let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
-            let _ = tx.send(AppEvent::Quit);
+        let _cancel_on_abort = AbortOnDrop(abort_watch);
+        match handle.await {
+            Ok(()) => {}
+            // Switching clusters aborts the outgoing cluster's watches. That
+            // is a normal teardown, not a crash: quitting here would exit the
+            // application on the user's first cluster switch.
+            Err(e) if is_deliberate_abort(&e) => {}
+            Err(e) => {
+                let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
+                let _ = tx.send(AppEvent::Quit);
+            }
         }
     })
 }
@@ -113,7 +142,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     };
 
     let contexts = cluster::load_contexts().unwrap_or_default();
-    let (context_name, context_namespace, namespace_from_context) = contexts
+    let (startup_context_name, context_namespace, namespace_from_context) = contexts
         .iter()
         .find(|c| c.is_current)
         .map(|c| {
@@ -142,7 +171,12 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
     };
 
-    let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+    // Everything belonging to "the cluster on screen" lives behind one handle
+    // so that a switch can replace it wholesale — the store in particular is
+    // replaced rather than cleared. See `switch_cluster`.
+    let session: SharedSession = Arc::new(Mutex::new(Session::new(
+        ClusterRegistry::from_contexts(contexts),
+    )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     let pod_ar = ApiResource::erase::<Pod>(&());
@@ -151,14 +185,22 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         client.clone(),
         pod_ar,
         watch_namespace,
-        store.clone(),
+        session.lock().await.store.clone(),
         tx.clone(),
     );
 
     // Tokio swallows a panicking task at the JoinHandle boundary. Without this,
     // a dead watch leaves the UI drawing indefinitely against a store nothing
     // is updating any more, showing stale data as if it were live.
-    let _watch_supervisor = supervise("watch", watch_handle, tx.clone());
+    //
+    // The session tracks the SUPERVISOR's handle, not the watch's, so that the
+    // first cluster switch tears this watch down with all the others; aborting
+    // a supervisor cancels its watch. See `supervise`.
+    session
+        .lock()
+        .await
+        .handles
+        .push(supervise("watch", watch_handle, tx.clone()));
 
     // Feed terminal input into the same channel so there is one wake source.
     let input_handle = {
@@ -192,6 +234,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // Same reasoning as the watch task: a panicking input reader would
     // otherwise stop delivering keystrokes and mouse clicks with no visible
     // symptom beyond "the UI stopped responding".
+    //
+    // Deliberately not tracked in the session: the input reader outlives every
+    // cluster, so a switch must not abort it.
     let _input_supervisor = supervise("input", input_handle, tx.clone());
 
     // `kill <pid>` skips every `Drop`, so without this the process dies holding
@@ -268,7 +313,31 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             status = *s;
             needs_redraw = true;
         }
+        // A switch changes the ribbon, the status bar and the whole table, and
+        // "connecting" must appear before the attempt that produced it
+        // finishes — which is the entire reason it is announced as an event.
+        if !batch.session_events.is_empty() {
+            needs_redraw = true;
+        }
+        for e in &batch.session_events {
+            if let SessionEvent::ConnectFailed { id, reason } = e {
+                last_error = Some(format!("connecting to {}: {reason}", id.0));
+            }
+        }
 
+        // A cluster switch REPLACES the store and changes which cluster is
+        // active, so both are re-read every pass rather than captured once: a
+        // clone taken before a switch would keep showing the previous
+        // cluster's objects under the previous cluster's name for ever.
+        //
+        // The session guard is released before the store is locked — holding
+        // it across an await would block `switch_cluster`, which needs it to
+        // announce "connecting" while this loop is still running.
+        let (store, active_cluster) = {
+            let s = session.lock().await;
+            (s.store.clone(), s.registry.active().map(|e| e.id.0.clone()))
+        };
+        let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         // Read the store snapshot into a local Vec before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
         let objects = store.read().await.objects(&pod_gvk);
