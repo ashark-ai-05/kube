@@ -194,6 +194,31 @@ mod tests {
         (text, hits)
     }
 
+    /// Render the picker and return the `Style` painted at the label text of
+    /// two given row positions (0-indexed within the visible/filtered list).
+    /// Geometry mirrors `render_picker`'s own layout — one row for the top
+    /// border, one for the filter line, so row 0's label starts at (x=3,
+    /// y=2) — confirmed against the actual rendered buffer (dumped via
+    /// `render_to_string`) rather than assumed:
+    /// ```text
+    ///  0: "╭ Clusters ────...
+    ///  1: "│⌕             ...
+    ///  2: "│▊ prod-eu     ...   <- row 0, label starts at x=3
+    ///  3: "│▊ prod-us     ...   <- row 1
+    /// ```
+    fn render_row_styles(picker: &Picker, row_a: usize, row_b: usize) -> (Style, Style) {
+        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_picker(f, area, picker, &mut hits);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let style_at = |row: usize| buf[(3, 2 + row as u16)].style();
+        (style_at(row_a), style_at(row_b))
+    }
+
     #[test]
     fn an_empty_filter_matches_everything() {
         assert_eq!(filtered_indices(&items(), "").len(), 5);
@@ -327,6 +352,84 @@ mod tests {
         assert!(
             !text.contains("XXXXXXXX"),
             "background bled through the overlay:\n{text}"
+        );
+    }
+
+    #[test]
+    fn picker_rows_win_over_the_table_beneath_them() {
+        // The overlay draws on top; its hit zones must win by Z-INDEX, not
+        // merely by being registered later. This matters because
+        // HitRegistry's own tie-break rule ("later registration wins at
+        // equal z", see hit.rs) means a table-then-picker registration
+        // order would make the picker win *anyway*, even at z=0 — that
+        // ordering can never distinguish "z=1 wins" from "registered last
+        // wins" and was tried first here and found not to fail under the
+        // z=0 mutation (see task-6-report.md for the empirical check). So
+        // the competing table zone is registered AFTER the picker instead,
+        // at equal z=0: with that adversarial ordering, only render_picker
+        // actually using z=1 can make the picker win.
+        let mut hits = HitRegistry::new();
+        let p = Picker {
+            title: "Clusters".into(),
+            items: items(),
+            filter: String::new(),
+            selected: 0,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = centered(f.area(), 60, 60);
+            render_picker(f, area, &p, &mut hits);
+        })
+        .unwrap();
+
+        // Find a coordinate the picker actually registered.
+        let mut coord = None;
+        'outer: for y in 0..24u16 {
+            for x in 0..80u16 {
+                if matches!(hits.hit(x, y), Some(HitTarget::PickerRow(_))) {
+                    coord = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, y) = coord.expect("picker registered no rows");
+
+        // Register a competing table zone over that same coordinate,
+        // AFTER the picker, at z=0 — the adversarial ordering.
+        hits.push(
+            Rect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+            0,
+            HitTarget::TableRow(99),
+        );
+
+        assert!(
+            matches!(hits.hit(x, y), Some(HitTarget::PickerRow(_))),
+            "a table zone registered AFTER the picker, at equal z, must still \
+             lose to it — the picker only wins here because it registers at \
+             z=1, not because of registration order"
+        );
+    }
+
+    #[test]
+    fn the_selected_row_is_visually_distinct_from_the_others() {
+        // Task 5's ribbon shipped six tests that all asserted fg and none that
+        // asserted bg, so dropping the background fill left it invisible with
+        // a green suite. Assert whatever actually distinguishes the row.
+        let p = Picker {
+            title: "Clusters".into(),
+            items: items(),
+            filter: String::new(),
+            selected: 1,
+        };
+        let (styles_selected, styles_other) = render_row_styles(&p, 1, 0);
+        assert_ne!(
+            styles_selected, styles_other,
+            "the selected picker row must render differently from an unselected one"
         );
     }
 }
