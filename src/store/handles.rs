@@ -1,3 +1,42 @@
+use tokio::task::JoinHandle;
+
+/// Every watch task belonging to the active cluster.
+///
+/// Switching clusters must abort all of them. Without this, each switch leaks
+/// a live watch connection and its cache — invisible with one cluster, and
+/// twenty times over with twenty.
+#[derive(Default)]
+pub struct WatchHandles {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl WatchHandles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// Abort every watch and clear the registry. Returns how many were aborted.
+    pub fn abort_all(&mut self) -> usize {
+        let n = self.handles.len();
+        for h in self.handles.drain(..) {
+            h.abort();
+        }
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -20,10 +59,17 @@ mod tests {
 
         assert_eq!(handles.len(), 3);
         assert_eq!(handles.abort_all(), 3);
-        assert!(handles.is_empty(), "aborted handles must not linger in the registry");
+        assert!(
+            handles.is_empty(),
+            "aborted handles must not linger in the registry"
+        );
 
         tokio::task::yield_now().await;
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "no task should have run to completion");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "no task should have run to completion"
+        );
     }
 
     #[tokio::test]
@@ -38,6 +84,10 @@ mod tests {
         handles.push(tokio::spawn(async {}));
         handles.abort_all();
         handles.push(tokio::spawn(async {}));
-        assert_eq!(handles.len(), 1, "switching clusters repeatedly must not accumulate handles");
+        assert_eq!(
+            handles.len(),
+            1,
+            "switching clusters repeatedly must not accumulate handles"
+        );
     }
 }
