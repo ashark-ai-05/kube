@@ -1,6 +1,10 @@
 use crate::store::columns::columns_for;
 use crate::ui::hit::{HitRegistry, HitTarget};
+use crate::ui::scroll;
 use crate::ui::theme;
+// Re-exported so this view's existing call sites and tests keep naming it
+// here; the implementation now lives in `ui::scroll`, shared with the picker.
+pub use crate::ui::scroll::scroll_offset;
 use crate::ui::theme::phase_style;
 use kube::api::{DynamicObject, GroupVersionKind};
 use ratatui::Frame;
@@ -42,40 +46,17 @@ impl TableView {
 ///
 /// Formatting the whole list every frame costs O(objects); this makes it
 /// O(viewport). The block border takes one line at the top and one at the
-/// bottom, and the header takes one more, leaving `height - 3` data rows.
+/// bottom, and the header takes one more, leaving `height - 3` data rows —
+/// this view's own chrome, which is all this wrapper adds over the shared
+/// `scroll::window`.
 pub fn visible_window(offset: usize, area_height: u16, total: usize) -> std::ops::Range<usize> {
-    let rows = area_height.saturating_sub(3) as usize;
-    let start = offset.min(total);
-    let end = start.saturating_add(rows).min(total);
-    start..end
+    scroll::window(offset, data_rows(area_height), total)
 }
 
-/// Offset that keeps `selected` visible, moving as little as possible.
-///
-/// `render_table` owns scrolling outright rather than delegating it to
-/// ratatui. The straightforward design — hand `Table` a windowed `Vec<Row>`
-/// while leaving `TableState::selected` as an absolute object index — was
-/// tried first and found empirically unsafe: `ratatui::widgets::Table::render`
-/// clamps `state.selected` to `rows.len() - 1` whenever `selected >=
-/// rows.len()`, so a windowed row list silently rewrites the real selection
-/// (verified with a probe: `selected = 30` against a 7-row list came back as
-/// `selected = Some(6)` after render). No choice of offset avoids that clamp,
-/// because it fires purely off `rows.len()`. Computing the offset ourselves
-/// and handing ratatui a window-relative selection sidesteps it entirely:
-/// ratatui always sees exactly the rows it draws, so its own clamp is a
-/// no-op and it never scrolls on its own. See task-4-report.md for the full
-/// empirical finding.
-pub fn scroll_offset(selected: usize, current_offset: usize, rows: usize) -> usize {
-    if rows == 0 {
-        return 0;
-    }
-    if selected < current_offset {
-        selected
-    } else if selected >= current_offset + rows {
-        selected + 1 - rows
-    } else {
-        current_offset
-    }
+/// How many data rows fit in an area of this height: everything but the two
+/// borders and the header.
+fn data_rows(area_height: u16) -> usize {
+    area_height.saturating_sub(3) as usize
 }
 
 /// Render the resource table and register a clickable zone for every visible row.
@@ -114,7 +95,7 @@ pub fn render_table(
     // derive the visible window from that offset. Row construction and hit
     // zones below both derive from this one `window`, so they cannot drift
     // apart the way Plan 1's shipped defect did.
-    let rows_visible = area.height.saturating_sub(3) as usize;
+    let rows_visible = data_rows(area.height);
     view.offset = scroll_offset(view.selected, view.offset, rows_visible);
     let window = visible_window(view.offset, area.height, objects.len());
 

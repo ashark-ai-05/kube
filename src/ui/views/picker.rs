@@ -1,4 +1,5 @@
 use crate::ui::hit::{HitRegistry, HitTarget};
+use crate::ui::scroll;
 use crate::ui::theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -20,7 +21,29 @@ pub struct Picker {
     pub title: String,
     pub items: Vec<PickerItem>,
     pub filter: String,
+    /// Index into the FILTERED list, matching `HitTarget::PickerRow`.
     pub selected: usize,
+    /// Scroll offset into the filtered list, owned here and advanced by
+    /// `render_picker` each frame — the same arrangement `TableView` uses.
+    /// Without it the picker drew only the first screenful while `selected`
+    /// ranged over the whole filtered list, so on a kubeconfig with 20+
+    /// contexts the ones past the fold were never drawn, registered no hit
+    /// zone, and could be confirmed by Enter without ever appearing
+    /// highlighted.
+    pub scroll: usize,
+}
+
+/// Clamp `selected` to the filtered list, so it always names a row that
+/// exists.
+///
+/// Items and filter both change under an open picker: `main.rs` rebuilds the
+/// item list every event-loop pass (cluster states and observed namespaces
+/// both move on their own), and a concurrent switch can empty it entirely.
+/// Left unclamped, `selected` names a row that is gone and Enter resolves to
+/// nothing — the picker closes having silently done nothing at all.
+pub fn clamp_selection(picker: &mut Picker) {
+    let n = filtered_indices(&picker.items, &picker.filter).len();
+    picker.selected = picker.selected.min(n.saturating_sub(1));
 }
 
 /// Case-insensitive substring match over item labels.
@@ -61,8 +84,18 @@ pub fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
 /// the table beneath (which registers at z=0), and the row index carried by
 /// `HitTarget::PickerRow` is the index into the *filtered* list — that is
 /// what the user actually clicked, and it is the caller's job (Task 9) to
-/// map it back through `filtered_indices` to the real item.
-pub fn render_picker(f: &mut Frame, area: Rect, picker: &Picker, hits: &mut HitRegistry) {
+/// map it back through `filtered_indices` to the real item. Scrolling does
+/// not change that contract: the index registered is `scroll + row`, still
+/// an index into the filtered list, never a screen position.
+///
+/// This view owns its scrolling, exactly as `render_table` does: it advances
+/// `picker.scroll` by the least amount that keeps `picker.selected` on
+/// screen, then draws and registers only that window.
+pub fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, hits: &mut HitRegistry) {
+    // Items and filter change under an open picker, so a selection can be
+    // left past the end. Clamp here so no caller has to remember to — the
+    // same defensive clamp `render_table` performs.
+    clamp_selection(picker);
     let matches = filtered_indices(&picker.items, &picker.filter);
 
     f.render_widget(Clear, area);
@@ -89,11 +122,18 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &Picker, hits: &mut HitR
     f.render_widget(Paragraph::new(filter_line), Rect { height: 1, ..inner });
 
     let list_y = inner.y.saturating_add(1);
-    let rows = inner.height.saturating_sub(1);
-    for (row, &item_idx) in matches.iter().take(rows as usize).enumerate() {
+    // The filter line takes the first inner row; the rest is list.
+    let rows = inner.height.saturating_sub(1) as usize;
+    picker.scroll = scroll::scroll_offset(picker.selected, picker.scroll, rows);
+    let visible = scroll::window(picker.scroll, rows, matches.len());
+
+    for (row, &item_idx) in matches[visible.clone()].iter().enumerate() {
+        // The index the user is actually pointing at: into the filtered list,
+        // not the screen. `visible.start` is `picker.scroll`.
+        let filtered_index = visible.start + row;
         let y = list_y + row as u16;
         let item = &picker.items[item_idx];
-        let selected = row == picker.selected;
+        let selected = filtered_index == picker.selected;
 
         let accent = item.accent.unwrap_or(theme::MIST);
         let mut style = Style::default().fg(theme::PAPER);
@@ -122,8 +162,10 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &Picker, hits: &mut HitR
         f.render_widget(Paragraph::new(line).style(style), row_area);
 
         // z=1 so the overlay wins over the table beneath. The index is into
-        // the FILTERED list, because that is what the user actually clicked.
-        hits.push(row_area, 1, HitTarget::PickerRow(row));
+        // the FILTERED list, because that is what the user actually clicked —
+        // scrolled or not, so a click after scrolling picks the row drawn
+        // there rather than the one that used to be there.
+        hits.push(row_area, 1, HitTarget::PickerRow(filtered_index));
     }
 }
 
@@ -146,7 +188,7 @@ mod tests {
 
     /// Render the picker into a fresh buffer and flatten it to text plus the
     /// hit zones it registered.
-    fn render_to_string(picker: &Picker, w: u16, h: u16) -> (String, HitRegistry) {
+    fn render_to_string(picker: &mut Picker, w: u16, h: u16) -> (String, HitRegistry) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitRegistry::new();
         term.draw(|f| {
@@ -172,7 +214,7 @@ mod tests {
     /// the picker fails to `Clear` first, `Block`'s background only touches
     /// cell *style* — the leftover `X` glyphs stay put wherever the overlay
     /// doesn't explicitly draw its own text, and this is how that surfaces.
-    fn render_over_noise(picker: &Picker, w: u16, h: u16) -> (String, HitRegistry) {
+    fn render_over_noise(picker: &mut Picker, w: u16, h: u16) -> (String, HitRegistry) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitRegistry::new();
         term.draw(|f| {
@@ -206,7 +248,7 @@ mod tests {
     ///  2: "│▊ prod-eu     ...   <- row 0, label starts at x=3
     ///  3: "│▊ prod-us     ...   <- row 1
     /// ```
-    fn render_row_styles(picker: &Picker, row_a: usize, row_b: usize) -> (Style, Style) {
+    fn render_row_styles(picker: &mut Picker, row_a: usize, row_b: usize) -> (Style, Style) {
         let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let mut hits = HitRegistry::new();
         term.draw(|f| {
@@ -269,26 +311,28 @@ mod tests {
 
     #[test]
     fn the_picker_draws_its_title_and_items() {
-        let p = Picker {
+        let mut p = Picker {
             title: "Clusters".into(),
             items: items(),
             filter: String::new(),
             selected: 0,
+            scroll: 0,
         };
-        let (text, _) = render_to_string(&p, 60, 16);
+        let (text, _) = render_to_string(&mut p, 60, 16);
         assert!(text.contains("Clusters"), "title missing:\n{text}");
         assert!(text.contains("prod-eu"), "items missing:\n{text}");
     }
 
     #[test]
     fn each_visible_picker_row_is_clickable_and_maps_to_the_filtered_index() {
-        let p = Picker {
+        let mut p = Picker {
             title: "Clusters".into(),
             items: items(),
             filter: "prod".into(),
             selected: 0,
+            scroll: 0,
         };
-        let (_, hits) = render_to_string(&p, 60, 16);
+        let (_, hits) = render_to_string(&mut p, 60, 16);
         let mut found = Vec::new();
         for y in 0..16u16 {
             for x in 0..60u16 {
@@ -314,13 +358,14 @@ mod tests {
         // into the filtered list" from "index into the full list", and
         // getting it wrong is how a filtered click selects the wrong
         // cluster.
-        let p_wsdc = Picker {
+        let mut p_wsdc = Picker {
             title: "Clusters".into(),
             items: items(),
             filter: "wsdc".into(),
             selected: 0,
+            scroll: 0,
         };
-        let (_, hits) = render_to_string(&p_wsdc, 60, 16);
+        let (_, hits) = render_to_string(&mut p_wsdc, 60, 16);
         let mut found = Vec::new();
         for y in 0..16u16 {
             for x in 0..60u16 {
@@ -342,13 +387,14 @@ mod tests {
     #[test]
     fn the_overlay_covers_what_is_beneath_it() {
         // Without Clear, the previous frame's content shows through the modal.
-        let p = Picker {
+        let mut p = Picker {
             title: "T".into(),
             items: items(),
             filter: String::new(),
             selected: 0,
+            scroll: 0,
         };
-        let (text, _) = render_over_noise(&p, 60, 16);
+        let (text, _) = render_over_noise(&mut p, 60, 16);
         assert!(
             !text.contains("XXXXXXXX"),
             "background bled through the overlay:\n{text}"
@@ -369,16 +415,17 @@ mod tests {
         // at equal z=0: with that adversarial ordering, only render_picker
         // actually using z=1 can make the picker win.
         let mut hits = HitRegistry::new();
-        let p = Picker {
+        let mut p = Picker {
             title: "Clusters".into(),
             items: items(),
             filter: String::new(),
             selected: 0,
+            scroll: 0,
         };
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| {
             let area = centered(f.area(), 60, 60);
-            render_picker(f, area, &p, &mut hits);
+            render_picker(f, area, &mut p, &mut hits);
         })
         .unwrap();
 
@@ -420,16 +467,242 @@ mod tests {
         // Task 5's ribbon shipped six tests that all asserted fg and none that
         // asserted bg, so dropping the background fill left it invisible with
         // a green suite. Assert whatever actually distinguishes the row.
-        let p = Picker {
+        let mut p = Picker {
             title: "Clusters".into(),
             items: items(),
             filter: String::new(),
             selected: 1,
+            scroll: 0,
         };
-        let (styles_selected, styles_other) = render_row_styles(&p, 1, 0);
+        let (styles_selected, styles_other) = render_row_styles(&mut p, 1, 0);
         assert_ne!(
             styles_selected, styles_other,
             "the selected picker row must render differently from an unselected one"
         );
+    }
+
+    // --- Scrolling: a kubeconfig with more contexts than fit on screen ---
+
+    /// Twenty clusters, named so no label is a substring of another
+    /// ("cluster-1" would match inside "cluster-19"; two digits do not).
+    fn many_clusters() -> Vec<PickerItem> {
+        (0..20)
+            .map(|i| PickerItem {
+                label: format!("cluster-{i:02}"),
+                detail: String::new(),
+                accent: None,
+            })
+            .collect()
+    }
+
+    /// A viewport with room for exactly 11 list rows: 14 lines, less two
+    /// borders and the filter line. Confirmed against a real buffer dump —
+    /// rows draw at y=2..=12, labels start at x=3, y=13 is the bottom
+    /// border. Twenty items into eleven rows is the whole point: nine of
+    /// them can only be reached by scrolling.
+    fn render_scrolled(picker: &mut Picker) -> (Vec<String>, HitRegistry, Vec<Style>) {
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| render_picker(f, f.area(), picker, &mut hits))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let lines: Vec<String> = (0..14u16)
+            .map(|y| (0..60u16).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let styles: Vec<Style> = (0..14u16).map(|y| buf[(3, y)].style()).collect();
+        (lines, hits, styles)
+    }
+
+    #[test]
+    fn a_selection_past_the_first_screenful_is_actually_drawn() {
+        // The shipped bug: `matches.iter().take(rows)` drew only the first
+        // eleven of twenty clusters while `main.rs` let `selected` walk the
+        // whole filtered list. Nineteen presses of Down left `selected = 19`
+        // with cluster-19 never rendered — and Enter then connected to a
+        // cluster the user had never seen selected.
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: String::new(),
+            selected: 19,
+            scroll: 0,
+        };
+        let (lines, _, _) = render_scrolled(&mut p);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("cluster-19"),
+            "the selected cluster must be on screen; got:\n{text}"
+        );
+        assert!(
+            !text.contains("cluster-00"),
+            "the window must have scrolled off the top, not grown; got:\n{text}"
+        );
+        assert_eq!(
+            p.scroll, 9,
+            "the offset must move by the minimum that brings row 19 into an \
+             11-row window, not jump to the selection"
+        );
+    }
+
+    #[test]
+    fn the_selected_row_is_highlighted_after_scrolling_to_it() {
+        // Drawing it is not enough: the highlight is compared against the
+        // FILTERED index, so a comparison left against the screen row would
+        // put the highlight on cluster-09 (screen row 0) — or, once the
+        // selection exceeds the row count, on nothing at all.
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: String::new(),
+            selected: 19,
+            scroll: 0,
+        };
+        let (lines, _, styles) = render_scrolled(&mut p);
+        assert!(
+            lines[12].contains("cluster-19"),
+            "expected cluster-19 on the last list row; got: {}",
+            lines[12]
+        );
+        assert_eq!(
+            styles[12].bg,
+            Some(theme::DUSK),
+            "the selected row must carry the selection background"
+        );
+        assert_ne!(
+            styles[2].bg,
+            Some(theme::DUSK),
+            "an unselected row (cluster-09, the first drawn) must not be \
+             highlighted — a highlight keyed off the screen row would land here"
+        );
+    }
+
+    #[test]
+    fn every_drawn_row_registers_a_hit_zone_carrying_its_filtered_index() {
+        // "Every action reachable by mouse alone" — the clusters past the
+        // first screenful registered no hit zone at all, so they could not
+        // be clicked however far the list was scrolled.
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: String::new(),
+            selected: 19,
+            scroll: 0,
+        };
+        let (lines, hits, _) = render_scrolled(&mut p);
+
+        let mut found = Vec::new();
+        for y in 0..14u16 {
+            if let Some(HitTarget::PickerRow(i)) = hits.hit(5, y) {
+                found.push(*i);
+            }
+        }
+        assert_eq!(
+            found,
+            (9..20).collect::<Vec<usize>>(),
+            "the eleven rows on screen are filtered indices 9..=19, not 0..=10"
+        );
+
+        // And the zone at each y names the row actually DRAWN there — the
+        // Plan 1 invariant, re-checked under a scrolled window.
+        for (k, y) in (2..13u16).enumerate() {
+            let expected_label = format!("cluster-{:02}", 9 + k);
+            assert!(
+                lines[y as usize].contains(&expected_label),
+                "expected {expected_label} at y={y}; got: {}",
+                lines[y as usize]
+            );
+            assert_eq!(
+                hits.hit(5, y),
+                Some(&HitTarget::PickerRow(9 + k)),
+                "clicking the row drawn at y={y} must resolve to the cluster shown there"
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_back_up_follows_the_selection() {
+        // The offset must move both ways: having scrolled down to 19, moving
+        // the selection back to 0 must bring the top of the list back rather
+        // than leaving the selection above the window.
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: String::new(),
+            selected: 19,
+            scroll: 0,
+        };
+        let _ = render_scrolled(&mut p);
+        assert_eq!(p.scroll, 9);
+
+        p.selected = 0;
+        let (lines, _, _) = render_scrolled(&mut p);
+        assert_eq!(p.scroll, 0, "the window must follow the selection upward");
+        assert!(
+            lines.join("\n").contains("cluster-00"),
+            "cluster-00 must be back on screen"
+        );
+    }
+
+    #[test]
+    fn a_filter_narrower_than_the_viewport_does_not_scroll() {
+        // Nothing about the fix may disturb the common case: a list that
+        // fits must draw from the top with no offset at all.
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: "cluster-1".into(),
+            selected: 0,
+            scroll: 0,
+        };
+        let (lines, hits, _) = render_scrolled(&mut p);
+        assert_eq!(p.scroll, 0);
+        assert!(
+            lines[2].contains("cluster-10"),
+            "the first match must draw on the first list row; got: {}",
+            lines[2]
+        );
+        assert_eq!(
+            hits.hit(5, 2),
+            Some(&HitTarget::PickerRow(0)),
+            "with ten matches in an eleven-row window the filtered index is \
+             still the position within the MATCHES, which for cluster-10 is 0"
+        );
+    }
+
+    #[test]
+    fn a_selection_left_past_the_end_of_a_shrunken_list_is_clamped() {
+        // A cluster switch can empty the object list under an open namespace
+        // picker, dropping it from many items to one. Left unclamped,
+        // `selected` names a row that no longer exists and a confirm on it
+        // resolves to nothing: the picker vanishes having done nothing.
+        let mut p = Picker {
+            title: "Namespaces".into(),
+            items: vec![PickerItem {
+                label: "all namespaces".into(),
+                detail: String::new(),
+                accent: None,
+            }],
+            filter: String::new(),
+            selected: 8,
+            scroll: 0,
+        };
+        clamp_selection(&mut p);
+        assert_eq!(
+            p.selected, 0,
+            "a selection past the end must name the last surviving row"
+        );
+    }
+
+    #[test]
+    fn clamping_an_empty_list_yields_zero_rather_than_underflowing() {
+        let mut p = Picker {
+            title: "Clusters".into(),
+            items: many_clusters(),
+            filter: "matches-nothing".into(),
+            selected: 7,
+            scroll: 0,
+        };
+        clamp_selection(&mut p);
+        assert_eq!(p.selected, 0);
     }
 }

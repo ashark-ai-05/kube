@@ -16,7 +16,9 @@ use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
 use kube_tui::ui::theme;
-use kube_tui::ui::views::picker::{Picker, PickerItem, centered, filtered_indices, render_picker};
+use kube_tui::ui::views::picker::{
+    Picker, PickerItem, centered, clamp_selection, filtered_indices, render_picker,
+};
 use kube_tui::ui::views::status::render_status;
 use kube_tui::ui::views::table::{TableView, render_table};
 use ratatui::Frame;
@@ -180,7 +182,9 @@ fn render_frame(
     last_error: Option<&str>,
     show_hint: bool,
     connecting: Option<&str>,
-    overlay: &Overlay,
+    // Mutable because the picker owns its scroll offset and advances it
+    // during the draw, exactly as `TableView` does — see `render_picker`.
+    overlay: &mut Overlay,
     hits: &mut HitRegistry,
 ) {
     let full = f.area();
@@ -202,7 +206,7 @@ fn render_frame(
         hits,
     );
 
-    if let Some(picker) = overlay.picker() {
+    if let Some(picker) = overlay.picker_mut() {
         let area = centered(f.area(), 60, 60);
         render_picker(f, area, picker, hits);
     }
@@ -551,10 +555,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // Keep an open picker's items current: the registry (cluster
         // states) and the object list (namespaces seen) can both change
         // while it's on screen, and it must reflect that rather than a
-        // snapshot taken at open time. Filter and selection are untouched.
+        // snapshot taken at open time. The filter is untouched; the
+        // selection is only clamped, never moved, because a shrinking list
+        // can otherwise leave it naming a row that no longer exists — a
+        // confirm on which resolves to nothing and closes the picker having
+        // silently done nothing at all.
         match &mut overlay {
-            Overlay::ClusterPicker(p) => p.items = cluster_picker_items(&entries),
-            Overlay::NamespacePicker(p) => p.items = namespace_picker_items(&objects),
+            Overlay::ClusterPicker(p) => {
+                p.items = cluster_picker_items(&entries);
+                clamp_selection(p);
+            }
+            Overlay::NamespacePicker(p) => {
+                p.items = namespace_picker_items(&objects);
+                clamp_selection(p);
+            }
             Overlay::None => {}
         }
 
@@ -596,6 +610,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         items: cluster_picker_items(&entries),
                         filter: String::new(),
                         selected: 0,
+                        scroll: 0,
                     });
                     needs_redraw = true;
                 }
@@ -605,6 +620,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         items: namespace_picker_items(&objects),
                         filter: String::new(),
                         selected: 0,
+                        scroll: 0,
                     });
                     needs_redraw = true;
                 }
@@ -734,7 +750,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 last_error.as_deref(),
                 show_hint,
                 connecting_name.as_deref(),
-                &overlay,
+                &mut overlay,
                 &mut hits,
             );
         })?;
@@ -1033,6 +1049,7 @@ mod tests {
                     .collect(),
                 filter: "wsdc".into(),
                 selected: 0,
+                scroll: 0,
             };
             assert_eq!(
                 resolve_picker_choice(&picker, 0),
@@ -1051,6 +1068,7 @@ mod tests {
                 }],
                 filter: String::new(),
                 selected: 0,
+                scroll: 0,
             };
             assert_eq!(resolve_picker_choice(&picker, 5), None);
         }
@@ -1069,6 +1087,7 @@ mod tests {
                 }],
                 filter: String::new(),
                 selected: 3,
+                scroll: 0,
             });
             assert_eq!(
                 confirm_index_for(Action::PickerSelect(7), &overlay),
@@ -1101,6 +1120,7 @@ mod tests {
                 items,
                 filter: "e".into(),
                 selected: 1,
+                scroll: 0,
             });
             let index = confirm_index_for(Action::PickerConfirm, &overlay);
             assert_eq!(index, Some(1), "must be the picker's own selection, not 0");
@@ -1129,6 +1149,7 @@ mod tests {
                 items: vec![],
                 filter: String::new(),
                 selected: 0,
+                scroll: 0,
             });
             assert_eq!(confirm_index_for(Action::ClosePicker, &overlay), None);
             assert_eq!(confirm_index_for(Action::Quit, &overlay), None);
@@ -1185,12 +1206,65 @@ mod tests {
         }
 
         #[test]
+        fn a_click_on_a_scrolled_picker_row_resolves_to_the_cluster_drawn_there() {
+            // End to end for the Critical: render a 20-cluster picker scrolled
+            // to the bottom, take the hit zone a click on the LAST visible row
+            // would resolve to, and push that index back through the same
+            // `resolve_picker_choice` the event loop uses. The whole chain —
+            // draw, register, hit-test, map filtered index to item — must name
+            // the cluster actually printed on that line.
+            //
+            // Before the fix nothing was registered below the first
+            // screenful at all, so `hits.hit` returned None here and the
+            // click did nothing.
+            let mut picker = Picker {
+                title: "Clusters".into(),
+                items: (0..20)
+                    .map(|i| PickerItem {
+                        label: format!("cluster-{i:02}"),
+                        detail: String::new(),
+                        accent: None,
+                    })
+                    .collect(),
+                filter: String::new(),
+                selected: 19,
+                scroll: 0,
+            };
+
+            let mut hits = HitRegistry::new();
+            let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+            term.draw(|f| {
+                kube_tui::ui::views::picker::render_picker(f, f.area(), &mut picker, &mut hits);
+            })
+            .unwrap();
+
+            // The last list row of a 14-line viewport (two borders, one
+            // filter line) is y=12 — verified against a real buffer dump.
+            let buf = term.backend().buffer();
+            let drawn: String = (0..60u16).map(|x| buf[(x, 12)].symbol()).collect();
+            assert!(
+                drawn.contains("cluster-19"),
+                "expected cluster-19 drawn on the last list row; got: {drawn}"
+            );
+
+            let Some(HitTarget::PickerRow(i)) = hits.hit(5, 12) else {
+                panic!("a click on the last visible row must land on a picker row");
+            };
+            assert_eq!(
+                resolve_picker_choice(&picker, *i),
+                Some("cluster-19".to_string()),
+                "clicking the row showing cluster-19 must connect to cluster-19, \
+                 not to whatever shares that screen position in the unscrolled list"
+            );
+        }
+
+        #[test]
         fn render_frame_paints_the_ribbon_in_the_active_clusters_hue() {
             let pods = vec![pod_in("a", "default")];
             let gvk = GroupVersionKind::gvk("", "v1", "Pod");
             let mut view = TableView::new();
             let mut hits = HitRegistry::new();
-            let overlay = Overlay::None;
+            let mut overlay = Overlay::None;
 
             let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
             term.draw(|f| {
@@ -1205,7 +1279,7 @@ mod tests {
                     None,
                     false,
                     None,
-                    &overlay,
+                    &mut overlay,
                     &mut hits,
                 );
             })
@@ -1254,7 +1328,7 @@ mod tests {
             let gvk = GroupVersionKind::gvk("", "v1", "Pod");
             let mut view = TableView::new();
             let mut hits = HitRegistry::new();
-            let overlay = Overlay::ClusterPicker(Picker {
+            let mut overlay = Overlay::ClusterPicker(Picker {
                 title: "Clusters".into(),
                 items: vec![PickerItem {
                     label: "prod".into(),
@@ -1263,6 +1337,7 @@ mod tests {
                 }],
                 filter: String::new(),
                 selected: 0,
+                scroll: 0,
             });
 
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1278,7 +1353,7 @@ mod tests {
                     None,
                     false,
                     None,
-                    &overlay,
+                    &mut overlay,
                     &mut hits,
                 );
             })

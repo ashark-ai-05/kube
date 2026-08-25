@@ -63,6 +63,7 @@ mod tests {
             }],
             filter: String::new(),
             selected: 0,
+            scroll: 0,
         }
     }
 
