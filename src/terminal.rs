@@ -48,12 +48,27 @@ impl<T: TerminalControl> Drop for TerminalGuard<T> {
     }
 }
 
+/// Whether a panic on a thread with this name should restore the terminal.
+///
+/// Only the main thread owns the terminal. A panic on a Tokio worker restores
+/// nothing, because the render loop is still running and would keep drawing
+/// into a torn-down screen.
+pub fn should_restore_on_panic(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
+}
+
 /// Installs a panic hook that restores the terminal before the default hook
 /// prints. Without this, a panic leaves the user in a terminal with no echo.
+///
+/// The hook is process-global, so it also fires for panics on background
+/// Tokio tasks. Only the main thread's panic restores the terminal — see
+/// `should_restore_on_panic`.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = RealTerminal.restore();
+        if should_restore_on_panic(std::thread::current().name()) {
+            let _ = RealTerminal.restore();
+        }
         previous(info);
     }));
 }
@@ -98,6 +113,19 @@ mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "disarmed guard must not restore"
+        );
+    }
+
+    #[test]
+    fn only_the_main_thread_restores_the_terminal_on_panic() {
+        assert!(should_restore_on_panic(Some("main")));
+        assert!(
+            !should_restore_on_panic(Some("tokio-runtime-worker")),
+            "a worker panic must not tear down a terminal the render loop is still using"
+        );
+        assert!(
+            !should_restore_on_panic(None),
+            "unnamed threads are not the main thread"
         );
     }
 }

@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pod_ar = ApiResource::erase::<Pod>(&());
     let pod_gvk = GroupVersionKind::gvk("", "v1", "Pod");
-    let _watch = spawn_watch(
+    let watch_handle = spawn_watch(
         client.clone(),
         pod_ar,
         Some(current.1.clone()),
@@ -71,8 +71,26 @@ async fn main() -> anyhow::Result<()> {
         tx.clone(),
     );
 
-    // Feed terminal input into the same channel so there is one wake source.
+    // Tokio swallows a panicking task at the JoinHandle boundary. Without this,
+    // a dead watch leaves the UI drawing indefinitely against a store nothing
+    // is updating any more, showing stale data as if it were live.
     {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = watch_handle.await {
+                let reason = if e.is_panic() {
+                    "panicked"
+                } else {
+                    "was cancelled"
+                };
+                let _ = tx.send(AppEvent::Error(format!("watch task {reason}; exiting")));
+                let _ = tx.send(AppEvent::Quit);
+            }
+        });
+    }
+
+    // Feed terminal input into the same channel so there is one wake source.
+    let input_handle = {
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut events = crossterm::event::EventStream::new();
@@ -80,6 +98,24 @@ async fn main() -> anyhow::Result<()> {
                 if tx.send(AppEvent::Input(e)).is_err() {
                     break;
                 }
+            }
+        })
+    };
+
+    // Same reasoning as the watch task: a panicking input reader would
+    // otherwise stop delivering keystrokes and mouse clicks with no visible
+    // symptom beyond "the UI stopped responding".
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = input_handle.await {
+                let reason = if e.is_panic() {
+                    "panicked"
+                } else {
+                    "was cancelled"
+                };
+                let _ = tx.send(AppEvent::Error(format!("input task {reason}; exiting")));
+                let _ = tx.send(AppEvent::Quit);
             }
         });
     }
@@ -120,6 +156,11 @@ async fn main() -> anyhow::Result<()> {
 
         // Read the store snapshot into a local Vec before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
+        //
+        // Redraw on every batch regardless of `batch.store_dirty`: input alone
+        // can change the selection. The "10,000 deltas cost one repaint"
+        // property comes from draining the channel before drawing, not from
+        // this flag.
         let objects = store.read().await.objects(&pod_gvk);
 
         let mut quit = false;
