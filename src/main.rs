@@ -17,6 +17,42 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
+/// Describe why a supervised task stopped, including the panic message.
+///
+/// The panic hook deliberately does not print for background threads (it would
+/// staircase into the live alternate screen), so this is the only path by which
+/// a worker panic's payload reaches the user.
+fn join_failure_detail(task: &str, e: tokio::task::JoinError) -> String {
+    if e.is_panic() {
+        let p = e.into_panic();
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic with non-string payload".to_string());
+        format!("{task} task panicked: {msg}")
+    } else {
+        format!("{task} task was cancelled")
+    }
+}
+
+/// Watch a background task and turn its death into a visible error plus a quit.
+///
+/// Tokio swallows a panicking task at the `JoinHandle` boundary; without this
+/// the UI keeps drawing as if everything were still live.
+fn supervise(
+    task: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
+            let _ = tx.send(AppEvent::Quit);
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // First: a panic anywhere below must still leave the terminal usable.
@@ -77,29 +113,32 @@ async fn main() -> anyhow::Result<()> {
     // Tokio swallows a panicking task at the JoinHandle boundary. Without this,
     // a dead watch leaves the UI drawing indefinitely against a store nothing
     // is updating any more, showing stale data as if it were live.
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = watch_handle.await {
-                let reason = if e.is_panic() {
-                    "panicked"
-                } else {
-                    "was cancelled"
-                };
-                let _ = tx.send(AppEvent::Error(format!("watch task {reason}; exiting")));
-                let _ = tx.send(AppEvent::Quit);
-            }
-        });
-    }
+    supervise("watch", watch_handle, tx.clone());
 
     // Feed terminal input into the same channel so there is one wake source.
     let input_handle = {
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut events = crossterm::event::EventStream::new();
-            while let Some(Ok(e)) = events.next().await {
-                if tx.send(AppEvent::Input(e)).is_err() {
-                    break;
+            loop {
+                match events.next().await {
+                    Some(Ok(e)) => {
+                        if tx.send(AppEvent::Input(e)).is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // Without this the UI would stay alive accepting nothing,
+                        // and raw mode means there is no signal-based way out.
+                        let _ = tx.send(AppEvent::Error(format!("input stream failed: {e}")));
+                        let _ = tx.send(AppEvent::Quit);
+                        break;
+                    }
+                    None => {
+                        let _ = tx.send(AppEvent::Error("input stream ended".to_string()));
+                        let _ = tx.send(AppEvent::Quit);
+                        break;
+                    }
                 }
             }
         })
@@ -108,18 +147,29 @@ async fn main() -> anyhow::Result<()> {
     // Same reasoning as the watch task: a panicking input reader would
     // otherwise stop delivering keystrokes and mouse clicks with no visible
     // symptom beyond "the UI stopped responding".
+    supervise("input", input_handle, tx.clone());
+
+    // `kill <pid>` skips every `Drop`, so without this the process dies holding
+    // raw mode, mouse capture and the alternate screen — the dead shell this
+    // whole design exists to prevent. SIGINT arrives as Ctrl-C through
+    // crossterm in raw mode and is already handled by `action_for`.
+    #[cfg(unix)]
     {
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = input_handle.await {
-                let reason = if e.is_panic() {
-                    "panicked"
-                } else {
-                    "was cancelled"
+            let mut term_sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    // Without a signal handler the terminal survives via Drop on
+                    // normal exit only; log and continue rather than failing startup.
+                    Err(e) => {
+                        let _ =
+                            tx.send(AppEvent::Error(format!("SIGTERM handler unavailable: {e}")));
+                        return;
+                    }
                 };
-                let _ = tx.send(AppEvent::Error(format!("input task {reason}; exiting")));
-                let _ = tx.send(AppEvent::Quit);
-            }
+            term_sig.recv().await;
+            let _ = tx.send(AppEvent::Quit);
         });
     }
 
@@ -223,4 +273,53 @@ async fn main() -> anyhow::Result<()> {
     // old `ratatui::restore()` path performed. Normal exit and panic exit now
     // share one restoration implementation, so neither can drift from the other.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn join_error_from(f: impl FnOnce() + Send + 'static) -> tokio::task::JoinError {
+        let handle = tokio::task::spawn_blocking(f);
+        handle.await.expect_err("the task must have failed")
+    }
+
+    #[tokio::test]
+    async fn a_str_panic_payload_reaches_the_user() {
+        let e = join_error_from(|| panic!("watcher exploded")).await;
+        assert_eq!(
+            join_failure_detail("watch", e),
+            "watch task panicked: watcher exploded",
+            "the payload is the only record of a background panic: the hook does not print it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_string_panic_payload_reaches_the_user() {
+        let e = join_error_from(|| panic!("{}", format!("code {}", 7))).await;
+        assert_eq!(
+            join_failure_detail("input", e),
+            "input task panicked: code 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_string_panic_payload_still_reports_something() {
+        let e = join_error_from(|| std::panic::panic_any(42u8)).await;
+        assert_eq!(
+            join_failure_detail("watch", e),
+            "watch task panicked: panic with non-string payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_is_distinguished_from_a_panic() {
+        let handle = tokio::spawn(async {
+            // Never completes; the abort below is what ends it.
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let e = handle.await.expect_err("aborting must yield a JoinError");
+        assert_eq!(join_failure_detail("watch", e), "watch task was cancelled");
+    }
 }

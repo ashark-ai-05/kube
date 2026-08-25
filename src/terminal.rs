@@ -57,19 +57,37 @@ pub fn should_restore_on_panic(thread_name: Option<&str>) -> bool {
     thread_name == Some("main")
 }
 
+/// Whether a panic on a thread with this name may print through the default
+/// hook.
+///
+/// The default hook writes to stderr, which during a TUI session is the live
+/// alternate screen in raw mode: with no carriage return on newline the
+/// message staircases across the UI, and teardown then discards the buffer, so
+/// the screen is corrupted *and* the panic location is lost. Only the main
+/// thread — whose panic ends the session anyway, after the terminal has been
+/// restored — may print. Background panics reach the user through the task
+/// supervisor in `main`, which surfaces the payload as an `AppEvent::Error`.
+pub fn should_print_panic(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
+}
+
 /// Installs a panic hook that restores the terminal before the default hook
 /// prints. Without this, a panic leaves the user in a terminal with no echo.
 ///
 /// The hook is process-global, so it also fires for panics on background
-/// Tokio tasks. Only the main thread's panic restores the terminal — see
-/// `should_restore_on_panic`.
+/// Tokio tasks. Only the main thread's panic restores the terminal and prints
+/// — see `should_restore_on_panic` and `should_print_panic`.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if should_restore_on_panic(std::thread::current().name()) {
+        let thread = std::thread::current();
+        let name = thread.name();
+        if should_restore_on_panic(name) {
             let _ = RealTerminal.restore();
         }
-        previous(info);
+        if should_print_panic(name) {
+            previous(info);
+        }
     }));
 }
 
@@ -127,5 +145,16 @@ mod tests {
             !should_restore_on_panic(None),
             "unnamed threads are not the main thread"
         );
+    }
+
+    #[test]
+    fn only_the_main_thread_prints_its_panic() {
+        assert!(should_print_panic(Some("main")));
+        assert!(
+            !should_print_panic(Some("tokio-runtime-worker")),
+            "printing into a live alternate screen in raw mode staircases the \
+             message across the UI and is then discarded by teardown"
+        );
+        assert!(!should_print_panic(None));
     }
 }
