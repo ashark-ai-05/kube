@@ -239,9 +239,9 @@ async fn switching_clusters_aborts_the_previous_watch() {
     let victim = before.first().cloned().expect("at least one demo pod");
 
     // Abort exactly the way a cluster switch does: register the watch's
-    // supervising handle in the same `WatchHandles` registry `Session` uses,
-    // then call `abort_all()` — not `handle.abort()` directly — so this
-    // exercises the real teardown path rather than a stand-in for it.
+    // `JoinHandle` in the same `WatchHandles` registry `Session` uses, then
+    // call `abort_all()` — not `handle.abort()` directly — so this exercises
+    // the real teardown path rather than a stand-in for it.
     let mut handles = WatchHandles::new();
     handles.push(handle);
     assert_eq!(
