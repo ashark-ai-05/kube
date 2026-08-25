@@ -307,7 +307,7 @@ The performance property "a watch storm of 10,000 deltas produces one repaint" l
 **Files:**
 - Create: `src/app/mod.rs`
 - Create: `src/app/event.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod app;`)
 
 **Interfaces:**
 - Consumes: nothing from Task 1.
@@ -494,7 +494,7 @@ git commit -m "feat: event types with drain-and-coalesce for burst absorption"
 **Files:**
 - Create: `src/cluster/mod.rs`
 - Create: `src/cluster/config.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod cluster;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -659,7 +659,7 @@ The fix is to accumulate init objects into a staging buffer and swap atomically 
 **Files:**
 - Create: `src/store/mod.rs`
 - Create: `src/store/cache.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod store;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1343,7 +1343,7 @@ Ratatui is immediate-mode, so a click at `(col, row)` carries no meaning by itse
 **Files:**
 - Create: `src/ui/mod.rs`
 - Create: `src/ui/hit.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs` (add `pub mod ui;`)
 
 **Interfaces:**
 - Consumes: nothing.
