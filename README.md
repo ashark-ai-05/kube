@@ -41,9 +41,18 @@ first-class multi-cluster switching and a themed, colour-coded interface.
 - **Server-side Table rendering** (`src/store/table.rs`, `fetch_table`/`decode_table`)
   — the raw-HTTP path that asks the API server to render a resource kubectl-style
   (`Accept: application/json;as=Table;v=1;g=meta.k8s.io`, since `kube` 4.2 has no
-  built-in support for it) is implemented and tested, including against a real cluster
-  (see below), but the live table view still renders pods through its own hardcoded
-  column extraction (`src/store/columns.rs`), not through this path yet.
+  built-in support for it). The decode logic (`decode_table`) is unit-tested against
+  synthetic JSON. `fetch_table` itself — the part that actually sends the request and
+  the Accept header — has **never been run against a cluster**: an integration test
+  for it exists (`tests/integration_kind.rs`) but is `#[ignore]`d and has not been
+  executed, because no container runtime was available on the machine it was written
+  on. Until someone runs `./scripts/dev-cluster.sh && cargo test -- --ignored`, treat
+  the header as unverified — a Kubernetes API server ignores an `Accept` value it
+  doesn't recognise and falls back to ordinary JSON rather than erroring, so a typo or
+  a version drift in that header fails **silently**, and no unit test can catch it: the
+  header only exists on the wire, never in `decode_table`'s input. The live table view
+  also still renders pods through its own hardcoded column extraction
+  (`src/store/columns.rs`), not through this path at all.
 - **Only pods.** The watch, the table, and the column logic are all general enough to
   handle other kinds, but `main.rs` currently hardcodes a single `Pod` watch. The
   sidebar kind tree that would make other kinds reachable is Plan 3.
