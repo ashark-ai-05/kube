@@ -119,9 +119,53 @@ mod tests {
             render_ribbon(f, ribbon, None, &mut hits);
         })
         .unwrap();
+        let buf = term.backend().buffer();
         assert_eq!(
-            term.backend().buffer()[(0, 0)].style().fg,
-            Some(theme::DUSK)
+            buf[(0, 0)].style().fg,
+            Some(theme::DUSK),
+            "muted ribbon foreground must be DUSK"
+        );
+        assert_eq!(
+            buf[(0, 0)].style().bg,
+            Some(theme::DUSK),
+            "muted ribbon background must be DUSK or it disappears"
+        );
+    }
+
+    #[test]
+    fn the_ribbon_is_a_solid_bar_not_a_coloured_glyph() {
+        // Block fills its area with spaces, so fg alone paints nothing. If bg
+        // is ever dropped the ribbon vanishes silently — every fg assertion
+        // still passes, because fg is set correctly on an invisible cell.
+        let mut term = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let (ribbon, _) = split_ribbon(f.area());
+            render_ribbon(f, ribbon, Some("prod-eu"), &mut hits);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let expected = theme::cluster_hue("prod-eu");
+        for y in 0..5 {
+            let cell = &buf[(0, y)];
+            assert_eq!(
+                cell.style().bg,
+                Some(expected),
+                "row {y} has no background fill"
+            );
+            assert_eq!(
+                cell.style().fg,
+                Some(expected),
+                "row {y} foreground drifted from the hue"
+            );
+        }
+        // The neighbouring column must stay unpainted, or the "one cell wide"
+        // guarantee is not actually being tested by anything.
+        assert_ne!(
+            buf[(1, 0)].style().bg,
+            Some(expected),
+            "the ribbon bled into column 1"
         );
     }
 
