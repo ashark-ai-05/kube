@@ -45,13 +45,13 @@ fn supervise(
     task: &'static str,
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::UnboundedSender<AppEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = handle.await {
             let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
             let _ = tx.send(AppEvent::Quit);
         }
-    });
+    })
 }
 
 #[tokio::main]
@@ -158,7 +158,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // Tokio swallows a panicking task at the JoinHandle boundary. Without this,
     // a dead watch leaves the UI drawing indefinitely against a store nothing
     // is updating any more, showing stale data as if it were live.
-    supervise("watch", watch_handle, tx.clone());
+    let _watch_supervisor = supervise("watch", watch_handle, tx.clone());
 
     // Feed terminal input into the same channel so there is one wake source.
     let input_handle = {
@@ -192,7 +192,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // Same reasoning as the watch task: a panicking input reader would
     // otherwise stop delivering keystrokes and mouse clicks with no visible
     // symptom beyond "the UI stopped responding".
-    supervise("input", input_handle, tx.clone());
+    let _input_supervisor = supervise("input", input_handle, tx.clone());
 
     // `kill <pid>` skips every `Drop`, so without this the process dies holding
     // raw mode, mouse capture and the alternate screen — the dead shell this
@@ -337,6 +337,17 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Increments a counter when dropped. Aborting a task drops its future, so
+    /// this fires on cancellation but not while the task is merely suspended.
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     async fn join_error_from(f: impl FnOnce() + Send + 'static) -> tokio::task::JoinError {
         let handle = tokio::task::spawn_blocking(f);
@@ -380,5 +391,92 @@ mod tests {
         handle.abort();
         let e = handle.await.expect_err("aborting must yield a JoinError");
         assert_eq!(join_failure_detail("watch", e), "watch task was cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_deliberately_aborted_watch_does_not_quit_the_app() {
+        // Every cluster switch aborts the outgoing cluster's watches. A
+        // supervisor that treats any Err as a death would send Quit, so the
+        // very first switch would exit the application.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let watch = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        watch.abort();
+        supervise("watch", watch, tx)
+            .await
+            .expect("the supervisor itself must not die");
+
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(format!("{e:?}"));
+        }
+        assert!(
+            got.is_empty(),
+            "a deliberate abort must produce no error and no quit, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_watch_still_quits_the_app() {
+        // The other half of the same decision: silencing cancellation must not
+        // silence a real crash, which would leave the UI drawing stale data.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let watch = tokio::spawn(async { panic!("watcher exploded") });
+        supervise("watch", watch, tx)
+            .await
+            .expect("the supervisor itself must not die");
+
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(e);
+        }
+        assert!(
+            matches!(got.first(), Some(AppEvent::Error(m)) if m.contains("watcher exploded")),
+            "the panic payload must reach the user, got {got:?}"
+        );
+        assert!(
+            matches!(got.get(1), Some(AppEvent::Quit)),
+            "a dead watch must end the app rather than draw stale data, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_the_supervisor_cancels_the_watch_beneath_it() {
+        // Only one owner can await a JoinHandle, and the supervisor needs it to
+        // observe a panic — so `WatchHandles` holds the SUPERVISOR's handle.
+        // Aborting that must cancel the watch underneath: dropping a JoinHandle
+        // DETACHES its task, which would leak exactly the watch a cluster
+        // switch is trying to tear down.
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let signal = DropSignal(cancelled.clone());
+        let watch = tokio::spawn(async move {
+            // Held across the await, so it drops only on cancellation.
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let supervisor = supervise("watch", watch, tx);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "nothing should be cancelled yet"
+        );
+
+        supervisor.abort();
+        for _ in 0..20 {
+            if cancelled.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            1,
+            "aborting the supervisor must cancel its watch, not detach it"
+        );
     }
 }

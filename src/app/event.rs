@@ -1,3 +1,4 @@
+use crate::app::session::SessionEvent;
 use crossterm::event::Event as CtEvent;
 use indexmap::IndexMap;
 use kube::api::GroupVersionKind;
@@ -23,6 +24,9 @@ pub enum AppEvent {
         gvk: GroupVersionKind,
         status: WatchStatus,
     },
+    /// Progress of a cluster switch. Carries no data the store owns — the
+    /// registry is the source of truth; this only says something changed.
+    Session(SessionEvent),
     Error(String),
     Quit,
 }
@@ -34,6 +38,10 @@ pub struct Coalesced {
     pub store_dirty: bool,
     pub status_changes: Vec<(GroupVersionKind, WatchStatus)>,
     pub errors: Vec<String>,
+    /// Kept in order and never dropped: a `Connecting` collapsed into the
+    /// `Connected` behind it would lose the only frame that says the app is
+    /// waiting on a cluster that takes tens of seconds to answer.
+    pub session_events: Vec<SessionEvent>,
     pub quit: bool,
 }
 
@@ -53,6 +61,7 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
             AppEvent::WatchStatus { gvk, status } => {
                 statuses.insert(gvk, status);
             }
+            AppEvent::Session(_) => {}
             AppEvent::Error(e) => out.errors.push(e),
             AppEvent::Quit => out.quit = true,
         }
@@ -135,6 +144,26 @@ mod tests {
             "only the newest status per kind matters"
         );
         assert_eq!(out.status_changes[0].1, WatchStatus::Synced);
+    }
+
+    #[test]
+    fn session_progress_is_kept_in_order_and_never_coalesced() {
+        // Connecting and Connected are the same "kind" of event; collapsing to
+        // the newest would erase the only frame that reports the wait.
+        use crate::cluster::ClusterId;
+        let id = ClusterId("prod".into());
+        let out = coalesce(vec![
+            AppEvent::Session(SessionEvent::Connecting(id.clone())),
+            AppEvent::StoreChanged { gvk: pod_gvk() },
+            AppEvent::Session(SessionEvent::Connected(id.clone())),
+        ]);
+        assert_eq!(
+            out.session_events,
+            vec![
+                SessionEvent::Connecting(id.clone()),
+                SessionEvent::Connected(id),
+            ]
+        );
     }
 
     #[test]
