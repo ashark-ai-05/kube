@@ -10,19 +10,13 @@ use ratatui::widgets::{Block, Borders, Row, Table, TableState};
 use std::sync::Arc;
 
 pub struct TableView {
-    /// Kept only so that code still setting the *absolute* selection via
-    /// `state.select(Some(i))` — namely `main.rs`, which this task must not
-    /// modify — keeps compiling. `render_table` no longer reads this field
-    /// for scrolling or highlighting; `selected` and `offset` below are the
-    /// real state now. Task 9 must switch `main.rs` to set `view.selected`
-    /// directly, at which point this field can be removed. See
-    /// task-4-report.md for why this split exists.
-    pub state: TableState,
     /// Absolute index of the selected object, owned by this view rather than
-    /// by ratatui.
+    /// by ratatui. Callers (e.g. `main.rs`, which tracks its own `selected`
+    /// in response to `Action::SelectRow`/`Action::ScrollBy`) write the real
+    /// selection here directly.
     pub selected: usize,
     /// Scroll offset, owned by this view and advanced by `scroll_offset` each
-    /// frame. Never read back out of ratatui's `TableState` after render:
+    /// frame. Never read back out of a ratatui `TableState` after render:
     /// `render_table` always hands `Table` an already-windowed row list with
     /// a window-relative selection, so ratatui has nothing left to scroll and
     /// cannot disagree with this value.
@@ -38,7 +32,6 @@ impl Default for TableView {
 impl TableView {
     pub fn new() -> Self {
         Self {
-            state: TableState::default().with_selected(Some(0)),
             selected: 0,
             offset: 0,
         }
@@ -137,8 +130,8 @@ pub fn render_table(
 
     // Window-relative selection: ratatui is given exactly the rows it draws,
     // so its own out-of-bounds clamp on `selected` is a no-op and it has
-    // nothing left to scroll. `view.state` is not used here — see its doc
-    // comment.
+    // nothing left to scroll. This TableState is freshly built every frame
+    // and discarded after the call — nothing persists it.
     let selected_in_window = view
         .selected
         .checked_sub(window.start)
@@ -348,6 +341,51 @@ mod tests {
                 "clicking the row drawn at y={y} must select index {i}, not another row"
             );
         }
+    }
+
+    #[test]
+    fn the_selected_row_is_the_one_that_renders_highlighted() {
+        // Regression guard: TableView used to carry a vestigial TableState
+        // that main.rs wrote the real selection into while render_table read
+        // a different, always-zero field — every test passed, but selection
+        // was inert in the running binary. This exercises the full path from
+        // "app sets a selection" to "that row renders highlighted".
+        let pods: Vec<_> = (0..5)
+            .map(|i| pod(&format!("pod-{i}"), "Running"))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 2;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
+            .unwrap();
+
+        let buf = term.backend().buffer();
+        // pod-2 is the third data row: first_row_y = area.y + 2, so it draws
+        // at y = 2 + 2 = 4. pod-0, an unselected row, draws at y = 2. Bold is
+        // the discriminator, not "any style difference": phase_style never
+        // sets it (verified in ui/theme.rs), only row_highlight_style does,
+        // so checking bold pins WHICH row is highlighted, not just that two
+        // rows differ — a bug that pins selection to row 0 would still make
+        // row 0 (y=2) bold and row 2 (y=4) plain, and a same-row-index check
+        // that only asserted inequality would miss that entirely.
+        let is_bold = |y: u16| {
+            (1..10).any(|x| {
+                buf[(x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
+        };
+        assert!(
+            is_bold(4),
+            "the selected row (pod-2, drawn at y=4) must be bold"
+        );
+        assert!(
+            !is_bold(2),
+            "an unselected row (pod-0, drawn at y=2) must not be bold"
+        );
     }
 
     #[test]

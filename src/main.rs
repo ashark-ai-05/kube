@@ -307,11 +307,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
         needs_redraw = false;
 
-        view.state.select(if objects.is_empty() {
-            None
+        view.selected = if objects.is_empty() {
+            0
         } else {
-            Some(selected)
-        });
+            selected.min(objects.len() - 1)
+        };
 
         hits.clear();
         term.draw(|f| {
