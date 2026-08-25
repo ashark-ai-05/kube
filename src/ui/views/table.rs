@@ -91,7 +91,7 @@ pub fn render_table(
     f.render_stateful_widget(table, area, &mut view.state);
 
     // Register hit zones matching the geometry above.
-    let header_y = area.y + 1;
+    let header_y = area.y.saturating_add(1);
     if header_y < area.y + area.height {
         hits.push(
             Rect {
@@ -105,10 +105,10 @@ pub fn render_table(
         );
     }
 
-    let first_row_y = area.y + 2;
+    let first_row_y = area.y.saturating_add(2);
     let last_y = area.y + area.height.saturating_sub(1);
     for (i, _) in objects.iter().enumerate() {
-        let y = first_row_y + i as u16;
+        let y = first_row_y.saturating_add(i as u16);
         if y >= last_y {
             break;
         }
@@ -251,5 +251,57 @@ mod tests {
             "a failing pod must be visually distinct"
         );
         assert_ne!(phase_style("Running"), phase_style("Pending"));
+    }
+
+    #[test]
+    fn hit_zones_align_with_the_rows_ratatui_actually_draws() {
+        // The real guarantee: the row you can SEE at screen row y is the row
+        // you SELECT by clicking y. Asserting the zone sequence alone does not
+        // pin this — the whole block can shift and the sequence still matches.
+        let pods = vec![
+            pod("row-zero", "Running"),
+            pod("row-one", "Running"),
+            pod("row-two", "Running"),
+        ];
+        let (text, hits) = render(&pods, 60, 10);
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert!(
+            lines[1].contains("NAME"),
+            "header expected at y=1, got: {}",
+            lines[1]
+        );
+        assert_eq!(hits.hit(5, 1), Some(&HitTarget::ColumnHeader(0)));
+
+        for (i, name) in ["row-zero", "row-one", "row-two"].iter().enumerate() {
+            let y = 2 + i;
+            assert!(
+                lines[y].contains(name),
+                "expected {name} drawn at y={y}, got: {}",
+                lines[y]
+            );
+            assert_eq!(
+                hits.hit(5, y as u16),
+                Some(&HitTarget::TableRow(i)),
+                "clicking the row drawn at y={y} must select index {i}, not another row"
+            );
+        }
+    }
+
+    #[test]
+    fn zones_are_not_registered_past_the_visible_area() {
+        // 20 rows into a viewport with room for a handful: registration must
+        // stop at the bottom border rather than running past the frame.
+        let pods: Vec<_> = (0..20).map(|i| pod(&format!("p{i}"), "Running")).collect();
+        let (_, hits) = render(&pods, 60, 8);
+
+        for y in 0..40u16 {
+            if let Some(HitTarget::TableRow(idx)) = hits.hit(5, y) {
+                assert!(
+                    y < 7,
+                    "row zone {idx} registered at y={y}, at or past the bottom border of an 8-row viewport"
+                );
+            }
+        }
     }
 }
