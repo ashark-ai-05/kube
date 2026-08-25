@@ -1,6 +1,7 @@
 use crate::store::columns::columns_for;
 use crate::ui::hit::{HitRegistry, HitTarget};
 use crate::ui::theme;
+use crate::ui::theme::phase_style;
 use kube::api::{DynamicObject, GroupVersionKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -26,17 +27,6 @@ impl TableView {
     }
 }
 
-/// Colour a pod phase by severity so problems are visible without reading.
-pub fn phase_style(phase: &str) -> Style {
-    let color = match phase {
-        "Running" | "Succeeded" => theme::OK,
-        "Pending" | "ContainerCreating" => theme::WARN,
-        "Failed" | "CrashLoopBackOff" | "Error" | "ImagePullBackOff" => theme::ERR,
-        _ => theme::MUTED,
-    };
-    Style::default().fg(color)
-}
-
 /// Render the resource table and register a clickable zone for every visible row.
 ///
 /// Rows are registered against the same geometry ratatui uses to lay them out:
@@ -57,11 +47,8 @@ pub fn render_table(
     let columns = columns_for(gvk);
     let widths: Vec<Constraint> = columns.iter().map(|c| c.width).collect();
 
-    let header = Row::new(columns.iter().map(|c| c.header).collect::<Vec<_>>()).style(
-        Style::default()
-            .fg(theme::HEADER)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header =
+        Row::new(columns.iter().map(|c| c.header).collect::<Vec<_>>()).style(theme::header_style());
 
     let rows: Vec<Row> = objects
         .iter()
@@ -72,7 +59,7 @@ pub fn render_table(
                 .iter()
                 .position(|c| c.header == "STATUS")
                 .map(|i| phase_style(&cells[i]))
-                .unwrap_or_else(|| Style::default().fg(theme::FG));
+                .unwrap_or_else(|| Style::default().fg(theme::PAPER));
             Row::new(cells).style(style)
         })
         .collect();
@@ -81,12 +68,13 @@ pub fn render_table(
         .header(header)
         .row_highlight_style(
             Style::default()
-                .fg(theme::SELECTED)
+                .fg(theme::INDIGO)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme::border_style(true))
                 .title(gvk.kind.clone()),
         );
 
@@ -247,16 +235,6 @@ mod tests {
             text.lines().all(|l| l.chars().count() == 12),
             "no line may exceed the width"
         );
-    }
-
-    #[test]
-    fn failing_phases_are_styled_differently_from_running() {
-        assert_ne!(
-            phase_style("Running"),
-            phase_style("CrashLoopBackOff"),
-            "a failing pod must be visually distinct"
-        );
-        assert_ne!(phase_style("Running"), phase_style("Pending"));
     }
 
     #[test]

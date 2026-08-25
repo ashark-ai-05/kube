@@ -11,10 +11,10 @@ use ratatui::widgets::Paragraph;
 /// presenting stale data as live is the worst failure mode for an ops tool.
 pub fn status_label(status: WatchStatus) -> (&'static str, Style) {
     match status {
-        WatchStatus::Initialising => ("loading", Style::default().fg(theme::MUTED)),
-        WatchStatus::Synced => ("live", Style::default().fg(theme::OK)),
-        WatchStatus::Reconnecting => ("reconnecting", Style::default().fg(theme::WARN)),
-        WatchStatus::Failed => ("failed", Style::default().fg(theme::ERR)),
+        WatchStatus::Initialising => ("loading", Style::default().fg(theme::MIST)),
+        WatchStatus::Synced => ("live", Style::default().fg(theme::VIRIDIAN)),
+        WatchStatus::Reconnecting => ("reconnecting", Style::default().fg(theme::AMBER)),
+        WatchStatus::Failed => ("failed", Style::default().fg(theme::CORAL)),
     }
 }
 
@@ -33,23 +33,29 @@ pub fn render_status(
     let (label, style) = status_label(status);
 
     let mut spans = vec![
-        Span::styled(format!(" {context} "), Style::default().fg(theme::HEADER)),
-        Span::styled("· ", Style::default().fg(theme::MUTED)),
-        Span::styled(format!("{namespace} "), Style::default().fg(theme::FG)),
-        Span::styled("· ", Style::default().fg(theme::MUTED)),
-        Span::styled(format!("{count} items "), Style::default().fg(theme::FG)),
-        Span::styled("· ", Style::default().fg(theme::MUTED)),
+        Span::styled(
+            format!(" {context} "),
+            Style::default().fg(theme::PERIWINKLE),
+        ),
+        Span::styled("· ", Style::default().fg(theme::MIST)),
+        Span::styled(format!("{namespace} "), Style::default().fg(theme::PAPER)),
+        Span::styled("· ", Style::default().fg(theme::MIST)),
+        Span::styled(format!("{count} items "), Style::default().fg(theme::PAPER)),
+        Span::styled("· ", Style::default().fg(theme::MIST)),
         Span::styled(label, style),
     ];
 
     if let Some(e) = error {
         spans.push(Span::styled("  ", Style::default()));
-        spans.push(Span::styled(e.to_string(), Style::default().fg(theme::ERR)));
+        spans.push(Span::styled(
+            e.to_string(),
+            Style::default().fg(theme::CORAL),
+        ));
     } else if show_all_namespaces_hint {
         spans.push(Span::styled("  ", Style::default()));
         spans.push(Span::styled(
             "no pods here — try -A for all namespaces",
-            Style::default().fg(theme::MUTED),
+            Style::default().fg(theme::MIST),
         ));
     }
 
