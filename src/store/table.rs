@@ -185,6 +185,27 @@ pub fn sort_rows(rows: &mut [Vec<String>], sort: &SortState) {
     });
 }
 
+/// The order `sort_rows` puts rows in, expressed as indices into the
+/// UNSORTED list.
+///
+/// Selection is an index into what the user can see, and what the user can
+/// see is the sorted list — but `sort_rows` works on cells alone, so once a
+/// builtin-column table is sorted there is nothing left tying a displayed
+/// position back to the object it came from. This returns exactly that
+/// mapping, so a caller can answer "which object is on screen line N" by
+/// reproducing the view's own ordering rather than approximating it (or,
+/// worse, indexing the unsorted object list with a sorted row number and
+/// opening a detail pane on a different object — the failure `row_identity`
+/// exists to prevent on the server-columns path).
+///
+/// Same comparator, same stability and the same out-of-range no-op as
+/// `sort_rows`, and pinned to agree with it by test: any divergence between
+/// the two is the bug this function exists to prevent.
+pub fn sorted_indices(rows: &[Vec<String>], sort: &SortState) -> Vec<usize> {
+    let _ = (rows, sort);
+    unimplemented!("Task 10: reproduce the view's row ordering")
+}
+
 /// Compare two cell values numerically if both parse as `f64`, lexically
 /// otherwise.
 fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
@@ -341,6 +362,86 @@ mod tests {
                 {"cells": ["api-q8w", "1/2", "CrashLoopBackOff", "10.244.1.38"]}
             ]
         })
+    }
+
+    // --- Task 10: mapping a displayed row back to its object ---
+
+    /// Rows whose sort order differs from their input order in every way a
+    /// wrong `sorted_indices` could get right by accident: the numeric column
+    /// (index 1) sorts `2 < 9 < 10` numerically but `10 < 2 < 9` lexically,
+    /// two rows tie on it so stability is observable, and no row is already
+    /// in its final position.
+    fn permuting_rows() -> Vec<Vec<String>> {
+        [
+            ["delta", "10", "x"],
+            ["alpha", "2", "y"],
+            ["charlie", "2", "z"],
+            ["bravo", "9", "w"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|s| s.to_string()).collect())
+        .collect()
+    }
+
+    #[test]
+    fn sorted_indices_reproduce_exactly_what_sort_rows_produces() {
+        // The whole point: a caller uses this to map a screen position back
+        // to an object, so any divergence from the ordering the view actually
+        // draws resolves the click to the wrong object. Checked in both
+        // directions, on a fixture where numeric-vs-lexical and stability
+        // both change the answer.
+        for descending in [false, true] {
+            for column in 0..3 {
+                let sort = SortState { column, descending };
+                let mut expected = permuting_rows();
+                sort_rows(&mut expected, &sort);
+
+                let original = permuting_rows();
+                let order = sorted_indices(&original, &sort);
+                let got: Vec<Vec<String>> = order.iter().map(|&i| original[i].clone()).collect();
+                assert_eq!(
+                    got, expected,
+                    "sorted_indices disagreed with sort_rows for {sort:?}"
+                );
+                assert_eq!(order.len(), original.len(), "every row must be placed");
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_indices_are_a_permutation_that_keeps_ties_in_input_order() {
+        // "alpha" and "charlie" both hold "2". A stable sort keeps them in
+        // input order (indices 1 then 2); `sort_unstable_by` is free not to,
+        // and a row that swaps under the user between frames is exactly the
+        // disorientation `sort_rows` documents avoiding.
+        let order = sorted_indices(
+            &permuting_rows(),
+            &SortState {
+                column: 1,
+                descending: false,
+            },
+        );
+        assert_eq!(
+            order,
+            vec![1, 2, 3, 0],
+            "expected 2(alpha), 2(charlie), 9(bravo), 10(delta) — numeric, \
+             ties in input order"
+        );
+    }
+
+    #[test]
+    fn sorted_indices_for_an_out_of_range_column_leave_the_order_untouched() {
+        // Matches `sort_rows`' own guard: a sort request can outlive a kind
+        // switch that shrinks the row width.
+        let rows = permuting_rows();
+        let order = sorted_indices(
+            &rows,
+            &SortState {
+                column: 9,
+                descending: false,
+            },
+        );
+        assert_eq!(order, vec![0, 1, 2, 3]);
     }
 
     #[test]

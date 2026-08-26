@@ -4,32 +4,41 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube_tui::app::Overlay;
 use kube_tui::app::event::{AppEvent, Coalesced, WatchStatus, coalesce};
-use kube_tui::app::input::{Action, action_for, apply_selection};
+use kube_tui::app::input::{Action, Focus, action_for, apply_selection};
 use kube_tui::app::session::{
     Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
 };
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
+use kube_tui::cluster::discovery::KindInfo;
 use kube_tui::cluster::{
     AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState, NamespaceListError,
     is_valid_namespace_name, list_namespaces,
 };
+use kube_tui::store::columns::columns_for;
+use kube_tui::store::events::EventRow;
+use kube_tui::store::multi::KindAvailability;
+use kube_tui::store::table::{SortState, TableData, row_identity, sort_table_rows, sorted_indices};
 use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
 use kube_tui::ui::theme;
+use kube_tui::ui::tree::KindTree;
+use kube_tui::ui::views::detail::{DetailPane, render_detail};
 use kube_tui::ui::views::picker::{
     Picker, PickerItem, centered, clamp_selection, filtered_indices, render_picker,
 };
+use kube_tui::ui::views::sidebar::render_sidebar;
 use kube_tui::ui::views::status::render_status;
-use kube_tui::ui::views::table::{TableView, render_table};
+use kube_tui::ui::views::table::{TableView, render_table_with_data};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -380,6 +389,15 @@ fn next_error(
     error
 }
 
+/// How wide the kind tree is, in columns. Wide enough for `PersistentVolume`
+/// plus a count and the two-cell indent `render_sidebar` draws kinds with.
+const SIDEBAR_WIDTH: u16 = 28;
+
+/// How close together two clicks on the same row must be to count as a
+/// double-click. Crossterm reports only individual button presses — there is
+/// no double-click event to subscribe to — so this is measured here.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
 /// Everything one frame needs out of the store, read in a single lock
 /// acquisition.
 ///
@@ -391,52 +409,234 @@ fn next_error(
 /// the worst failure mode for an ops tool. A replaced store reports
 /// `Initialising` by construction, so reading both here makes that state
 /// unrepresentable rather than something to remember to reset.
+///
+/// The sidebar's per-kind counts and availability come from this same read,
+/// for the same reason and one more: availability is a fact the store already
+/// records (`ResourceStore::availability`, written by the watch that failed),
+/// so deriving it here — by matching on an error string, or by mapping
+/// `WatchStatus::Failed` back onto a reason — would be a second answer to a
+/// question that already has one, and the two would disagree for the kinds
+/// the cap never watched at all.
+struct Snapshot {
+    objects: Vec<Arc<DynamicObject>>,
+    status: WatchStatus,
+    /// Server-rendered columns for the active kind, if a fetch has landed.
+    table: Option<TableData>,
+    /// Count and availability for each kind in the session's `kinds`, in the
+    /// same order — parallel to that slice, so the sidebar never has to key
+    /// back into a map that might be missing an entry.
+    kind_facts: Vec<(usize, KindAvailability)>,
+    /// Refetch bookkeeping for the ACTIVE kind only: nothing else is fetched.
+    last_change: Option<Instant>,
+    last_table_fetch: Option<Instant>,
+}
+
 async fn store_snapshot(
     store: &kube_tui::store::watch::SharedStore,
     gvk: &GroupVersionKind,
-) -> (Vec<Arc<DynamicObject>>, WatchStatus) {
-    let s = store.read().await;
-    (s.objects(gvk), s.status(gvk))
+    kinds: &[KindInfo],
+) -> Snapshot {
+    let _ = (store, gvk, kinds);
+    unimplemented!("Task 10: read the whole frame's worth of store in one lock")
 }
 
-/// Draw one frame: the ribbon, then the table and status bar, then the
-/// overlay LAST — so its z=1 hit zones (registered by `render_picker`)
-/// resolve above the table's z=0 zones wherever the two overlap, and its
-/// own content (behind a `Clear`) paints over whatever the table left in
-/// that region.
+/// Rebuild the sidebar tree from the session's kinds and this frame's store
+/// facts, keeping whatever the user has done to it.
+///
+/// The tree is derived data — kinds come from discovery, counts and
+/// availability from the store — but expansion state and the selection are
+/// the user's, and there is nowhere else for them to live. So this rebuilds
+/// the rows and carries those two forward:
+///
+/// - **Expansion** is carried by group LABEL. A group the user collapsed
+///   stays collapsed when a count changes underneath it. A group that did not
+///   exist before starts collapsed, except the one holding the active kind:
+///   opening onto twenty collapsed groups with no sign of where the table's
+///   own kind lives is worse than useless.
+/// - **The selection** is carried by IDENTITY, not by row number. Row numbers
+///   are meaningless across a rebuild — a group above the selection gaining
+///   one kind moves every row below it — so the selected group label or GVK
+///   is looked up in the new rows and the index that now points at it is
+///   restored. Only when the thing selected is gone entirely does this fall
+///   back to `clamp_selected`.
+fn refresh_tree(
+    tree: &mut KindTree,
+    kinds: &[KindInfo],
+    facts: &[(usize, KindAvailability)],
+    active: &GroupVersionKind,
+) {
+    let _ = (tree, kinds, facts, active);
+    unimplemented!("Task 10: rebuild the kind tree without losing the user's state")
+}
+
+/// Resolve the table's selected row to the object it is showing.
+///
+/// Never `objects[selected]`. The table on screen is one of two things, and
+/// neither is the live object list in the order the store happens to hold it:
+///
+/// - **Server-rendered columns.** The `TableData` came from a point-in-time
+///   `fetch_table`; the object list is continuously updated by the watch. The
+///   two are not guaranteed to agree on order or even count at any instant,
+///   so the row's OWN identity (`row_identity`, from the
+///   `includeObject=Metadata` metadata the fetch asked for) is the only
+///   correct answer.
+/// - **Builtin columns**, before the first fetch lands or after one failed.
+///   Here the rows really are extracted from `objects` in order — but only
+///   until a column header is clicked, after which `render_table_with_data`
+///   sorts them. `sorted_indices` reproduces exactly that ordering so the
+///   row the user clicked is the object they get.
+///
+/// Returns `(namespace, name)` — the identity, not the object, because the
+/// object must be re-resolved against the live list on every frame rather
+/// than held as a snapshot that stops updating.
+fn selected_object(
+    objects: &[Arc<DynamicObject>],
+    gvk: &GroupVersionKind,
+    table: Option<&TableData>,
+    sort: Option<&SortState>,
+    selected: usize,
+) -> Option<(Option<String>, String)> {
+    let _ = (objects, gvk, table, sort, selected);
+    unimplemented!("Task 10: resolve a displayed row to its object")
+}
+
+/// The live object matching an identity, or `None` if it has left the store.
+fn find_object<'a>(
+    objects: &'a [Arc<DynamicObject>],
+    namespace: Option<&str>,
+    name: &str,
+) -> Option<&'a Arc<DynamicObject>> {
+    let _ = (objects, namespace, name);
+    unimplemented!("Task 10: re-resolve the detail pane's object each frame")
+}
+
+/// Whether to issue a Table fetch for the active kind now.
+///
+/// Delegates the real decision to `store::table::refetch_is_due`, which is
+/// where "stale AND settled" is defined; this only covers the one case that
+/// function has no opinion on — a kind whose watch has never delivered
+/// anything, so there is no change to debounce against. That is not an idle
+/// kind to leave alone: it is a kind the user just selected, or one that is
+/// genuinely empty, and either way its columns have never been fetched.
+fn table_fetch_due(
+    last_fetch: Option<Instant>,
+    last_change: Option<Instant>,
+    now: Instant,
+    debounce: Duration,
+) -> bool {
+    let _ = (last_fetch, last_change, now, debounce);
+    unimplemented!("Task 10: decide when to refetch the active kind's table")
+}
+
+/// Whether this click on `row` completes a double-click.
+///
+/// Crossterm reports button presses, not clicks — there is no double-click
+/// event — so it is measured here. The row must match as well as the timing:
+/// two fast clicks on two different rows are two selections, not an open.
+fn is_double_click(previous: Option<(usize, Instant)>, row: usize, now: Instant) -> bool {
+    let _ = (previous, row, now);
+    unimplemented!("Task 10: detect a double-click on a table row")
+}
+
+/// The detail pane's subject, and everything fetched FOR that subject.
+///
+/// Events live here, beside the identity they belong to, rather than in a
+/// `Vec<EventRow>` of their own next to an `Option<DetailPane>`. That is what
+/// makes them unable to go stale: a fetch reply carries the identity it was
+/// issued for (`app::event::FetchedEvents`) and is applied only if it matches
+/// the identity in THIS struct, so a reply that arrives after the user has
+/// moved the pane to another object — or closed it — is dropped rather than
+/// displayed. Two parallel fields could be written independently; one struct
+/// cannot be.
+///
+/// The object itself is deliberately NOT stored: it is re-resolved from the
+/// live object list every frame (`find_object`), so the YAML and Overview
+/// tabs track the object as it changes rather than freezing at open time.
+struct OpenDetail {
+    gvk: GroupVersionKind,
+    namespace: Option<String>,
+    name: String,
+    events: Vec<EventRow>,
+    events_error: Option<String>,
+}
+
+impl OpenDetail {
+    /// Whether a fetch reply belongs to the object this pane is open on.
+    fn is_for(&self, gvk: &GroupVersionKind, namespace: Option<&str>, name: &str) -> bool {
+        let _ = (gvk, namespace, name);
+        unimplemented!("Task 10: match a fetch reply to the open object")
+    }
+}
+
+/// Everything a frame draws that is read-only for the duration of the draw.
+///
+/// A struct rather than more positional parameters: `render_frame` reads a
+/// dozen unrelated values and four mutable views, and at that width a
+/// transposed pair of `&str`s or `bool`s compiles silently.
+struct FrameArgs<'a> {
+    objects: &'a [Arc<DynamicObject>],
+    gvk: &'a GroupVersionKind,
+    table_data: Option<TableData>,
+    context_name: &'a str,
+    display_namespace: &'a str,
+    status: WatchStatus,
+    last_error: Option<&'a str>,
+    show_hint: bool,
+    connecting: Option<&'a str>,
+    /// `Some` opens the detail pane over the table. The object is passed in
+    /// rather than looked up here so the draw closure stays synchronous and
+    /// does no work it could get wrong.
+    detail_object: Option<&'a DynamicObject>,
+    events: &'a [EventRow],
+    events_error: Option<&'a str>,
+}
+
+/// Draw one frame: ribbon, sidebar, table, status bar, then the detail pane
+/// over the table, then any picker over everything.
+///
+/// The order is the z-order. Each overlay's hit zones (`render_detail` at
+/// z=1, `render_picker` at z=1) resolve above the table's z=0 zones wherever
+/// they overlap, and each is drawn behind a `Clear` so its own content paints
+/// over whatever the layer below left there. The picker is last because it is
+/// modal over the detail pane too — a cluster switch is reachable from
+/// anywhere.
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     f: &mut Frame,
-    objects: &[Arc<DynamicObject>],
-    gvk: &GroupVersionKind,
+    args: FrameArgs<'_>,
     view: &mut TableView,
-    context_name: &str,
-    display_namespace: &str,
-    status: WatchStatus,
-    last_error: Option<&str>,
-    show_hint: bool,
-    connecting: Option<&str>,
-    // Mutable because the picker owns its scroll offset and advances it
-    // during the draw, exactly as `TableView` does — see `render_picker`.
+    tree: &mut KindTree,
+    // Mutable because each of these owns a scroll offset it advances during
+    // the draw — see `render_picker`, `render_sidebar`, `render_detail`.
+    pane: &mut DetailPane,
     overlay: &mut Overlay,
     hits: &mut HitRegistry,
 ) {
     let full = f.area();
     let (ribbon_area, rest) = split_ribbon(full);
-    render_ribbon(f, ribbon_area, Some(context_name), hits);
+    render_ribbon(f, ribbon_area, Some(args.context_name), hits);
 
     let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(rest);
-    render_table(f, chunks[0], objects, gvk, view, hits);
+    let _ = (tree, pane);
+    render_table_with_data(
+        f,
+        chunks[0],
+        args.objects,
+        args.gvk,
+        args.table_data,
+        view,
+        hits,
+    );
     render_status(
         f,
         chunks[1],
-        context_name,
-        display_namespace,
-        status,
-        objects.len(),
-        last_error,
-        show_hint,
-        connecting,
+        args.context_name,
+        args.display_namespace,
+        args.status,
+        args.objects.len(),
+        args.last_error,
+        args.show_hint,
+        args.connecting,
         hits,
     );
 
@@ -726,6 +926,12 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
 
     let mut view = TableView::new();
+    let mut tree = KindTree {
+        groups: Vec::new(),
+        selected: 0,
+        scroll: 0,
+    };
+    let mut pane = DetailPane::new();
     let mut hits = HitRegistry::new();
     let mut last_error: Option<String> = None;
     // At most one picker is ever open; opening one replaces whatever was
@@ -825,7 +1031,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // Objects and watch health come from one acquisition of one store, so
         // a switch cannot show the previous cluster's health over this
         // cluster's (empty) object list.
-        let (objects, status) = store_snapshot(&store, &pod_gvk).await;
+        let snapshot = store_snapshot(&store, &pod_gvk, &[]).await;
+        let objects = snapshot.objects;
+        let status = snapshot.status;
 
         // Keep an open picker's items current: the registry (cluster
         // states) and the object list (namespaces seen) can both change
@@ -862,7 +1070,12 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             // arrives after the last draw, so on the very first iteration the
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
-            let action = action_for(input, &hits, overlay.is_open());
+            let focus = if overlay.is_open() {
+                Focus::Picker
+            } else {
+                Focus::Table
+            };
+            let action = action_for(input, &hits, focus);
             let confirm_index = confirm_index_for(action, &overlay);
             match action {
                 Action::Quit => quit = true,
@@ -883,6 +1096,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     needs_redraw = true;
                 }
                 Action::SortByColumn(_) => needs_redraw = true,
+                // Task 10 wires these; they are inert until then.
+                Action::ToggleFocus
+                | Action::SelectTreeRow(_)
+                | Action::ScrollTree(_)
+                | Action::ActivateTreeRow
+                | Action::OpenDetail
+                | Action::CloseDetail
+                | Action::SelectDetailTab(_)
+                | Action::CycleDetailTab(_)
+                | Action::ScrollDetail(_) => {}
                 Action::OpenClusterPicker => {
                     overlay = Overlay::ClusterPicker(Picker {
                         title: "Clusters".into(),
@@ -1051,15 +1274,23 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         term.draw(|f| {
             render_frame(
                 f,
-                &objects,
-                &pod_gvk,
+                FrameArgs {
+                    objects: &objects,
+                    gvk: &pod_gvk,
+                    table_data: snapshot.table.clone(),
+                    context_name: &context_name,
+                    display_namespace: scope,
+                    status,
+                    last_error: last_error.as_deref(),
+                    show_hint,
+                    connecting: connecting_name.as_deref(),
+                    detail_object: None,
+                    events: &[],
+                    events_error: None,
+                },
                 &mut view,
-                &context_name,
-                scope,
-                status,
-                last_error.as_deref(),
-                show_hint,
-                connecting_name.as_deref(),
+                &mut tree,
+                &mut pane,
                 &mut overlay,
                 &mut hits,
             );
@@ -1999,10 +2230,10 @@ mod tests {
                     );
                 }
             }
-            let (objects, status) = store_snapshot(&live, &gvk).await;
-            assert_eq!(objects.len(), 3);
+            let snap = store_snapshot(&live, &gvk, &[]).await;
+            assert_eq!(snap.objects.len(), 3);
             assert_eq!(
-                status,
+                snap.status,
                 WatchStatus::Synced,
                 "a live watch's own store must report live"
             );
@@ -2014,10 +2245,13 @@ mod tests {
             // "live" here, labelling an empty table as fresh data.
             let fresh: kube_tui::store::watch::SharedStore =
                 Arc::new(RwLock::new(ResourceStore::new()));
-            let (objects, status) = store_snapshot(&fresh, &gvk).await;
-            assert!(objects.is_empty(), "the new cluster starts with no objects");
+            let snap = store_snapshot(&fresh, &gvk, &[]).await;
+            assert!(
+                snap.objects.is_empty(),
+                "the new cluster starts with no objects"
+            );
             assert_eq!(
-                status,
+                snap.status,
                 WatchStatus::Initialising,
                 "zero items must never be labelled 'live': the status must come \
                  from the same store the (empty) object list did"
@@ -2077,11 +2311,45 @@ mod tests {
             );
         }
 
+        /// The default `FrameArgs` these render tests vary one field of: one
+        /// pod, no fetched table, nothing wrong, no overlay.
+        fn frame_args<'a>(
+            objects: &'a [Arc<DynamicObject>],
+            gvk: &'a GroupVersionKind,
+            context_name: &'a str,
+        ) -> FrameArgs<'a> {
+            FrameArgs {
+                objects,
+                gvk,
+                table_data: None,
+                context_name,
+                display_namespace: "default",
+                status: WatchStatus::Synced,
+                last_error: None,
+                show_hint: false,
+                connecting: None,
+                detail_object: None,
+                events: &[],
+                events_error: None,
+            }
+        }
+
+        /// An empty tree, as the sidebar looks before discovery lands.
+        fn empty_tree() -> KindTree {
+            KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            }
+        }
+
         #[test]
         fn render_frame_paints_the_ribbon_in_the_active_clusters_hue() {
             let pods = vec![pod_in("a", "default")];
             let gvk = GroupVersionKind::gvk("", "v1", "Pod");
             let mut view = TableView::new();
+            let mut tree = empty_tree();
+            let mut pane = DetailPane::new();
             let mut hits = HitRegistry::new();
             let mut overlay = Overlay::None;
 
@@ -2089,15 +2357,10 @@ mod tests {
             term.draw(|f| {
                 render_frame(
                     f,
-                    &pods,
-                    &gvk,
+                    frame_args(&pods, &gvk, "prod-eu"),
                     &mut view,
-                    "prod-eu",
-                    "default",
-                    WatchStatus::Synced,
-                    None,
-                    false,
-                    None,
+                    &mut tree,
+                    &mut pane,
                     &mut overlay,
                     &mut hits,
                 );
@@ -2159,19 +2422,16 @@ mod tests {
                 scroll: 0,
             });
 
+            let mut tree = empty_tree();
+            let mut pane = DetailPane::new();
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             term.draw(|f| {
                 render_frame(
                     f,
-                    &pods,
-                    &gvk,
+                    frame_args(&pods, &gvk, "prod"),
                     &mut view,
-                    "prod",
-                    "default",
-                    WatchStatus::Synced,
-                    None,
-                    false,
-                    None,
+                    &mut tree,
+                    &mut pane,
                     &mut overlay,
                     &mut hits,
                 );
@@ -2203,6 +2463,823 @@ mod tests {
             assert!(
                 found_picker_row,
                 "the picker's hit zones must resolve over the table's"
+            );
+        }
+    }
+
+    // --- Task 10: sidebar, detail pane, and refetch wiring ---
+
+    mod wiring {
+        use super::*;
+        use kube::ResourceExt;
+        use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+        use kube_tui::cluster::discovery::KindInfo;
+        use kube_tui::store::multi::KindAvailability;
+        use kube_tui::store::table::{RowIdentity, SortState, TableColumn, TableData, TableRow};
+        use kube_tui::store::watch::{ResourceStore, SharedStore};
+        use kube_tui::ui::tree::{TreeGroup, TreeKind, TreeRow, flatten};
+        use kube_tui::ui::views::picker::{Picker, PickerItem};
+        use ratatui::backend::TestBackend;
+        use std::time::{Duration, Instant};
+        use tokio::sync::RwLock;
+
+        fn pod_gvk() -> GroupVersionKind {
+            GroupVersionKind::gvk("", "v1", "Pod")
+        }
+
+        fn pod_ar() -> ApiResource {
+            ApiResource::erase::<Pod>(&())
+        }
+
+        fn pod_named(name: &str) -> Arc<DynamicObject> {
+            Arc::new(DynamicObject::new(name, &pod_ar()).within("demo"))
+        }
+
+        fn kind_info(group: &str, kind: &str) -> KindInfo {
+            KindInfo {
+                gvk: GroupVersionKind::gvk(group, "v1", kind),
+                resource: ApiResource {
+                    group: group.to_string(),
+                    api_version: if group.is_empty() {
+                        "v1".to_string()
+                    } else {
+                        format!("{group}/v1")
+                    },
+                    kind: kind.to_string(),
+                    version: "v1".to_string(),
+                    plural: format!("{}s", kind.to_lowercase()),
+                },
+                namespaced: true,
+                group_label: if group.is_empty() {
+                    "core".to_string()
+                } else {
+                    group.to_string()
+                },
+            }
+        }
+
+        /// A server-rendered Table whose row ORDER deliberately disagrees
+        /// with the object list below it, and whose NAME cells deliberately
+        /// disagree with the identities attached to the rows.
+        ///
+        /// Both are what a positional resolution gets wrong, and each on its
+        /// own would let a different wrong implementation pass: matching by
+        /// position picks the wrong row, and "read the NAME cell" (the
+        /// obvious shortcut `row_identity` exists to forbid, since a CRD's
+        /// NAME column need not be `metadata.name`) picks the wrong object
+        /// from the right row.
+        fn disagreeing_table() -> TableData {
+            TableData {
+                columns: vec![
+                    TableColumn {
+                        name: "Name".to_string(),
+                        priority: 0,
+                    },
+                    TableColumn {
+                        name: "Restarts".to_string(),
+                        priority: 0,
+                    },
+                ],
+                rows: vec![
+                    row("displayed-as-zulu", "10", "web-zulu"),
+                    row("displayed-as-alpha", "2", "web-alpha"),
+                    row("displayed-as-mike", "9", "web-mike"),
+                ],
+            }
+        }
+
+        fn row(cell_name: &str, restarts: &str, real_name: &str) -> TableRow {
+            TableRow {
+                cells: vec![cell_name.to_string(), restarts.to_string()],
+                identity: Some(RowIdentity {
+                    namespace: Some("demo".to_string()),
+                    name: real_name.to_string(),
+                }),
+            }
+        }
+
+        #[test]
+        fn a_selected_server_row_resolves_through_its_own_identity() {
+            // The object list is in a different order from the table's rows
+            // (the watch and the fetch are refreshed at different moments),
+            // and the NAME cell of every row names something that is not the
+            // object. Only `row_identity` gives the right answer here.
+            let objects = vec![
+                pod_named("web-alpha"),
+                pod_named("web-mike"),
+                pod_named("web-zulu"),
+            ];
+            let table = disagreeing_table();
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), Some(&table), None, 2),
+                Some((Some("demo".to_string()), "web-mike".to_string())),
+                "row 2 displays web-mike; indexing `objects` positionally \
+                 would answer web-zulu, and reading the NAME cell would \
+                 answer 'displayed-as-mike', which is no object at all"
+            );
+        }
+
+        #[test]
+        fn a_selected_server_row_follows_the_sort_the_table_is_drawn_in() {
+            // `render_table_with_data` sorts a copy of the rows before
+            // drawing, and registers hit zones against the SORTED order — so
+            // selection is an index into the sorted list. Resolving against
+            // the unsorted one opens the pane on a different object.
+            //
+            // Sorted ascending by Restarts (numeric): 2 (web-alpha), 9
+            // (web-mike), 10 (web-zulu). Row 0 is therefore web-alpha, which
+            // is a DIFFERENT object from the unsorted row 0 (web-zulu) — and
+            // also, deliberately, from the object at `objects[0]`.
+            let objects = vec![
+                pod_named("web-zulu"),
+                pod_named("web-mike"),
+                pod_named("web-alpha"),
+            ];
+            let table = disagreeing_table();
+            let sort = SortState {
+                column: 1,
+                descending: false,
+            };
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), Some(&table), Some(&sort), 0),
+                Some((Some("demo".to_string()), "web-alpha".to_string())),
+                "the first row of the SORTED table is web-alpha"
+            );
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), Some(&table), Some(&sort), 2),
+                Some((Some("demo".to_string()), "web-zulu".to_string())),
+                "and the last is web-zulu — 10 restarts sorts after 9 \
+                 numerically, not before it lexically"
+            );
+        }
+
+        #[test]
+        fn a_selected_builtin_column_row_follows_the_sort_too() {
+            // Before the first Table fetch lands there is no server row to
+            // carry an identity, and the rows really are `objects` in order —
+            // right up until a column header is clicked. Sorted by NAME
+            // ascending, `objects[0]` (web-zulu) is drawn LAST, so a resolver
+            // that ignored the sort would answer web-zulu for row 0.
+            let objects = vec![
+                pod_named("web-zulu"),
+                pod_named("web-mike"),
+                pod_named("web-alpha"),
+            ];
+            let sort = SortState {
+                column: 0,
+                descending: false,
+            };
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), None, Some(&sort), 0),
+                Some((Some("demo".to_string()), "web-alpha".to_string()))
+            );
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), None, None, 0),
+                Some((Some("demo".to_string()), "web-zulu".to_string())),
+                "and unsorted, row 0 is the first object as loaded"
+            );
+        }
+
+        #[test]
+        fn a_row_with_no_identity_resolves_to_nothing_rather_than_a_guess() {
+            // An apiserver that ignored `includeObject=Metadata`. A guess
+            // from the NAME cell would be wrong for any CRD whose NAME column
+            // is not `metadata.name`.
+            let objects = vec![pod_named("web-alpha")];
+            let table = TableData {
+                columns: vec![TableColumn {
+                    name: "Name".to_string(),
+                    priority: 0,
+                }],
+                rows: vec![TableRow {
+                    cells: vec!["web-alpha".to_string()],
+                    identity: None,
+                }],
+            };
+            assert_eq!(
+                selected_object(&objects, &pod_gvk(), Some(&table), None, 0),
+                None
+            );
+        }
+
+        #[test]
+        fn a_selection_past_the_end_resolves_to_nothing() {
+            let objects = vec![pod_named("web-alpha")];
+            assert_eq!(selected_object(&objects, &pod_gvk(), None, None, 9), None);
+            assert_eq!(
+                selected_object(&[], &pod_gvk(), None, None, 0),
+                None,
+                "an empty table has nothing to open"
+            );
+        }
+
+        #[test]
+        fn the_detail_panes_object_is_re_resolved_from_the_live_list() {
+            let objects = vec![pod_named("web-alpha"), pod_named("web-mike")];
+            assert_eq!(
+                find_object(&objects, Some("demo"), "web-mike").map(|o| o.name_any()),
+                Some("web-mike".to_string())
+            );
+            assert!(
+                find_object(&objects, Some("other"), "web-mike").is_none(),
+                "a name alone must not match across namespaces"
+            );
+            assert!(
+                find_object(&objects, Some("demo"), "web-gone").is_none(),
+                "an object that has left the store must resolve to nothing"
+            );
+        }
+
+        // --- the store snapshot the sidebar reads ---
+
+        async fn store_with_facts() -> SharedStore {
+            let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+            {
+                let mut s = store.write().await;
+                for n in ["a", "b", "c"] {
+                    s.apply(
+                        &pod_gvk(),
+                        &pod_ar(),
+                        kube::runtime::watcher::Event::Apply(
+                            DynamicObject::new(n, &pod_ar()).within("demo"),
+                        ),
+                    );
+                }
+                // Pods are watched and healthy, but the cap left them out of
+                // the eager watch set — so `status` says nothing is wrong
+                // while `availability` says they are not being watched.
+                s.set_status(pod_gvk(), WatchStatus::Synced);
+                s.set_availability(pod_gvk(), KindAvailability::NotWatched);
+
+                // Secrets are watched and forbidden: the apiserver's own
+                // reason is recorded, and `WatchStatus::Failed` alone cannot
+                // reproduce it.
+                let secret = GroupVersionKind::gvk("", "v1", "Secret");
+                s.set_status(secret.clone(), WatchStatus::Failed);
+                s.set_availability(
+                    secret,
+                    KindAvailability::Unavailable {
+                        reason: "secrets is forbidden".to_string(),
+                    },
+                );
+            }
+            store
+        }
+
+        #[tokio::test]
+        async fn the_snapshot_reads_availability_from_the_store_not_from_watch_status() {
+            // The mutation this guards: deriving each kind's availability in
+            // the render path — from `WatchStatus`, or worse by matching on
+            // an error string — instead of reading the answer the store
+            // already holds. Both kinds below are chosen so that derivation
+            // gives a DIFFERENT answer: Pod is `Synced` yet not watched at
+            // all, and Secret's reason exists nowhere in its status.
+            let store = store_with_facts().await;
+            let kinds = vec![kind_info("", "Pod"), kind_info("", "Secret")];
+            let snap = store_snapshot(&store, &pod_gvk(), &kinds).await;
+
+            assert_eq!(snap.kind_facts.len(), 2, "one fact per kind, in order");
+            assert_eq!(
+                snap.kind_facts[0],
+                (3, KindAvailability::NotWatched),
+                "a kind cut by the cap is not 'watching': deriving from \
+                 WatchStatus::Synced would say it was"
+            );
+            assert_eq!(
+                snap.kind_facts[1],
+                (
+                    0,
+                    KindAvailability::Unavailable {
+                        reason: "secrets is forbidden".to_string()
+                    }
+                ),
+                "the apiserver's own reason must survive to the sidebar; \
+                 WatchStatus::Failed carries no reason at all"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_snapshot_carries_the_refetch_bookkeeping_for_the_active_kind() {
+            let store = store_with_facts().await;
+            let kinds = vec![kind_info("", "Pod")];
+            let snap = store_snapshot(&store, &pod_gvk(), &kinds).await;
+            assert!(
+                snap.last_change.is_some(),
+                "three pods were applied, so this kind has changed"
+            );
+            assert_eq!(
+                snap.last_table_fetch, None,
+                "nothing has been fetched for it yet"
+            );
+        }
+
+        // --- the sidebar tree ---
+
+        fn facts_for(kinds: &[KindInfo]) -> Vec<(usize, KindAvailability)> {
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (i, KindAvailability::Watching))
+                .collect()
+        }
+
+        fn tree_labels(tree: &KindTree) -> Vec<String> {
+            flatten(tree)
+                .iter()
+                .map(|r| match r {
+                    TreeRow::Group { group, .. } => group.label.clone(),
+                    TreeRow::Kind { kind, .. } => format!("  {}", kind.label),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_tree_groups_kinds_and_carries_each_ones_count_and_availability() {
+            let kinds = vec![
+                kind_info("", "Pod"),
+                kind_info("", "Service"),
+                kind_info("apps", "Deployment"),
+            ];
+            let facts = vec![
+                (7, KindAvailability::Watching),
+                (
+                    0,
+                    KindAvailability::Unavailable {
+                        reason: "forbidden".to_string(),
+                    },
+                ),
+                (2, KindAvailability::NotWatched),
+            ];
+            let mut tree = KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            refresh_tree(&mut tree, &kinds, &facts, &pod_gvk());
+
+            let core = tree
+                .groups
+                .iter()
+                .find(|g| g.label == "core")
+                .expect("the core group must exist");
+            assert_eq!(
+                core.kinds
+                    .iter()
+                    .map(|k| k.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Pod", "Service"],
+                "kinds keep discovery's stable order within their group"
+            );
+            assert_eq!(core.kinds[0].count, Some(7));
+            assert_eq!(core.kinds[0].availability, KindAvailability::Watching);
+            assert_eq!(
+                core.kinds[1].availability,
+                KindAvailability::Unavailable {
+                    reason: "forbidden".to_string()
+                },
+                "the store's reason must reach the row the sidebar draws"
+            );
+            let apps = tree
+                .groups
+                .iter()
+                .find(|g| g.label == "apps")
+                .expect("the apps group must exist");
+            assert_eq!(apps.kinds[0].availability, KindAvailability::NotWatched);
+        }
+
+        #[test]
+        fn the_group_holding_the_active_kind_opens_and_the_rest_stay_shut() {
+            // Twenty API groups is normal. Expanding all of them buries the
+            // one kind the table is actually showing; expanding none leaves
+            // no sign of where it is.
+            let kinds = vec![
+                kind_info("acme.io", "Widget"),
+                kind_info("apps", "Deployment"),
+                kind_info("", "Pod"),
+            ];
+            let mut tree = KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            refresh_tree(&mut tree, &kinds, &facts_for(&kinds), &pod_gvk());
+
+            let expanded: Vec<&str> = tree
+                .groups
+                .iter()
+                .filter(|g| g.expanded)
+                .map(|g| g.label.as_str())
+                .collect();
+            assert_eq!(
+                expanded,
+                vec!["core"],
+                "only the group holding the active kind (core/v1 Pod) opens"
+            );
+        }
+
+        #[test]
+        fn a_rebuild_keeps_what_the_user_expanded_and_what_they_selected() {
+            // Counts change constantly, so the tree is rebuilt constantly.
+            // If a rebuild reset expansion, a collapsed group would spring
+            // open the moment a pod restarted somewhere; if it reset the
+            // selection, the sidebar highlight would jump under the user's
+            // hand several times a second.
+            let kinds = vec![
+                kind_info("", "Pod"),
+                kind_info("", "Service"),
+                kind_info("apps", "Deployment"),
+            ];
+            let mut tree = KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            refresh_tree(&mut tree, &kinds, &facts_for(&kinds), &pod_gvk());
+
+            // The user opens `apps` and collapses `core`, then selects the
+            // Deployment row. `apps` sorts before `core`, so with core
+            // collapsed the rows are: apps, Deployment, core.
+            for g in &mut tree.groups {
+                g.expanded = g.label == "apps";
+            }
+            assert_eq!(tree_labels(&tree), vec!["apps", "  Deployment", "core"]);
+            tree.selected = 1;
+
+            // A count arrives for every kind — a rebuild with the same kinds
+            // but different facts.
+            let facts = vec![
+                (99, KindAvailability::Watching),
+                (5, KindAvailability::Watching),
+                (1, KindAvailability::Watching),
+            ];
+            refresh_tree(&mut tree, &kinds, &facts, &pod_gvk());
+
+            assert_eq!(
+                tree_labels(&tree),
+                vec!["apps", "  Deployment", "core"],
+                "the user's expansion state must survive a rebuild"
+            );
+            assert_eq!(
+                tree.selected_kind().map(|k| k.label.clone()),
+                Some("Deployment".to_string()),
+                "and so must the selection"
+            );
+            assert_eq!(
+                tree.selected_kind().and_then(|k| k.count),
+                Some(1),
+                "with the new count, not the old one"
+            );
+        }
+
+        #[test]
+        fn a_rebuild_keeps_the_selection_on_the_same_kind_when_rows_shift_above_it() {
+            // The case a row-index-preserving implementation gets wrong, and
+            // the reason the anchor is an identity: a group ABOVE the
+            // selection gains a kind, so every row below it moves down by
+            // one. Keeping `selected` numerically would silently re-point it
+            // at whatever now occupies that row.
+            let before = vec![kind_info("apps", "Deployment"), kind_info("zoo.io", "Ape")];
+            let mut tree = KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            refresh_tree(&mut tree, &before, &facts_for(&before), &pod_gvk());
+            for g in &mut tree.groups {
+                g.expanded = true;
+            }
+            assert_eq!(
+                tree_labels(&tree),
+                vec!["apps", "  Deployment", "zoo.io", "  Ape"]
+            );
+            tree.selected = 3; // "Ape"
+
+            let after = vec![
+                kind_info("apps", "DaemonSet"),
+                kind_info("apps", "Deployment"),
+                kind_info("zoo.io", "Ape"),
+            ];
+            refresh_tree(&mut tree, &after, &facts_for(&after), &pod_gvk());
+
+            assert_eq!(
+                tree_labels(&tree),
+                vec!["apps", "  DaemonSet", "  Deployment", "zoo.io", "  Ape"]
+            );
+            assert_eq!(
+                tree.selected_kind().map(|k| k.label.clone()),
+                Some("Ape".to_string()),
+                "the selection must follow the kind, not the row number — \
+                 row 3 is now Deployment"
+            );
+        }
+
+        #[test]
+        fn a_rebuild_that_removes_the_selected_kind_clamps_rather_than_dangling() {
+            // A cluster switch, or a CRD uninstalled mid-session.
+            let before = vec![kind_info("acme.io", "Widget")];
+            let mut tree = KindTree {
+                groups: Vec::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            refresh_tree(&mut tree, &before, &facts_for(&before), &pod_gvk());
+            tree.groups[0].expanded = true;
+            tree.selected = 1;
+
+            let after = vec![kind_info("", "Pod")];
+            refresh_tree(&mut tree, &after, &facts_for(&after), &pod_gvk());
+            assert!(
+                tree.selected < flatten(&tree).len(),
+                "the selection must stay inside the tree"
+            );
+        }
+
+        // --- the Table refetch trigger ---
+
+        #[test]
+        fn a_refetch_waits_for_the_burst_to_settle() {
+            // The mutation this guards: firing as soon as anything changed,
+            // ignoring the debounce. A rollout touching fifty pods produces a
+            // burst of deltas; one Table GET per delta hammers the apiserver
+            // on exactly the namespace someone is watching a rollout in.
+            let now = Instant::now();
+            let debounce = Duration::from_millis(750);
+            let changed_just_now = now - Duration::from_millis(10);
+            assert!(
+                !table_fetch_due(None, Some(changed_just_now), now, debounce),
+                "a change 10ms old has not settled; a fetch now would be one \
+                 of fifty"
+            );
+            let settled = now - Duration::from_millis(800);
+            assert!(
+                table_fetch_due(None, Some(settled), now, debounce),
+                "once the burst has been quiet for the debounce, fetch"
+            );
+        }
+
+        #[test]
+        fn a_kind_already_fetched_since_its_last_change_is_not_fetched_again() {
+            // What keeps a static namespace from being refetched merely
+            // because time passed — the other half of idle CPU staying at
+            // zero.
+            let now = Instant::now();
+            let debounce = Duration::from_millis(750);
+            let changed = now - Duration::from_secs(60);
+            let fetched = now - Duration::from_secs(30);
+            assert!(!table_fetch_due(
+                Some(fetched),
+                Some(changed),
+                now,
+                debounce
+            ));
+            assert!(
+                table_fetch_due(
+                    Some(changed - Duration::from_secs(1)),
+                    Some(changed),
+                    now,
+                    debounce
+                ),
+                "a fetch that predates the change is stale and must be redone"
+            );
+        }
+
+        #[test]
+        fn a_kind_that_has_never_changed_is_fetched_exactly_once() {
+            // Selecting a kind whose watch has delivered nothing — an empty
+            // namespace, or one whose watch has not synced yet. There is no
+            // change to debounce against, but its columns have never been
+            // fetched, and without this the table would sit on the builtin
+            // NAME/AGE fallback for ever.
+            let now = Instant::now();
+            let debounce = Duration::from_millis(750);
+            assert!(
+                table_fetch_due(None, None, now, debounce),
+                "never fetched, never changed: fetch it once"
+            );
+            assert!(
+                !table_fetch_due(Some(now - Duration::from_secs(1)), None, now, debounce),
+                "and having fetched it, do not fetch it again on every wake"
+            );
+        }
+
+        // --- opening the pane by mouse ---
+
+        #[test]
+        fn two_quick_clicks_on_the_same_row_are_a_double_click() {
+            let t0 = Instant::now();
+            assert!(is_double_click(
+                Some((3, t0)),
+                3,
+                t0 + Duration::from_millis(120)
+            ));
+        }
+
+        #[test]
+        fn two_slow_clicks_on_the_same_row_are_two_selections() {
+            let t0 = Instant::now();
+            assert!(!is_double_click(
+                Some((3, t0)),
+                3,
+                t0 + Duration::from_millis(900)
+            ));
+        }
+
+        #[test]
+        fn two_quick_clicks_on_different_rows_are_two_selections() {
+            // Fast selection of two adjacent rows must not open a pane on the
+            // second one.
+            let t0 = Instant::now();
+            assert!(!is_double_click(
+                Some((3, t0)),
+                4,
+                t0 + Duration::from_millis(50)
+            ));
+        }
+
+        #[test]
+        fn the_first_click_of_the_session_is_never_a_double_click() {
+            assert!(!is_double_click(None, 0, Instant::now()));
+        }
+
+        // --- events cannot be shown under the wrong object ---
+
+        fn open_on(name: &str) -> OpenDetail {
+            OpenDetail {
+                gvk: pod_gvk(),
+                namespace: Some("demo".to_string()),
+                name: name.to_string(),
+                events: Vec::new(),
+                events_error: None,
+            }
+        }
+
+        #[test]
+        fn an_events_reply_is_accepted_only_for_the_object_the_pane_is_open_on() {
+            let open = open_on("web-alpha");
+            assert!(open.is_for(&pod_gvk(), Some("demo"), "web-alpha"));
+            assert!(
+                !open.is_for(&pod_gvk(), Some("demo"), "web-mike"),
+                "a reply for the object the user just moved away from must \
+                 not be shown under this one's name"
+            );
+            assert!(
+                !open.is_for(&pod_gvk(), Some("kube-system"), "web-alpha"),
+                "the same name in another namespace is another object"
+            );
+            assert!(
+                !open.is_for(
+                    &GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                    Some("demo"),
+                    "web-alpha"
+                ),
+                "a Deployment and a Pod can share a name"
+            );
+        }
+
+        // --- draw order ---
+
+        fn thirty_pods() -> Vec<Arc<DynamicObject>> {
+            (0..30).map(|i| pod_named(&format!("pod-{i:02}"))).collect()
+        }
+
+        fn screen(term: &Terminal<TestBackend>) -> String {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            let mut out = String::new();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    out.push_str(buf[(x, y)].symbol());
+                }
+                out.push('\n');
+            }
+            out
+        }
+
+        fn draw(
+            detail_object: Option<&DynamicObject>,
+            overlay: &mut Overlay,
+            tree: &mut KindTree,
+        ) -> Terminal<TestBackend> {
+            let pods = thirty_pods();
+            let gvk = pod_gvk();
+            let mut view = TableView::new();
+            let mut pane = DetailPane::new();
+            let mut hits = HitRegistry::new();
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| {
+                render_frame(
+                    f,
+                    FrameArgs {
+                        objects: &pods,
+                        gvk: &gvk,
+                        table_data: None,
+                        context_name: "prod",
+                        display_namespace: "demo",
+                        status: WatchStatus::Synced,
+                        last_error: None,
+                        show_hint: false,
+                        connecting: None,
+                        detail_object,
+                        events: &[],
+                        events_error: None,
+                    },
+                    &mut view,
+                    tree,
+                    &mut pane,
+                    overlay,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+            term
+        }
+
+        fn sidebar_tree() -> KindTree {
+            KindTree {
+                groups: vec![TreeGroup {
+                    label: "core".to_string(),
+                    expanded: true,
+                    kinds: vec![TreeKind {
+                        gvk: pod_gvk(),
+                        label: "Pod".to_string(),
+                        count: Some(30),
+                        availability: KindAvailability::Watching,
+                    }],
+                }],
+                selected: 1,
+                scroll: 0,
+            }
+        }
+
+        #[test]
+        fn the_sidebar_is_drawn_beside_the_table_not_instead_of_it() {
+            let mut overlay = Overlay::None;
+            let mut tree = sidebar_tree();
+            let term = draw(None, &mut overlay, &mut tree);
+            let text = screen(&term);
+            assert!(
+                text.contains("Kinds"),
+                "the sidebar's own frame must be on screen:\n{text}"
+            );
+            assert!(text.contains("Pod"), "and the kind it lists:\n{text}");
+            assert!(
+                text.contains("pod-00"),
+                "the table must still be drawn alongside it:\n{text}"
+            );
+        }
+
+        #[test]
+        fn the_detail_pane_paints_over_the_table_it_covers() {
+            // The control first: with no pane open, every stub pod renders
+            // "Unknown" in its STATUS cell, so the string is definitely on
+            // screen and this assertion is not vacuous.
+            let mut overlay = Overlay::None;
+            let mut tree = sidebar_tree();
+            let without = screen(&draw(None, &mut overlay, &mut tree));
+            assert!(
+                without.contains("Unknown"),
+                "control: the table's STATUS cells must be visible with no \
+                 pane open:\n{without}"
+            );
+
+            let obj = pod_named("pod-07");
+            let with = screen(&draw(Some(&obj), &mut overlay, &mut tree));
+            assert!(
+                with.contains("Overview"),
+                "the pane's tab bar must be drawn:\n{with}"
+            );
+            assert!(
+                !with.contains("Unknown"),
+                "the pane covers the whole table area, so no table row may \
+                 bleed through it — it was not drawn last:\n{with}"
+            );
+        }
+
+        #[test]
+        fn a_picker_paints_over_the_detail_pane_as_well_as_the_table() {
+            // The picker is modal over everything: a cluster switch stays
+            // reachable with a detail pane open. The label is long on purpose
+            // — a short one is drawn entirely to the LEFT of the detail
+            // pane's own region, where a wrong draw order could not overwrite
+            // it, which would make this fixture vacuous.
+            let long = "prod-eu-west-1-platform-cluster";
+            let mut overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items: vec![PickerItem {
+                    label: long.to_string(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 0,
+                scroll: 0,
+            });
+            let mut tree = sidebar_tree();
+            let obj = pod_named("pod-07");
+            let text = screen(&draw(Some(&obj), &mut overlay, &mut tree));
+            assert!(
+                text.contains(long),
+                "the picker must survive the detail pane drawn beneath it:\n{text}"
             );
         }
     }

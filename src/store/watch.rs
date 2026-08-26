@@ -9,6 +9,7 @@ use kube::runtime::watcher;
 use kube::{Api, Client};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -40,6 +41,21 @@ pub struct ResourceStore {
     /// unrepresentable: a stale fetch for a kind the user has since left
     /// simply updates that kind's (unread) entry.
     tables: HashMap<GroupVersionKind, TableData>,
+    /// When this kind's watch last changed anything, and when a Table fetch
+    /// was last issued for it — the two inputs `store::table::refetch_is_due`
+    /// needs.
+    ///
+    /// Here rather than in the event loop for a reason the loop could not
+    /// enforce itself: both are only meaningful relative to the data in THIS
+    /// store, and a cluster switch or a namespace change replaces the store
+    /// wholesale (`switch_cluster` step 5, `restart_watch`). Kept in the loop
+    /// they would have to be cleared by hand at both of those points, and a
+    /// carried-over `last_fetch` would suppress the very first refetch on the
+    /// new cluster — a table showing the old cluster's columns until
+    /// something happens to change. Living in the store makes them start
+    /// empty by construction, the same reasoning `tables` itself documents.
+    last_change: HashMap<GroupVersionKind, Instant>,
+    last_table_fetch: HashMap<GroupVersionKind, Instant>,
 }
 
 impl Default for ResourceStore {
@@ -55,6 +71,8 @@ impl ResourceStore {
             statuses: HashMap::new(),
             availability: HashMap::new(),
             tables: HashMap::new(),
+            last_change: HashMap::new(),
+            last_table_fetch: HashMap::new(),
         }
     }
 
@@ -72,6 +90,45 @@ impl ResourceStore {
 
     pub fn objects(&self, gvk: &GroupVersionKind) -> Vec<Arc<DynamicObject>> {
         self.kinds.get(gvk).map(|c| c.objects()).unwrap_or_default()
+    }
+
+    /// How many objects of this kind are cached.
+    ///
+    /// Not `objects(gvk).len()`: the sidebar needs a count for EVERY
+    /// discovered kind on every frame, and `objects` clones a `Vec` of `Arc`s
+    /// to produce one. Forty kinds over a few hundred objects each would be
+    /// tens of thousands of refcount bumps per repaint, for a number the
+    /// cache already knows — and would break the O(viewport) render budget on
+    /// exactly the clusters where it matters.
+    pub fn count(&self, gvk: &GroupVersionKind) -> usize {
+        self.kinds.get(gvk).map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// When this kind's watch last delivered anything into the store, or
+    /// `None` if it never has. One of the two inputs to
+    /// `store::table::refetch_is_due`.
+    pub fn last_change(&self, gvk: &GroupVersionKind) -> Option<Instant> {
+        let _ = gvk;
+        unimplemented!("Task 10: record and report the last watch delta")
+    }
+
+    /// Record that a Table fetch was ISSUED for this kind.
+    ///
+    /// Issue time, not completion time: recorded on completion, every wake
+    /// arriving while a fetch is in flight would see a stale `last_fetch` and
+    /// issue another, so one slow request on a busy namespace becomes a pile
+    /// of concurrent identical GETs. Recording at issue is conservative in
+    /// the safe direction — anything that changes while the request is in
+    /// flight updates `last_change` past this value and re-arms the refetch
+    /// normally.
+    pub fn note_table_fetch(&mut self, gvk: GroupVersionKind, at: Instant) {
+        let _ = (gvk, at);
+        unimplemented!("Task 10: record a table fetch")
+    }
+
+    pub fn last_table_fetch(&self, gvk: &GroupVersionKind) -> Option<Instant> {
+        let _ = gvk;
+        unimplemented!("Task 10: report the last table fetch")
     }
 
     pub fn set_status(&mut self, gvk: GroupVersionKind, status: WatchStatus) {
@@ -349,6 +406,96 @@ mod tests {
         let store = ResourceStore::new();
         let unknown = GroupVersionKind::gvk("apps", "v1", "Deployment");
         assert!(store.objects(&unknown).is_empty());
+    }
+
+    // --- Task 10: counts and refetch bookkeeping ---
+
+    #[test]
+    fn counting_a_kind_agrees_with_listing_it_without_cloning_the_list() {
+        // The sidebar needs a count per kind per frame; `objects().len()`
+        // would clone a Vec of Arcs for every one of them.
+        let mut store = ResourceStore::new();
+        let ar = ApiResource::erase::<Pod>(&());
+        for n in ["a", "b", "c"] {
+            store.apply(&pod_gvk(), &ar, watcher::Event::Apply(pod(n)));
+        }
+        store.apply(&pod_gvk(), &ar, watcher::Event::Delete(pod("b")));
+        assert_eq!(
+            store.count(&pod_gvk()),
+            store.objects(&pod_gvk()).len(),
+            "the cheap count must agree with the expensive one"
+        );
+        assert_eq!(store.count(&pod_gvk()), 2);
+        assert_eq!(
+            store.count(&GroupVersionKind::gvk("apps", "v1", "Deployment")),
+            0,
+            "a kind nothing has been applied for counts zero, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_watch_delta_records_when_this_kind_last_changed() {
+        // `refetch_is_due` needs this instant; without it, a Table fetch has
+        // nothing to debounce against and either never fires or fires on
+        // every delta.
+        let mut store = ResourceStore::new();
+        let ar = ApiResource::erase::<Pod>(&());
+        assert_eq!(
+            store.last_change(&pod_gvk()),
+            None,
+            "nothing has happened for this kind yet"
+        );
+
+        let before = Instant::now();
+        store.apply(&pod_gvk(), &ar, watcher::Event::Apply(pod("a")));
+        let after = Instant::now();
+
+        let at = store
+            .last_change(&pod_gvk())
+            .expect("a delta must record when it landed");
+        assert!(
+            at >= before && at <= after,
+            "the recorded instant must be the one the delta actually landed at"
+        );
+        assert_eq!(
+            store.last_change(&GroupVersionKind::gvk("apps", "v1", "Deployment")),
+            None,
+            "one kind's delta says nothing about another's"
+        );
+    }
+
+    #[test]
+    fn a_table_fetch_is_recorded_per_kind() {
+        let mut store = ResourceStore::new();
+        let deploy = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let at = Instant::now();
+        assert_eq!(store.last_table_fetch(&pod_gvk()), None);
+        store.note_table_fetch(pod_gvk(), at);
+        assert_eq!(store.last_table_fetch(&pod_gvk()), Some(at));
+        assert_eq!(
+            store.last_table_fetch(&deploy),
+            None,
+            "fetching one kind's table must not suppress another's first fetch"
+        );
+    }
+
+    #[test]
+    fn a_fresh_store_carries_no_fetch_or_change_history() {
+        // What makes a cluster switch safe: `switch_cluster` replaces the
+        // store, so the new cluster starts with nothing suppressing its very
+        // first Table fetch.
+        let mut old = ResourceStore::new();
+        old.apply(
+            &pod_gvk(),
+            &ApiResource::erase::<Pod>(&()),
+            watcher::Event::Apply(pod("a")),
+        );
+        old.note_table_fetch(pod_gvk(), Instant::now());
+        assert!(old.last_table_fetch(&pod_gvk()).is_some());
+
+        let fresh = ResourceStore::new();
+        assert_eq!(fresh.last_table_fetch(&pod_gvk()), None);
+        assert_eq!(fresh.last_change(&pod_gvk()), None);
     }
 
     #[test]
