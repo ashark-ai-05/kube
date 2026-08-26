@@ -202,8 +202,22 @@ pub fn sort_rows(rows: &mut [Vec<String>], sort: &SortState) {
 /// `sort_rows`, and pinned to agree with it by test: any divergence between
 /// the two is the bug this function exists to prevent.
 pub fn sorted_indices(rows: &[Vec<String>], sort: &SortState) -> Vec<usize> {
-    let _ = (rows, sort);
-    unimplemented!("Task 10: reproduce the view's row ordering")
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    if rows.iter().any(|row| sort.column >= row.len()) {
+        return order;
+    }
+    // `sort_by`, not `sort_unstable_by`, matching `sort_rows` — equal keys
+    // must keep input order, or the mapping this returns disagrees with the
+    // one the view drew for exactly the rows that tie.
+    order.sort_by(|&a, &b| {
+        let ordering = compare_cells(&rows[a][sort.column], &rows[b][sort.column]);
+        if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    order
 }
 
 /// Compare two cell values numerically if both parse as `f64`, lexically

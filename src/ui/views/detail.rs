@@ -61,6 +61,28 @@ impl DetailTab {
     fn index(self) -> usize {
         TAB_ORDER.iter().position(|t| *t == self).unwrap_or(0)
     }
+
+    /// The tab a `HitTarget::DetailTab(index)` refers to, or `None` for an
+    /// index no tab occupies.
+    ///
+    /// Public so the event loop can resolve a tab click without keeping its
+    /// own copy of the tab order. A second copy is exactly what `TAB_ORDER`
+    /// exists to prevent: the drawn order, the hit-tested order and the
+    /// clicked order must be one array, or a tab added later moves in one of
+    /// them and not the others.
+    pub fn at(index: usize) -> Option<DetailTab> {
+        TAB_ORDER.get(index).copied()
+    }
+
+    /// The tab `delta` places away, wrapping in both directions — so `Tab`
+    /// from the last tab returns to the first rather than stopping dead.
+    pub fn cycled(self, delta: i32) -> DetailTab {
+        let len = TAB_ORDER.len() as i32;
+        // `rem_euclid` rather than `%`: Rust's `%` keeps the sign of the
+        // left operand, so a backwards step from tab 0 would index -1.
+        let next = (self.index() as i32 + delta).rem_euclid(len) as usize;
+        TAB_ORDER.get(next).copied().unwrap_or(DetailTab::Overview)
+    }
 }
 
 /// State for a single open detail pane: which tab is active, and the
@@ -531,6 +553,28 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Style;
+
+    #[test]
+    fn a_tab_index_resolves_to_the_tab_drawn_at_that_position() {
+        // The indices `render_tab_bar` registers as `HitTarget::DetailTab`
+        // are positions in `TAB_ORDER`; resolving them anywhere else would
+        // have to keep a second copy of that order in step.
+        assert_eq!(DetailTab::at(0), Some(DetailTab::Overview));
+        assert_eq!(DetailTab::at(1), Some(DetailTab::Yaml));
+        assert_eq!(DetailTab::at(2), Some(DetailTab::Events));
+        assert_eq!(DetailTab::at(3), None, "there is no fourth tab");
+    }
+
+    #[test]
+    fn cycling_tabs_wraps_in_both_directions() {
+        // Backwards from the first tab is the case that catches `%`: Rust's
+        // remainder keeps the left operand's sign, so `(0 - 1) % 3` is -1,
+        // which is not an index.
+        assert_eq!(DetailTab::Overview.cycled(1), DetailTab::Yaml);
+        assert_eq!(DetailTab::Events.cycled(1), DetailTab::Overview);
+        assert_eq!(DetailTab::Overview.cycled(-1), DetailTab::Events);
+        assert_eq!(DetailTab::Yaml.cycled(-1), DetailTab::Overview);
+    }
 
     /// A Pod with the fields the Overview tab exists to surface: a
     /// namespace, a node it was scheduled to, and a phase — everything a

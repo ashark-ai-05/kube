@@ -80,33 +80,8 @@ pub enum Action {
 /// passes it in rather than reinterpreting a stateless mapper's output after
 /// the fact.
 pub fn action_for(event: &CtEvent, hits: &HitRegistry, focus: Focus) -> Action {
-    let overlay_open = matches!(focus, Focus::Picker);
     match event {
-        CtEvent::Mouse(m) => match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => match hits.hit(m.column, m.row) {
-                Some(HitTarget::PickerRow(i)) => Action::PickerSelect(*i),
-                Some(HitTarget::Ribbon) => Action::OpenClusterPicker,
-                Some(HitTarget::TableRow(i)) if !overlay_open => Action::SelectRow(*i),
-                Some(HitTarget::ColumnHeader(i)) if !overlay_open => Action::SortByColumn(*i),
-                _ => Action::None,
-            },
-            // Scroll applies to whatever is under the cursor, not to focus —
-            // but suppressed while a picker is open: the table beneath it is
-            // not what the user is looking at.
-            MouseEventKind::ScrollDown if !overlay_open => match hits.hit(m.column, m.row) {
-                Some(HitTarget::TableRow(_)) | Some(HitTarget::ColumnHeader(_)) => {
-                    Action::ScrollBy(SCROLL_STEP)
-                }
-                _ => Action::None,
-            },
-            MouseEventKind::ScrollUp if !overlay_open => match hits.hit(m.column, m.row) {
-                Some(HitTarget::TableRow(_)) | Some(HitTarget::ColumnHeader(_)) => {
-                    Action::ScrollBy(-SCROLL_STEP)
-                }
-                _ => Action::None,
-            },
-            _ => Action::None,
-        },
+        CtEvent::Mouse(m) => mouse_action(m.kind, hits.hit(m.column, m.row), focus),
         CtEvent::Key(k) if k.kind == KeyEventKind::Press => {
             // Raw mode disables the terminal's own SIGINT handling, so
             // Ctrl-C must keep working as an emergency quit no matter what
@@ -114,32 +89,115 @@ pub fn action_for(event: &CtEvent, hits: &HitRegistry, focus: Focus) -> Action {
             if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                 return Action::Quit;
             }
-            if overlay_open {
-                match k.code {
-                    KeyCode::Esc => Action::ClosePicker,
-                    KeyCode::Backspace => Action::PickerBackspace,
-                    KeyCode::Enter => Action::PickerConfirm,
-                    KeyCode::Up => Action::ScrollBy(-1),
-                    KeyCode::Down => Action::ScrollBy(1),
-                    // Every other character — including j, k, c, n, q — is
-                    // filter text, not a binding. A picker whose own
-                    // alphabet doubled as bindings would make some cluster
-                    // names untypeable.
-                    KeyCode::Char(c) => Action::PickerFilterChar(c),
-                    _ => Action::None,
-                }
+            key_action(k.code, focus)
+        }
+        _ => Action::None,
+    }
+}
+
+/// What a mouse event over `target` means with `focus` where it is.
+///
+/// The two modal layers behave differently on purpose. A picker is modal over
+/// everything: it is centred over the whole frame and nothing behind it is
+/// meant to be interacted with. The detail pane is modal only over the
+/// TABLE — it is drawn in the table's rect and leaves the sidebar and ribbon
+/// visible, so clicking a kind or switching cluster stays available; letting
+/// the table beneath it respond instead would move a selection the user
+/// cannot see.
+fn mouse_action(kind: MouseEventKind, target: Option<&HitTarget>, focus: Focus) -> Action {
+    let picker_open = matches!(focus, Focus::Picker);
+    let detail_open = matches!(focus, Focus::Detail);
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(HitTarget::PickerRow(i)) => Action::PickerSelect(*i),
+            Some(HitTarget::DetailTab(i)) if detail_open => Action::SelectDetailTab(*i),
+            Some(HitTarget::DetailClose) if detail_open => Action::CloseDetail,
+            Some(HitTarget::Ribbon) => Action::OpenClusterPicker,
+            Some(HitTarget::TreeRow(i)) if !picker_open => Action::SelectTreeRow(*i),
+            Some(HitTarget::TableRow(i)) if !picker_open && !detail_open => Action::SelectRow(*i),
+            Some(HitTarget::ColumnHeader(i)) if !picker_open && !detail_open => {
+                Action::SortByColumn(*i)
+            }
+            _ => Action::None,
+        },
+        // Scroll applies to whatever is under the cursor, not to focus — so
+        // the wheel over the sidebar moves the sidebar even while the table
+        // has focus. The exception is the detail pane, which covers the whole
+        // table area: the wheel anywhere over it scrolls its content, because
+        // its body registers no zones of its own to aim at.
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let step = if matches!(kind, MouseEventKind::ScrollDown) {
+                SCROLL_STEP
             } else {
-                match k.code {
-                    KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
-                    KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
-                    KeyCode::Char('c') => Action::OpenClusterPicker,
-                    KeyCode::Char('n') => Action::OpenNamespacePicker,
-                    KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-                    _ => Action::None,
+                -SCROLL_STEP
+            };
+            if picker_open {
+                return Action::None;
+            }
+            match target {
+                Some(HitTarget::TreeRow(_)) => Action::ScrollTree(step),
+                _ if detail_open => Action::ScrollDetail(step),
+                Some(HitTarget::TableRow(_)) | Some(HitTarget::ColumnHeader(_)) => {
+                    Action::ScrollBy(step)
                 }
+                _ => Action::None,
             }
         }
         _ => Action::None,
+    }
+}
+
+/// What a key press means with `focus` where it is.
+fn key_action(code: KeyCode, focus: Focus) -> Action {
+    match focus {
+        Focus::Picker => match code {
+            KeyCode::Esc => Action::ClosePicker,
+            KeyCode::Backspace => Action::PickerBackspace,
+            KeyCode::Enter => Action::PickerConfirm,
+            KeyCode::Up => Action::ScrollBy(-1),
+            KeyCode::Down => Action::ScrollBy(1),
+            // Every other character — including j, k, c, n, q — is filter
+            // text, not a binding. A picker whose own alphabet doubled as
+            // bindings would make some cluster names untypeable.
+            KeyCode::Char(c) => Action::PickerFilterChar(c),
+            _ => Action::None,
+        },
+        // Tab cycles the pane's own tabs rather than moving focus: with the
+        // pane open its three tabs are what there is to move between, and
+        // Esc is how you leave.
+        Focus::Detail => match code {
+            KeyCode::Esc => Action::CloseDetail,
+            KeyCode::Tab | KeyCode::Right => Action::CycleDetailTab(1),
+            KeyCode::BackTab | KeyCode::Left => Action::CycleDetailTab(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::ScrollDetail(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::ScrollDetail(-1),
+            KeyCode::Char('c') => Action::OpenClusterPicker,
+            KeyCode::Char('n') => Action::OpenNamespacePicker,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::None,
+        },
+        Focus::Sidebar => match code {
+            KeyCode::Down | KeyCode::Char('j') => Action::ScrollTree(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::ScrollTree(-1),
+            // Space as well as Enter: expanding a group is the sidebar's most
+            // frequent action and Space is where a hand already is.
+            KeyCode::Enter | KeyCode::Char(' ') => Action::ActivateTreeRow,
+            KeyCode::Tab => Action::ToggleFocus,
+            KeyCode::Char('c') => Action::OpenClusterPicker,
+            KeyCode::Char('n') => Action::OpenNamespacePicker,
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            _ => Action::None,
+        },
+        Focus::Table => match code {
+            KeyCode::Down | KeyCode::Char('j') => Action::ScrollBy(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
+            KeyCode::Enter => Action::OpenDetail,
+            KeyCode::Tab => Action::ToggleFocus,
+            KeyCode::Char('c') => Action::OpenClusterPicker,
+            KeyCode::Char('n') => Action::OpenNamespacePicker,
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            _ => Action::None,
+        },
     }
 }
 

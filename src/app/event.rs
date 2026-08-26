@@ -128,9 +128,9 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
             }
             AppEvent::Session(s) => out.session_events.push(s),
             AppEvent::NamespacesListed(r) => out.namespace_list = Some(r),
-            AppEvent::EventsFetched(_) => unimplemented!("Task 10: collect events fetches"),
-            AppEvent::KindsDiscovered => unimplemented!("Task 10: flag discovery"),
-            AppEvent::Wake => unimplemented!("Task 10: flag the debounce wake"),
+            AppEvent::EventsFetched(f) => out.events_fetched.push(f),
+            AppEvent::KindsDiscovered => out.kinds_discovered = true,
+            AppEvent::Wake => out.wake = true,
             AppEvent::Error(e) => out.errors.push(e),
             AppEvent::Quit => out.quit = true,
         }

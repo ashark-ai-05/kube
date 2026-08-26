@@ -86,6 +86,12 @@ impl ResourceStore {
             .entry(gvk.clone())
             .or_insert_with(|| KindCache::new(resource.clone()))
             .apply(event);
+        // Recorded here, at the single point every delta for every kind
+        // passes through, rather than at the watch loop's call sites: a
+        // second place to remember to stamp this is a second place to forget
+        // to, and a missed stamp shows up as a Table that quietly stops
+        // refreshing for one kind.
+        self.last_change.insert(gvk.clone(), Instant::now());
     }
 
     pub fn objects(&self, gvk: &GroupVersionKind) -> Vec<Arc<DynamicObject>> {
@@ -108,8 +114,7 @@ impl ResourceStore {
     /// `None` if it never has. One of the two inputs to
     /// `store::table::refetch_is_due`.
     pub fn last_change(&self, gvk: &GroupVersionKind) -> Option<Instant> {
-        let _ = gvk;
-        unimplemented!("Task 10: record and report the last watch delta")
+        self.last_change.get(gvk).copied()
     }
 
     /// Record that a Table fetch was ISSUED for this kind.
@@ -122,13 +127,11 @@ impl ResourceStore {
     /// flight updates `last_change` past this value and re-arms the refetch
     /// normally.
     pub fn note_table_fetch(&mut self, gvk: GroupVersionKind, at: Instant) {
-        let _ = (gvk, at);
-        unimplemented!("Task 10: record a table fetch")
+        self.last_table_fetch.insert(gvk, at);
     }
 
     pub fn last_table_fetch(&self, gvk: &GroupVersionKind) -> Option<Instant> {
-        let _ = gvk;
-        unimplemented!("Task 10: report the last table fetch")
+        self.last_table_fetch.get(gvk).copied()
     }
 
     pub fn set_status(&mut self, gvk: GroupVersionKind, status: WatchStatus) {

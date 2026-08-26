@@ -298,6 +298,18 @@ pub async fn switch_cluster<C, F, W>(
             // wholesale for above rather than patched in place.
             s.namespaces_from_api = None;
 
+            // The same reasoning, one layer up: the kinds discovered on the
+            // OUTGOING cluster describe an API surface this one may not
+            // share at all — a CRD installed there and not here — and the
+            // active kind may be one of them. Cleared and reset here rather
+            // than patched when the new cluster's discovery eventually
+            // lands, so there is no window in which the sidebar lists the
+            // previous cluster's kinds over this one's (empty) store, and no
+            // window in which the table is pointed at a kind this cluster
+            // has never heard of.
+            s.kinds.clear();
+            s.active_kind = default_kind();
+
             // 6. Watch the store minted just above — never the one the previous
             //    cluster's watches were writing into.
             let store = s.store.clone();

@@ -1,31 +1,37 @@
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
+use kube::{Client, ResourceExt};
 use kube_tui::app::Overlay;
-use kube_tui::app::event::{AppEvent, Coalesced, WatchStatus, coalesce};
+use kube_tui::app::event::{AppEvent, Coalesced, FetchedEvents, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, Focus, action_for, apply_selection};
 use kube_tui::app::session::{
     Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
 };
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::cluster::discovery::KindInfo;
+use kube_tui::cluster::discovery::{KindInfo, discover_kinds, group_label_for};
 use kube_tui::cluster::{
     AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState, NamespaceListError,
     is_valid_namespace_name, list_namespaces,
 };
 use kube_tui::store::columns::columns_for;
-use kube_tui::store::events::EventRow;
-use kube_tui::store::multi::KindAvailability;
-use kube_tui::store::table::{SortState, TableData, row_identity, sort_table_rows, sorted_indices};
+use kube_tui::store::events::{EventRow, fetch_events};
+use kube_tui::store::multi::{
+    DEFAULT_MAX_EAGER_WATCHES, KindAvailability, kinds_to_watch, prioritise,
+};
+use kube_tui::store::table::{
+    SortState, TABLE_REFETCH_DEBOUNCE, TableData, fetch_table, refetch_is_due, row_identity,
+    sort_table_rows, sorted_indices,
+};
 use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
 use kube_tui::ui::theme;
-use kube_tui::ui::tree::KindTree;
-use kube_tui::ui::views::detail::{DetailPane, render_detail};
+use kube_tui::ui::tree::{KindTree, TreeGroup, TreeKind, TreeRow, flatten};
+use kube_tui::ui::views::detail::{DetailPane, DetailTab, render_detail};
 use kube_tui::ui::views::picker::{
     Picker, PickerItem, centered, clamp_selection, filtered_indices, render_picker,
 };
@@ -36,7 +42,7 @@ use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -436,8 +442,46 @@ async fn store_snapshot(
     gvk: &GroupVersionKind,
     kinds: &[KindInfo],
 ) -> Snapshot {
-    let _ = (store, gvk, kinds);
-    unimplemented!("Task 10: read the whole frame's worth of store in one lock")
+    let s = store.read().await;
+    Snapshot {
+        objects: s.objects(gvk),
+        status: s.status(gvk),
+        table: s.table_data(gvk),
+        kind_facts: kinds
+            .iter()
+            .map(|k| (s.count(&k.gvk), s.availability(&k.gvk)))
+            .collect(),
+        last_change: s.last_change(gvk),
+        last_table_fetch: s.last_table_fetch(gvk),
+    }
+}
+
+/// What the sidebar's selection points at, in terms that survive a rebuild.
+enum TreeAnchor {
+    Group(String),
+    Kind(GroupVersionKind),
+}
+
+fn selection_anchor(tree: &KindTree) -> Option<TreeAnchor> {
+    match flatten(tree).get(tree.selected)? {
+        TreeRow::Group { group, .. } => Some(TreeAnchor::Group(group.label.clone())),
+        TreeRow::Kind { kind, .. } => Some(TreeAnchor::Kind(kind.gvk.clone())),
+    }
+}
+
+/// Point `selected` back at whatever `anchor` names, or clamp if it is gone.
+fn restore_selection(tree: &mut KindTree, anchor: Option<TreeAnchor>) {
+    if let Some(anchor) = anchor {
+        let found = flatten(tree).iter().position(|row| match (row, &anchor) {
+            (TreeRow::Group { group, .. }, TreeAnchor::Group(label)) => group.label == *label,
+            (TreeRow::Kind { kind, .. }, TreeAnchor::Kind(gvk)) => kind.gvk == *gvk,
+            _ => false,
+        });
+        if let Some(i) = found {
+            tree.selected = i;
+        }
+    }
+    tree.clamp_selected();
 }
 
 /// Rebuild the sidebar tree from the session's kinds and this frame's store
@@ -465,8 +509,60 @@ fn refresh_tree(
     facts: &[(usize, KindAvailability)],
     active: &GroupVersionKind,
 ) {
-    let _ = (tree, kinds, facts, active);
-    unimplemented!("Task 10: rebuild the kind tree without losing the user's state")
+    let anchor = selection_anchor(tree);
+    let was_expanded: std::collections::HashMap<String, bool> = tree
+        .groups
+        .iter()
+        .map(|g| (g.label.clone(), g.expanded))
+        .collect();
+
+    let mut groups: Vec<TreeGroup> = Vec::new();
+    for (i, kind) in kinds.iter().enumerate() {
+        // A missing fact is "nothing known yet", not a panic: `facts` is
+        // built from the same `kinds` slice one lock acquisition earlier, so
+        // this cannot happen in the event loop, but a shorter slice must not
+        // take the whole frame down.
+        let (count, availability) = facts
+            .get(i)
+            .cloned()
+            .unwrap_or((0, KindAvailability::Watching));
+        let row = TreeKind {
+            gvk: kind.gvk.clone(),
+            label: kind.gvk.kind.clone(),
+            count: Some(count),
+            availability,
+        };
+        match groups.iter_mut().find(|g| g.label == kind.group_label) {
+            Some(group) => group.kinds.push(row),
+            None => groups.push(TreeGroup {
+                label: kind.group_label.clone(),
+                // A group that already existed keeps whatever the user did to
+                // it; a brand-new one starts shut unless it holds the kind
+                // the table is showing (applied below, once its kinds are
+                // known).
+                expanded: was_expanded
+                    .get(&kind.group_label)
+                    .copied()
+                    .unwrap_or(false),
+                kinds: vec![row],
+            }),
+        }
+    }
+
+    for group in &mut groups {
+        if !was_expanded.contains_key(&group.label) && group.kinds.iter().any(|k| k.gvk == *active)
+        {
+            group.expanded = true;
+        }
+    }
+    // Sorted here as well as by `discovery::sort_kinds` upstream: group order
+    // is what the sidebar's stability across restarts depends on, and making
+    // it a property of this function rather than of its caller's input means
+    // a caller that hands over unsorted kinds still gets a stable sidebar.
+    groups.sort_by(|a, b| a.label.cmp(&b.label));
+
+    tree.groups = groups;
+    restore_selection(tree, anchor);
 }
 
 /// Resolve the table's selected row to the object it is showing.
@@ -496,8 +592,41 @@ fn selected_object(
     sort: Option<&SortState>,
     selected: usize,
 ) -> Option<(Option<String>, String)> {
-    let _ = (objects, gvk, table, sort, selected);
-    unimplemented!("Task 10: resolve a displayed row to its object")
+    match table {
+        Some(t) => match sort {
+            Some(sort) => {
+                // `sort_table_rows` moves each row's identity with its cells
+                // (that is why `TableRow` bundles them), so the identity read
+                // out at `selected` is the one belonging to the row drawn
+                // there.
+                let mut rows = t.rows.clone();
+                sort_table_rows(&mut rows, sort);
+                row_identity(
+                    &TableData {
+                        columns: t.columns.clone(),
+                        rows,
+                    },
+                    selected,
+                )
+            }
+            None => row_identity(t, selected),
+        },
+        None => {
+            let index = match sort {
+                Some(sort) => {
+                    let columns = columns_for(gvk);
+                    let cells: Vec<Vec<String>> = objects
+                        .iter()
+                        .map(|obj| columns.iter().map(|c| (c.extract)(obj)).collect())
+                        .collect();
+                    *sorted_indices(&cells, sort).get(selected)?
+                }
+                None => selected,
+            };
+            let obj = objects.get(index)?;
+            Some((obj.metadata.namespace.clone(), obj.name_any()))
+        }
+    }
 }
 
 /// The live object matching an identity, or `None` if it has left the store.
@@ -506,8 +635,9 @@ fn find_object<'a>(
     namespace: Option<&str>,
     name: &str,
 ) -> Option<&'a Arc<DynamicObject>> {
-    let _ = (objects, namespace, name);
-    unimplemented!("Task 10: re-resolve the detail pane's object each frame")
+    objects
+        .iter()
+        .find(|o| o.metadata.namespace.as_deref() == namespace && o.name_any() == name)
 }
 
 /// Whether to issue a Table fetch for the active kind now.
@@ -524,8 +654,10 @@ fn table_fetch_due(
     now: Instant,
     debounce: Duration,
 ) -> bool {
-    let _ = (last_fetch, last_change, now, debounce);
-    unimplemented!("Task 10: decide when to refetch the active kind's table")
+    match last_change {
+        Some(changed) => refetch_is_due(last_fetch, changed, now, debounce),
+        None => last_fetch.is_none(),
+    }
 }
 
 /// Whether this click on `row` completes a double-click.
@@ -534,8 +666,12 @@ fn table_fetch_due(
 /// event — so it is measured here. The row must match as well as the timing:
 /// two fast clicks on two different rows are two selections, not an open.
 fn is_double_click(previous: Option<(usize, Instant)>, row: usize, now: Instant) -> bool {
-    let _ = (previous, row, now);
-    unimplemented!("Task 10: detect a double-click on a table row")
+    match previous {
+        Some((previous_row, at)) => {
+            previous_row == row && now.saturating_duration_since(at) <= DOUBLE_CLICK_WINDOW
+        }
+        None => false,
+    }
 }
 
 /// The detail pane's subject, and everything fetched FOR that subject.
@@ -562,9 +698,12 @@ struct OpenDetail {
 
 impl OpenDetail {
     /// Whether a fetch reply belongs to the object this pane is open on.
+    ///
+    /// All three parts are compared. A name alone is not an identity: the
+    /// same name exists in every namespace, and a Deployment and its Pods
+    /// routinely share one.
     fn is_for(&self, gvk: &GroupVersionKind, namespace: Option<&str>, name: &str) -> bool {
-        let _ = (gvk, namespace, name);
-        unimplemented!("Task 10: match a fetch reply to the open object")
+        self.gvk == *gvk && self.namespace.as_deref() == namespace && self.name == name
     }
 }
 
@@ -617,10 +756,16 @@ fn render_frame(
     render_ribbon(f, ribbon_area, Some(args.context_name), hits);
 
     let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(rest);
-    let _ = (tree, pane);
+    // The sidebar takes a fixed width and the table whatever is left. On a
+    // terminal too narrow to hold both, `Layout` shrinks the sidebar rather
+    // than overlapping them, and every view here already guards a zero-sized
+    // area.
+    let body = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
+        .split(chunks[0]);
+    render_sidebar(f, body[0], tree, hits);
     render_table_with_data(
         f,
-        chunks[0],
+        body[1],
         args.objects,
         args.gvk,
         args.table_data,
@@ -639,6 +784,13 @@ fn render_frame(
         args.connecting,
         hits,
     );
+
+    // Over the table's rect exactly, not the whole frame: the sidebar and the
+    // ribbon stay visible and usable with the pane open, so switching kind or
+    // cluster does not require closing it first.
+    if let Some(obj) = args.detail_object {
+        render_detail(f, body[1], obj, pane, hits, args.events, args.events_error);
+    }
 
     if let Some(picker) = overlay.picker_mut() {
         let area = centered(f.area(), 60, 60);
@@ -707,6 +859,310 @@ fn supervise(
             }
         }
     })
+}
+
+/// The kind list to fall back on when discovery itself fails.
+///
+/// A cluster we cannot enumerate is still a cluster we can watch pods on —
+/// `core/v1 Pod` needs no discovery to address. Degrading to Plan 2's
+/// behaviour beats showing an empty sidebar over an empty table with only a
+/// status-bar line to explain it.
+fn pod_kind() -> KindInfo {
+    let resource = ApiResource::erase::<Pod>(&());
+    KindInfo {
+        gvk: GroupVersionKind::gvk("", "v1", "Pod"),
+        namespaced: true,
+        group_label: group_label_for(&resource.group),
+        resource,
+    }
+}
+
+/// Discover what this cluster can browse, record it on the session, and watch
+/// every kind that fits under the cap — all under ONE `JoinHandle`.
+///
+/// One handle is what lets `switch_cluster`/`restart_watch` keep their
+/// existing contract (`FnOnce(Client, SharedStore, Option<String>) ->
+/// JoinHandle<()>`) while forty watches run beneath it. The task holds an
+/// `AbortOnDrop` per child across its own await, so aborting it — which is
+/// all `WatchHandles::abort_all` does — cancels the discovery if it is still
+/// in flight and every watch it has started, rather than detaching them.
+///
+/// **Staleness.** Discovery is slow enough that a cluster switch or a
+/// namespace change can complete while it is running, and its answer would
+/// then belong to a cluster nobody is looking at. The guard is the store:
+/// both of those operations replace it wholesale, and this task was handed
+/// the store belonging to the generation that started it, so
+/// `Arc::ptr_eq(&s.store, &store)` IS the identity check — no second counter
+/// to keep in step with the one `Session::generation` already maintains for
+/// connects.
+fn spawn_discovery_and_watches(
+    session: SharedSession,
+    client: Client,
+    store: kube_tui::store::watch::SharedStore,
+    namespace: Option<String>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let kinds: Vec<KindInfo> = match discover_kinds(&client).await {
+            Ok(kinds) if !kinds.is_empty() => kinds,
+            Ok(_) => vec![pod_kind()],
+            Err(e) => {
+                let _ = tx.send(AppEvent::Error(truncate_error(format!(
+                    "discovering kinds: {e:#} — showing pods only"
+                ))));
+                vec![pod_kind()]
+            }
+        };
+
+        // Which kinds survive the cap is a question of importance; which
+        // order they are DRAWN in is a question of stability. `prioritise`
+        // answers the first, on a copy, so `kinds` keeps `sort_kinds`' stable
+        // group-then-kind order for the second. Ranking the list the sidebar
+        // draws would reorder it by importance and scatter each group's kinds
+        // across the tree.
+        let mut ranked = kinds.clone();
+        prioritise(&mut ranked);
+        let (watched, skipped) = kinds_to_watch(&ranked, DEFAULT_MAX_EAGER_WATCHES);
+        let watched_gvks: HashSet<GroupVersionKind> =
+            watched.iter().map(|k| k.gvk.clone()).collect();
+        let resources: Vec<ApiResource> = watched.iter().map(|k| k.resource.clone()).collect();
+
+        {
+            let mut s = session.lock().await;
+            if !Arc::ptr_eq(&s.store, &store) {
+                // Superseded: this answer describes a cluster (or a scope)
+                // that is no longer on screen.
+                return;
+            }
+            s.kinds = kinds.clone();
+        }
+
+        // A kind the cap left out is not an empty kind, and the sidebar must
+        // not draw it as one. Recorded as availability in the store — the one
+        // place the sidebar reads per-kind facts from — rather than as a
+        // second list that only the sidebar knows about and only a cluster
+        // switch would clear.
+        {
+            let mut s = store.write().await;
+            for kind in &kinds {
+                if !watched_gvks.contains(&kind.gvk) {
+                    s.set_availability(kind.gvk.clone(), KindAvailability::NotWatched);
+                }
+            }
+        }
+        if skipped > 0 {
+            let _ = tx.send(AppEvent::Error(format!(
+                "{skipped} of {} kinds are not being watched (cap {DEFAULT_MAX_EAGER_WATCHES}) \
+                 — they show as 'not watched' in the sidebar",
+                kinds.len()
+            )));
+        }
+        let _ = tx.send(AppEvent::KindsDiscovered);
+
+        let mut children = Vec::with_capacity(resources.len());
+        let mut cancel_children = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let handle = spawn_watch(
+                client.clone(),
+                resource,
+                namespace.clone(),
+                store.clone(),
+                tx.clone(),
+            );
+            cancel_children.push(AbortOnDrop(handle.abort_handle()));
+            children.push(handle);
+        }
+
+        // Awaiting them all is what turns a child panic into something
+        // visible, exactly as `supervise` does for a single task: tokio
+        // otherwise swallows it at the `JoinHandle` boundary and the UI keeps
+        // drawing against a store nothing is updating.
+        for result in futures::future::join_all(children).await {
+            match result {
+                Ok(()) => {}
+                Err(e) if is_deliberate_abort(&e) => {}
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(join_failure_detail("watch", e)));
+                    let _ = tx.send(AppEvent::Quit);
+                }
+            }
+        }
+        // Held until here so that cancelling THIS task drops them and cancels
+        // the children with it. Dropping a `JoinHandle` only detaches.
+        drop(cancel_children);
+    })
+}
+
+/// Ask the API server for the active kind's own columns, kubectl-style.
+///
+/// Writes the answer straight into the store it was issued against, keyed by
+/// the kind it was issued for, and only then wakes the loop. A reply for a
+/// kind the user has since left updates that kind's (unread) entry; a reply
+/// for a cluster the user has since left updates a store nobody reads. Both
+/// are harmless by construction rather than by timing.
+fn spawn_table_fetch(
+    client: Client,
+    resource: ApiResource,
+    namespace: Option<String>,
+    gvk: GroupVersionKind,
+    store: kube_tui::store::watch::SharedStore,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let api: Api<DynamicObject> = match namespace.as_deref() {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &resource),
+            None => Api::all_with(client.clone(), &resource),
+        };
+        let url = api.resource_url().to_string();
+        match fetch_table(&client, &url).await {
+            Ok(data) => {
+                store.write().await.set_table_data(gvk.clone(), data);
+                let _ = tx.send(AppEvent::StoreChanged { gvk });
+            }
+            Err(e) => {
+                // Not fatal: `column_source` falls back to the builtin
+                // registry, so the table keeps rendering with NAME/AGE.
+                let _ = tx.send(AppEvent::Error(truncate_error(format!(
+                    "fetching {} columns: {e:#}",
+                    gvk.kind
+                ))));
+            }
+        }
+    });
+}
+
+/// Fetch one object's events for the detail pane.
+///
+/// The reply carries the identity it was issued for so the loop can drop it
+/// if the pane has moved on — see `app::event::FetchedEvents`.
+fn spawn_events_fetch(
+    client: Client,
+    gvk: GroupVersionKind,
+    namespace: Option<String>,
+    name: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = fetch_events(&client, namespace.as_deref().unwrap_or(""), &name)
+            .await
+            .map_err(|e| truncate_error(format!("{e:#}")));
+        let _ = tx.send(AppEvent::EventsFetched(FetchedEvents {
+            gvk,
+            namespace,
+            name,
+            result,
+        }));
+    });
+}
+
+/// Point the detail pane at whatever the table has selected, and ask for that
+/// object's events.
+///
+/// Does nothing if the selection resolves to no object — an empty table, or a
+/// server row with no identity attached. Opening a pane on nothing and
+/// showing an empty frame would be worse than not opening at all.
+#[allow(clippy::too_many_arguments)]
+fn open_detail(
+    detail: &mut Option<OpenDetail>,
+    pane: &mut DetailPane,
+    snapshot: &Snapshot,
+    objects: &[Arc<DynamicObject>],
+    active_kind: &GroupVersionKind,
+    view: &TableView,
+    client: &Client,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some((namespace, name)) = selected_object(
+        objects,
+        active_kind,
+        snapshot.table.as_ref(),
+        view.sort.as_ref(),
+        view.selected,
+    ) else {
+        return;
+    };
+    // A fresh pane per object: both scroll offsets and the YAML cache belong
+    // to the object that was open, not to the pane, and carrying an offset
+    // from a 900-line Deployment onto a 20-line ConfigMap opens it scrolled
+    // past its own end.
+    *pane = DetailPane::new();
+    *detail = Some(OpenDetail {
+        gvk: active_kind.clone(),
+        namespace: namespace.clone(),
+        name: name.clone(),
+        events: Vec::new(),
+        events_error: None,
+    });
+    spawn_events_fetch(
+        client.clone(),
+        active_kind.clone(),
+        namespace,
+        name,
+        tx.clone(),
+    );
+}
+
+/// Re-ask for the open object's events when the Events tab becomes visible.
+///
+/// Events are a one-shot list rather than a watch (`store::events`' own
+/// documented choice), so switching to the tab is the moment to ask again:
+/// someone opening it is asking what is happening *now*, and a list fetched
+/// when the pane opened may be minutes old by then.
+fn refresh_events_if_needed(
+    pane: &DetailPane,
+    detail: Option<&OpenDetail>,
+    client: &Client,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if pane.tab != DetailTab::Events {
+        return;
+    }
+    let Some(open) = detail else {
+        return;
+    };
+    spawn_events_fetch(
+        client.clone(),
+        open.gvk.clone(),
+        open.namespace.clone(),
+        open.name.clone(),
+        tx.clone(),
+    );
+}
+
+/// Move the active tab's scroll offset. Overview fits by construction and has
+/// none.
+///
+/// Only the lower bound is enforced here. The upper one depends on how the
+/// content wraps at the pane's current width, which is not known until the
+/// draw — so `render_yaml`/`render_events` clamp it there, against the real
+/// wrapped height.
+fn scroll_detail(pane: &mut DetailPane, delta: i32) {
+    let current = match pane.tab {
+        DetailTab::Overview => return,
+        DetailTab::Yaml => pane.yaml_scroll,
+        DetailTab::Events => pane.events_scroll,
+    };
+    let next = (i32::from(current) + delta).clamp(0, i32::from(u16::MAX)) as u16;
+    match pane.tab {
+        DetailTab::Overview => {}
+        DetailTab::Yaml => pane.yaml_scroll = next,
+        DetailTab::Events => pane.events_scroll = next,
+    }
+}
+
+/// Wake the loop once, after `after`, so a debounced refetch actually
+/// happens.
+///
+/// The watch is the trigger, but a debounce means the moment a fetch becomes
+/// due is a moment when, by definition, nothing is arriving to wake us. One
+/// sleeper per dirty batch closes that gap without becoming a timer: a
+/// `Wake` marks nothing dirty, so it arms no successor and a quiet cluster
+/// settles back to zero events and zero CPU.
+fn spawn_refetch_wake(tx: mpsc::UnboundedSender<AppEvent>, after: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        let _ = tx.send(AppEvent::Wake);
+    });
 }
 
 #[tokio::main]
@@ -824,13 +1280,15 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
-    let pod_ar = ApiResource::erase::<Pod>(&());
-    let pod_gvk = GroupVersionKind::gvk("", "v1", "Pod");
-    let watch_handle = spawn_watch(
+    // Discovery, and a watch per discovered kind, all under one handle — see
+    // `spawn_discovery_and_watches`. Nothing is watched until discovery
+    // answers, so there is no throwaway Pod watch to tear down a moment later
+    // and no window in which Pods are watched twice.
+    let discovery_handle = spawn_discovery_and_watches(
+        session.clone(),
         client.clone(),
-        pod_ar.clone(),
-        watch_namespace,
         session.lock().await.store.clone(),
+        watch_namespace,
         tx.clone(),
     );
 
@@ -845,7 +1303,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         .lock()
         .await
         .handles
-        .push(supervise("watch", watch_handle, tx.clone()));
+        .push(supervise("watch", discovery_handle, tx.clone()));
 
     // Feed terminal input into the same channel so there is one wake source.
     let input_handle = {
@@ -938,6 +1396,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // open before. Neither cluster nor namespace picking touched a network
     // before this task — this is what makes them reachable.
     let mut overlay = Overlay::None;
+    // Which of the two always-visible panes has the keyboard. The modal
+    // layers (a picker, the detail pane) override this while they are open
+    // rather than being tracked here as well — see `focus` below, which
+    // derives the real answer from all three each pass so a picker and a
+    // detail pane can never both believe they have it.
+    let mut pane_focus = Focus::Table;
+    // `Some` only while the detail pane is open, and it owns the identity the
+    // pane is open on together with the events fetched for it. See
+    // `OpenDetail`.
+    let mut detail: Option<OpenDetail> = None;
+    // The last table row clicked and when — the only state double-click
+    // detection needs (`is_double_click`); crossterm reports presses, not
+    // clicks.
+    let mut last_click: Option<(usize, Instant)> = None;
     // Nothing has been painted yet, so the first batch must draw whatever it is.
     let mut needs_redraw = true;
 
@@ -959,14 +1431,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // With all-motion mouse reporting, a bare mouse move otherwise costs a
         // full repaint, and `columns_for` reformats every object each frame.
         needs_redraw |= batch.store_dirty;
-        // Errors are raised AND retired here: see `next_error`. Without the
-        // retiring half a single blip pins an error across every subsequent
-        // switch.
-        let updated_error = next_error(last_error.clone(), &batch, &pod_gvk);
-        if updated_error != last_error {
-            last_error = updated_error;
-            needs_redraw = true;
-        }
+        // Discovery landing changes the whole sidebar.
+        needs_redraw |= batch.kinds_discovered;
+        // A wake means state read at the TOP of a pass may have changed since
+        // the last frame was drawn — most importantly `active_kind`, which a
+        // sidebar click writes to the session and then wakes the loop to pick
+        // up. Without this the table would keep showing the previous kind
+        // until something unrelated happened to force a repaint. Wakes only
+        // ever follow real activity, so this costs one extra repaint per
+        // settled burst and nothing at all on an idle cluster.
+        needs_redraw |= batch.wake;
         // The status itself is read back off the store below, not carried in a
         // local — see `store_snapshot`. The event only says "something
         // changed", which is all a redraw needs.
@@ -1011,6 +1485,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             namespace_is_fallback,
             client,
             namespaces_from_api,
+            kinds,
+            active_kind,
         ) = {
             let s = session.lock().await;
             (
@@ -1021,19 +1497,118 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 s.namespace_is_fallback,
                 s.client.clone(),
                 s.namespaces_from_api.clone(),
+                s.kinds.clone(),
+                s.active_kind.clone(),
             )
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
+
+        // Errors are raised AND retired here: see `next_error`. Without the
+        // retiring half a single blip pins an error across every subsequent
+        // switch. Done after the session read because which kind's sync
+        // retires an error depends on which kind is on screen — a Deployment
+        // watch coming up says nothing about why the Pod watch failed.
+        let updated_error = next_error(last_error.clone(), &batch, &active_kind);
+        if updated_error != last_error {
+            last_error = updated_error;
+            needs_redraw = true;
+        }
+
         // Read the store snapshot into locals before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
-        // Objects and watch health come from one acquisition of one store, so
-        // a switch cannot show the previous cluster's health over this
-        // cluster's (empty) object list.
-        let snapshot = store_snapshot(&store, &pod_gvk, &[]).await;
-        let objects = snapshot.objects;
+        // Objects, watch health, the fetched columns AND every kind's count
+        // and availability come from one acquisition of one store, so a
+        // switch cannot show the previous cluster's health over this
+        // cluster's (empty) object list, nor one kind's count beside
+        // another's availability.
+        let snapshot = store_snapshot(&store, &active_kind, &kinds).await;
+        // Borrowed, not cloned: this is the live object list, which on a busy
+        // namespace is thousands of `Arc`s, and a clone per event batch — mouse
+        // moves included — is thousands of refcount bumps for nothing.
+        let objects: &[Arc<DynamicObject>] = &snapshot.objects;
         let status = snapshot.status;
+
+        // The tree is rebuilt from that same snapshot every pass — counts
+        // change constantly — carrying the user's expansion state and
+        // selection across each rebuild. See `refresh_tree`.
+        refresh_tree(&mut tree, &kinds, &snapshot.kind_facts, &active_kind);
+
+        // Apply any events that came back, but only to the object they were
+        // fetched for. A reply for an object the pane has moved off is
+        // dropped here rather than shown under this one's name.
+        for fetched in &batch.events_fetched {
+            if let Some(open) = detail.as_mut()
+                && open.is_for(&fetched.gvk, fetched.namespace.as_deref(), &fetched.name)
+            {
+                match &fetched.result {
+                    Ok(rows) => {
+                        open.events = rows.clone();
+                        open.events_error = None;
+                    }
+                    Err(e) => {
+                        open.events.clear();
+                        open.events_error = Some(e.clone());
+                    }
+                }
+                needs_redraw = true;
+            }
+        }
+
+        // The active kind's columns: fetched when the watch says something
+        // changed and the change has settled (`refetch_is_due`, via
+        // `table_fetch_due`), never on a timer. When a change has NOT settled
+        // yet, one sleeper is armed for the moment it will have — the one
+        // moment nothing else would wake us. See `spawn_refetch_wake`.
+        let now = Instant::now();
+        if table_fetch_due(
+            snapshot.last_table_fetch,
+            snapshot.last_change,
+            now,
+            TABLE_REFETCH_DEBOUNCE,
+        ) {
+            if let Some(kind) = kinds.iter().find(|k| k.gvk == active_kind) {
+                // Recorded before the request goes out, not after it returns:
+                // see `ResourceStore::note_table_fetch`.
+                store
+                    .write()
+                    .await
+                    .note_table_fetch(active_kind.clone(), now);
+                spawn_table_fetch(
+                    client.clone(),
+                    kind.resource.clone(),
+                    namespace.clone(),
+                    active_kind.clone(),
+                    store.clone(),
+                    tx.clone(),
+                );
+            }
+        } else if let Some(changed) = snapshot.last_change
+            && snapshot
+                .last_table_fetch
+                .map(|f| f < changed)
+                .unwrap_or(true)
+        {
+            // Stale, but the change has not settled yet — so a fetch WILL
+            // become due, at a moment when by definition nothing is arriving
+            // to wake us for it. Armed on this condition alone rather than on
+            // "the store changed in this batch": selecting a kind whose watch
+            // happened to deliver something a moment ago lands here with
+            // nothing dirty, and gating on dirtiness would leave that kind on
+            // the built-in NAME/AGE fallback until its watch next moved.
+            //
+            // This cannot become a timer. A `Wake` marks nothing dirty and
+            // does not move `last_change`, so by the time one arrives the
+            // debounce has elapsed and the branch above fires instead; the
+            // fetch it issues records `last_table_fetch`, after which nothing
+            // here is stale and no successor is armed.
+            let settles_in =
+                TABLE_REFETCH_DEBOUNCE.saturating_sub(now.saturating_duration_since(changed));
+            // A hair past the debounce so the wake cannot land in the same
+            // millisecond and find itself one tick short.
+            spawn_refetch_wake(tx.clone(), settles_in + Duration::from_millis(10));
+        }
 
         // Keep an open picker's items current: the registry (cluster
         // states) and the object list (namespaces seen) can both change
@@ -1051,7 +1626,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             Overlay::NamespacePicker(p) => {
                 p.items = namespace_picker_items(
                     namespaces_from_api.as_ref(),
-                    &objects,
+                    objects,
                     namespace.as_deref(),
                 );
                 clamp_selection(p);
@@ -1070,23 +1645,56 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             // arrives after the last draw, so on the very first iteration the
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
+            // Focus is derived, not tracked: the modal layers win over
+            // whichever always-visible pane the keyboard was last left on, in
+            // the same order they are drawn in.
             let focus = if overlay.is_open() {
                 Focus::Picker
+            } else if detail.is_some() {
+                Focus::Detail
             } else {
-                Focus::Table
+                pane_focus
             };
             let action = action_for(input, &hits, focus);
             let confirm_index = confirm_index_for(action, &overlay);
+            // How many rows the table actually has: the server's, when it
+            // rendered them, and the object list's otherwise — the same
+            // choice `render_table_with_data` makes, so a selection can never
+            // be clamped against a different length than it is drawn against.
+            let table_rows = snapshot
+                .table
+                .as_ref()
+                .map(|t| t.rows.len())
+                .unwrap_or(objects.len());
             match action {
                 Action::Quit => quit = true,
                 Action::SelectRow(i) => {
-                    view.selected = i.min(objects.len().saturating_sub(1));
+                    view.selected = i.min(table_rows.saturating_sub(1));
+                    let clicked_at = Instant::now();
+                    if is_double_click(last_click, i, clicked_at) {
+                        open_detail(
+                            &mut detail,
+                            &mut pane,
+                            &snapshot,
+                            objects,
+                            &active_kind,
+                            &view,
+                            &client,
+                            &tx,
+                        );
+                        // Cleared so a third click is a fresh first click
+                        // rather than re-opening the pane.
+                        last_click = None;
+                    } else {
+                        last_click = Some((i, clicked_at));
+                    }
+                    pane_focus = Focus::Table;
                     needs_redraw = true;
                 }
                 Action::ScrollBy(d) => {
                     match &mut overlay {
                         Overlay::None => {
-                            view.selected = apply_selection(view.selected, d, objects.len());
+                            view.selected = apply_selection(view.selected, d, table_rows);
                         }
                         Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => {
                             let n = filtered_indices(&p.items, &p.filter).len();
@@ -1095,17 +1703,91 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     }
                     needs_redraw = true;
                 }
-                Action::SortByColumn(_) => needs_redraw = true,
-                // Task 10 wires these; they are inert until then.
-                Action::ToggleFocus
-                | Action::SelectTreeRow(_)
-                | Action::ScrollTree(_)
-                | Action::ActivateTreeRow
-                | Action::OpenDetail
-                | Action::CloseDetail
-                | Action::SelectDetailTab(_)
-                | Action::CycleDetailTab(_)
-                | Action::ScrollDetail(_) => {}
+                Action::SortByColumn(i) => {
+                    // Previously only armed a redraw, which drew the same
+                    // order again: `toggle_sort` is what `render_table_with_data`
+                    // reads.
+                    view.toggle_sort(i);
+                    needs_redraw = true;
+                }
+                Action::ToggleFocus => {
+                    pane_focus = match pane_focus {
+                        Focus::Sidebar => Focus::Table,
+                        _ => Focus::Sidebar,
+                    };
+                    needs_redraw = true;
+                }
+                Action::ScrollTree(d) => {
+                    tree.selected = apply_selection(tree.selected, d, flatten(&tree).len());
+                    needs_redraw = true;
+                }
+                // A click and Enter do the same thing to a sidebar row —
+                // expand a group, or make a kind active — so one arm serves
+                // both and they cannot drift apart.
+                Action::SelectTreeRow(_) | Action::ActivateTreeRow => {
+                    if let Action::SelectTreeRow(i) = action {
+                        tree.selected = i;
+                        pane_focus = Focus::Sidebar;
+                    }
+                    match tree.selected_kind().map(|k| k.gvk.clone()) {
+                        None => {
+                            let row = tree.selected;
+                            tree.toggle(row);
+                        }
+                        Some(gvk) if gvk != active_kind => {
+                            session.lock().await.active_kind = gvk;
+                            // The table is about to show a different kind
+                            // with different columns, so nothing about the
+                            // old one survives: not the selection, not the
+                            // sort (column 3 of Pods is not column 3 of
+                            // ConfigMaps), and not a detail pane opened on an
+                            // object of the previous kind.
+                            view.selected = 0;
+                            view.offset = 0;
+                            view.sort = None;
+                            detail = None;
+                            // The new kind's columns have never been fetched,
+                            // and its watch may be perfectly quiet — so
+                            // nothing else would wake this loop to notice.
+                            let _ = tx.send(AppEvent::Wake);
+                        }
+                        Some(_) => {}
+                    }
+                    needs_redraw = true;
+                }
+                Action::OpenDetail => {
+                    open_detail(
+                        &mut detail,
+                        &mut pane,
+                        &snapshot,
+                        objects,
+                        &active_kind,
+                        &view,
+                        &client,
+                        &tx,
+                    );
+                    needs_redraw = true;
+                }
+                Action::CloseDetail => {
+                    detail = None;
+                    needs_redraw = true;
+                }
+                Action::SelectDetailTab(i) => {
+                    if let Some(tab) = DetailTab::at(i) {
+                        pane.tab = tab;
+                        refresh_events_if_needed(&pane, detail.as_ref(), &client, &tx);
+                    }
+                    needs_redraw = true;
+                }
+                Action::CycleDetailTab(d) => {
+                    pane.tab = pane.tab.cycled(d);
+                    refresh_events_if_needed(&pane, detail.as_ref(), &client, &tx);
+                    needs_redraw = true;
+                }
+                Action::ScrollDetail(d) => {
+                    scroll_detail(&mut pane, d);
+                    needs_redraw = true;
+                }
                 Action::OpenClusterPicker => {
                     overlay = Overlay::ClusterPicker(Picker {
                         title: "Clusters".into(),
@@ -1130,7 +1812,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         title: "Namespaces".into(),
                         items: namespace_picker_items(
                             namespaces_from_api.as_ref(),
-                            &objects,
+                            objects,
                             namespace.as_deref(),
                         ),
                         filter: String::new(),
@@ -1197,8 +1879,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                 .map(|e| e.context.auth.clone())
                                 .unwrap_or(AuthMethod::None);
                             let session2 = session.clone();
+                            let session3 = session.clone();
                             let tx2 = tx.clone();
-                            let pod_ar2 = pod_ar.clone();
                             tokio::spawn(async move {
                                 switch_cluster(
                                     session2,
@@ -1221,10 +1903,22 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                             ))
                                         })
                                     },
+                                    // The new cluster's kinds are its own:
+                                    // discovery runs against the client this
+                                    // switch just obtained, into the store it
+                                    // just minted, and stands down if either
+                                    // is superseded before it answers. See
+                                    // `spawn_discovery_and_watches`.
                                     move |client, store, ns| {
                                         supervise(
                                             "watch",
-                                            spawn_watch(client, pod_ar2, ns, store, tx2.clone()),
+                                            spawn_discovery_and_watches(
+                                                session3,
+                                                client,
+                                                store,
+                                                ns,
+                                                tx2.clone(),
+                                            ),
                                             tx2,
                                         )
                                     },
@@ -1235,7 +1929,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         }
                         PickerOutcome::NamespaceChosen(ns_choice) => {
                             overlay = Overlay::None;
-                            let pod_ar2 = pod_ar.clone();
+                            let session3 = session.clone();
                             let tx2 = tx.clone();
                             // `restart_watch` reads the session's CURRENT client
                             // from the same lock it uses to tear down and replace
@@ -1246,10 +1940,27 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             // this closes. It records the scope under that same
                             // guard and passes it on to the closure, so nothing
                             // here has to update a display copy afterwards.
+                            //
+                            // Discovery re-runs here too. The kinds have not
+                            // changed — it is the same cluster — but the
+                            // watches have all just been torn down and every
+                            // one of them has to be restarted against the new
+                            // store and scope, and the alternative is reading
+                            // `session.kinds` in a SEPARATE lock acquisition
+                            // before this one, which is precisely the stale-
+                            // read shape `restart_watch`'s own doc comment
+                            // exists to close. One extra discovery round-trip
+                            // per namespace change is the cheaper mistake.
                             restart_watch(session.clone(), ns_choice, move |client, store, ns| {
                                 supervise(
                                     "watch",
-                                    spawn_watch(client, pod_ar2, ns, store, tx2.clone()),
+                                    spawn_discovery_and_watches(
+                                        session3,
+                                        client,
+                                        store,
+                                        ns,
+                                        tx2.clone(),
+                                    ),
                                     tx2,
                                 )
                             })
@@ -1271,12 +1982,29 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 
         hits.clear();
         let show_hint = should_hint_all_namespaces(namespace_is_fallback, objects.len());
+        // The object the pane is open on is re-resolved here, from THIS
+        // frame's object list, rather than held on `OpenDetail`: the YAML and
+        // Overview tabs must track the object as the watch updates it. An
+        // object that has left the store resolves to nothing and the pane
+        // closes with it — a pod that was deleted is not a pod whose YAML we
+        // should keep showing as if it were live.
+        let detail_object = detail
+            .as_ref()
+            .and_then(|d| find_object(objects, d.namespace.as_deref(), &d.name))
+            .cloned();
+        if detail.is_some() && detail_object.is_none() {
+            detail = None;
+        }
+        let (events, events_error) = match detail.as_ref() {
+            Some(d) => (d.events.as_slice(), d.events_error.as_deref()),
+            None => (&[][..], None),
+        };
         term.draw(|f| {
             render_frame(
                 f,
                 FrameArgs {
-                    objects: &objects,
-                    gvk: &pod_gvk,
+                    objects,
+                    gvk: &active_kind,
                     table_data: snapshot.table.clone(),
                     context_name: &context_name,
                     display_namespace: scope,
@@ -1284,9 +2012,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     last_error: last_error.as_deref(),
                     show_hint,
                     connecting: connecting_name.as_deref(),
-                    detail_object: None,
-                    events: &[],
-                    events_error: None,
+                    detail_object: detail_object.as_deref(),
+                    events,
+                    events_error,
                 },
                 &mut view,
                 &mut tree,
