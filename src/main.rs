@@ -862,7 +862,7 @@ fn render_frame(
     // area.
     let body = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
         .split(chunks[0]);
-    render_sidebar(f, body[0], tree, hits);
+    render_sidebar(f, body[0], tree, hits, args.gvk);
     render_table_with_data(
         f,
         body[1],

@@ -85,6 +85,20 @@ pub fn count_style() -> Style {
     Style::default().fg(VIOLET)
 }
 
+/// The kind the table is currently showing.
+///
+/// Distinct from the sidebar's own selection highlight (`DUSK` background,
+/// painted by `render_sidebar` itself): `tree.selected` is the cursor, this
+/// is the subject, and after a cluster switch (`active_kind` resets to Pod
+/// while `restore_selection` anchors the highlight by GVK) the two land on
+/// DIFFERENT rows every time, with nothing else on screen saying so. A
+/// distinct foreground colour, independent of whatever background the
+/// selection paints underneath it, so the two facts stay legible whether or
+/// not they land on the same row.
+pub fn active_kind_style() -> Style {
+    Style::default().fg(PERIWINKLE).add_modifier(Modifier::BOLD)
+}
+
 pub fn text_style() -> Style {
     Style::default().fg(PAPER)
 }
@@ -226,6 +240,16 @@ mod tests {
                 .expect("event styles must set a foreground");
             assert!(!chrome.contains(&fg), "{kind} rendered in a chrome colour");
         }
+    }
+
+    #[test]
+    fn the_active_kind_is_styled_distinctly_from_plain_text() {
+        assert_ne!(
+            active_kind_style(),
+            text_style(),
+            "an ordinary sidebar row and the one the table is actually \
+             showing must not render identically"
+        );
     }
 
     #[test]

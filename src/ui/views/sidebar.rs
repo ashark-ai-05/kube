@@ -12,6 +12,7 @@ use crate::ui::hit::{HitRegistry, HitTarget};
 use crate::ui::scroll;
 use crate::ui::theme;
 use crate::ui::tree::{KindTree, TreeRow, flatten};
+use kube::api::GroupVersionKind;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -25,7 +26,21 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 /// on screen, then draws and registers only that window. The row drawn at
 /// screen row `y` and the row a click at `y` resolves to are always the same
 /// flattened index — both are read from the identical `window` slice below.
-pub fn render_sidebar(f: &mut Frame, area: Rect, tree: &mut KindTree, hits: &mut HitRegistry) {
+///
+/// `active` is the kind the TABLE is currently showing — a fact distinct
+/// from `tree.selected` (the sidebar's own cursor), which the two must stay
+/// separate fields for: after a cluster switch resets `active_kind` to Pod
+/// while the selection is restored by GVK onto whatever the user last
+/// picked, the two routinely name different rows, and nothing on screen
+/// said so before this marked `active` explicitly. See `theme::
+/// active_kind_style`.
+pub fn render_sidebar(
+    f: &mut Frame,
+    area: Rect,
+    tree: &mut KindTree,
+    hits: &mut HitRegistry,
+    active: &GroupVersionKind,
+) {
     // The tree reshapes underneath an open sidebar (a group toggles,
     // discovery adds a kind) — clamp before touching `selected` for anything
     // below, the same defensive clamp `render_table`/`render_picker` perform.
@@ -65,9 +80,22 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, tree: &mut KindTree, hits: &mut
                 ))
             }
             TreeRow::Kind { kind, .. } => {
+                // The table's subject gets its own mark, independent of
+                // `absolute_row == tree.selected` below — that paints a
+                // background over whichever row the cursor is on, which is
+                // routinely a DIFFERENT row than this one. See this
+                // function's doc comment and `theme::active_kind_style`.
+                let is_active = kind.gvk == *active;
                 let mut spans = vec![
-                    Span::raw("  "),
-                    Span::styled(kind.label.clone(), theme::text_style()),
+                    Span::raw(if is_active { "» " } else { "  " }),
+                    Span::styled(
+                        kind.label.clone(),
+                        if is_active {
+                            theme::active_kind_style()
+                        } else {
+                            theme::text_style()
+                        },
+                    ),
                 ];
                 match &kind.availability {
                     // A watch that hit a permanent failure must say why —
@@ -203,6 +231,12 @@ mod tests {
         }
     }
 
+    /// A GVK that never matches any fixture's kinds — used by tests that do
+    /// not care about the active-kind mark, so it never fires accidentally.
+    fn no_active_kind() -> GroupVersionKind {
+        GroupVersionKind::gvk("no.such.group", "v0", "NoSuchKind")
+    }
+
     /// Like `render_to_string`, but also returns the `Style` painted at each
     /// screen row's label column (x=3: inner.x=1 plus the two-cell indent
     /// shared by group markers and kind labels alike), so a test can tell
@@ -215,12 +249,13 @@ mod tests {
         tree: &mut KindTree,
         w: u16,
         h: u16,
+        active: &GroupVersionKind,
     ) -> (Vec<String>, Vec<Style>, HitRegistry) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitRegistry::new();
         term.draw(|f| {
             let area = f.area();
-            render_sidebar(f, area, tree, &mut hits);
+            render_sidebar(f, area, tree, &mut hits, active);
         })
         .unwrap();
 
@@ -237,7 +272,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         term.draw(|f| {
             let area = f.area();
-            render_sidebar(f, area, tree, &mut hits);
+            render_sidebar(f, area, tree, &mut hits, &no_active_kind());
         })
         .unwrap();
 
@@ -336,7 +371,7 @@ mod tests {
         // Plan 2 shipped exactly this shape in its table view.
         let mut t = tree(&[("core", true, &["Pod", "Service"])]);
         t.selected = 2; // "Service": flattened row 2, drawn at y=3 (1 border + 2 rows above)
-        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10);
+        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10, &no_active_kind());
         assert!(
             lines[3].contains("Service"),
             "expected Service drawn at y=3; got: {}",
@@ -359,7 +394,7 @@ mod tests {
         // fixed screen position.
         let mut t = many_kinds(40);
         t.selected = 30;
-        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10);
+        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10, &no_active_kind());
 
         // Same arithmetic as hit_zones_follow_the_scrolled_sidebar's sibling
         // fixture: an 8-row window, selected=30, scrolls to offset 23, so
@@ -382,6 +417,43 @@ mod tests {
             Some(theme::DUSK),
             "an unselected row (Kind22, the first row drawn) must not be \
              highlighted"
+        );
+    }
+
+    #[test]
+    fn the_active_kind_is_marked_distinctly_even_when_the_selection_points_elsewhere() {
+        // Exactly the scenario a cluster switch produces every time:
+        // `switch_cluster` resets `active_kind` to Pod while
+        // `restore_selection` anchors the sidebar's highlight by GVK back
+        // onto whatever the user last picked (here, Service). Before this
+        // fix, `render_sidebar` painted only `tree.selected` — Pod and
+        // Service were visually IDENTICAL despite the table showing Pod
+        // and the highlight sitting on Service. A third kind (ConfigMap),
+        // neither active nor selected, is the plain baseline: without it,
+        // "the active kind differs from SOMETHING" could be satisfied
+        // trivially by comparing against the differently-styled group
+        // header instead of an ordinary kind row.
+        let mut t = tree(&[("core", true, &["Pod", "Service", "ConfigMap"])]);
+        t.selected = 2; // highlight on "Service" (flattened row 2, y=3)
+        // `tree()` builds each kind's gvk as `gvk(group_label, "v1", kind)` —
+        // matching that exactly, not guessing at the real `core/v1 Pod` gvk,
+        // is what makes this fixture's `is_active` comparison mean anything.
+        let active = GroupVersionKind::gvk("core", "v1", "Pod"); // table shows Pod (row 1, y=2)
+        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10, &active);
+
+        assert!(lines[2].contains("Pod"));
+        assert!(lines[3].contains("Service"));
+        assert!(lines[4].contains("ConfigMap"));
+        assert_ne!(
+            styles[2], styles[4],
+            "the active kind (Pod) must render distinctly from an ordinary \
+             kind row that is neither active nor selected (ConfigMap)"
+        );
+        assert_ne!(
+            styles[2], styles[3],
+            "the active kind (Pod, no selection background) and the \
+             selected row (Service, DUSK background) must remain \
+             distinguishable from each other, not just from a plain row"
         );
     }
 }
