@@ -318,7 +318,19 @@ async fn drive_watch<S>(
                         gvk: gvk.clone(),
                         status,
                     });
-                    let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
+                    // `safe_source_text`, not `{e}`. A retryable watch failure
+                    // is the one error path that fires repeatedly, and exec
+                    // credentials refresh lazily per request — so a plugin
+                    // that prints an `ExecCredential` and then exits non-zero
+                    // surfaces here as `watcher::Error::WatchStartFailed(
+                    // kube::Error::Service(Box<AuthError>))`, whose `Display`
+                    // is the plugin's stdout in plaintext. See
+                    // `cluster::redact`.
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "watch {}: {}",
+                        ar.kind,
+                        crate::cluster::safe_source_text(&e)
+                    )));
                 }
             },
         }
@@ -385,6 +397,28 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         })))
+    }
+
+    /// A retryable watch failure whose cause is a credential plugin that
+    /// printed an `ExecCredential` and then exited non-zero — the shape a
+    /// lazy per-request exec refresh produces. Classified `Retryable` (it is
+    /// not a 403/404 `Status`), so it takes the `format!` path that used to
+    /// print the error verbatim.
+    fn credential_leak_error(token: &str) -> watcher::Error {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: format!(r#"{{"kind":"ExecCredential","status":{{"token":"{token}"}}}}"#)
+                .into_bytes(),
+            stderr: Vec::new(),
+        };
+        watcher::Error::WatchStartFailed(kube::Error::Service(Box::new(
+            kube::client::AuthError::AuthExecRun {
+                cmd: "\"kubelogin\" \"get-token\"".to_string(),
+                status: out.status,
+                out,
+            },
+        )))
     }
 
     fn not_found_error(message: &str) -> watcher::Error {
@@ -863,6 +897,45 @@ mod tests {
         assert!(
             saw_remedy,
             "a forbidden watch must emit the actionable -n remedy, not just the raw apiserver text"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_failing_on_a_credential_plugin_never_emits_the_token() {
+        // Exec credentials refresh lazily, per request — so this fires long
+        // after startup, repeatedly, straight into the status bar. The error's
+        // own `Display` is the plugin's stdout in plaintext (proved below), so
+        // formatting it verbatim is a live bearer token on screen.
+        const TOKEN: &str = "SUPER-SECRET-TOKEN-abc123";
+        let raw = credential_leak_error(TOKEN);
+        assert!(
+            raw.to_string().contains(TOKEN),
+            "the fixture must actually leak, or this test guards nothing: {raw}"
+        );
+
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let events = vec![Err(credential_leak_error(TOKEN))];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+        drive_watch(s, gvk, ar, None, store, tx).await;
+
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Error(msg) = ev {
+                assert!(
+                    !msg.contains(TOKEN),
+                    "a bearer token reached the status bar: {msg}"
+                );
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "the watch must still report the failure — silence would be a worse fix than the leak"
         );
     }
 }

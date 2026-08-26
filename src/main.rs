@@ -323,14 +323,20 @@ const MAX_ERROR_CHARS: usize = 200;
 
 /// Cap an error at something a one-line status bar can plausibly carry.
 ///
-/// The bar is one row and already width-truncates, so length costs nothing
-/// visually — but it is also what bounds an error we do not control the
-/// contents of. `kube::client::auth::Error::AuthExecRun` formats
-/// `out: std::process::Output` with `{out:?}`, which includes the credential
-/// plugin's stdout — where a partial `ExecCredential` (token and all) sits if
-/// the plugin exits non-zero after printing one. It renders as a decimal byte
-/// array, and nothing in this app writes logs, so it never leaves the screen;
-/// capping it keeps it from being the whole line as well.
+/// **This is a legibility bound, not a security one.** An earlier version of
+/// this comment claimed the cap was what kept a credential plugin's stdout off
+/// the screen, on the basis that `std::process::Output`'s `Debug` renders it as
+/// a decimal byte array. That has been false since Rust 1.66, which added a
+/// manual `Debug` printing stdout and stderr as strings whenever they are valid
+/// UTF-8 — so a plugin that prints an `ExecCredential` and exits non-zero puts a
+/// readable bearer token in the message, behind a ~100-character prefix that a
+/// 200-character cap comfortably clears. Redaction is done by TYPE instead, in
+/// `cluster::redact`, and every path that formats an error goes through it
+/// FIRST; this function then bounds whatever survives.
+///
+/// What it is still for: server-supplied text (a `Status.message` quoting a
+/// whole admission-webhook rejection) is unbounded and not ours, and one status
+/// row is one row.
 ///
 /// Truncates by CHARACTERS, not bytes: an error containing multi-byte text
 /// (a cluster name, a server-supplied message) would panic a byte slice on a
@@ -908,7 +914,8 @@ fn spawn_discovery_and_watches(
             Ok(_) => vec![pod_kind()],
             Err(e) => {
                 let _ = tx.send(AppEvent::Error(truncate_error(format!(
-                    "discovering kinds: {e:#} — showing pods only"
+                    "discovering kinds: {} — showing pods only",
+                    cluster::safe_error_text(&e)
                 ))));
                 vec![pod_kind()]
             }
@@ -1023,8 +1030,9 @@ fn spawn_table_fetch(
                 // Not fatal: `column_source` falls back to the builtin
                 // registry, so the table keeps rendering with NAME/AGE.
                 let _ = tx.send(AppEvent::Error(truncate_error(format!(
-                    "fetching {} columns: {e:#}",
-                    gvk.kind
+                    "fetching {} columns: {}",
+                    gvk.kind,
+                    cluster::safe_error_text(&e)
                 ))));
             }
         }
@@ -1045,7 +1053,7 @@ fn spawn_events_fetch(
     tokio::spawn(async move {
         let result = fetch_events(&client, namespace.as_deref().unwrap_or(""), &name)
             .await
-            .map_err(|e| truncate_error(format!("{e:#}")));
+            .map_err(|e| truncate_error(cluster::safe_error_text(&e)));
         let _ = tx.send(AppEvent::EventsFetched(FetchedEvents {
             gvk,
             namespace,
@@ -1226,7 +1234,17 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     let client = match cluster::connect_with(&startup_opts).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("kube: could not connect to a cluster: {e:#}");
+            // Through `safe_error_text`, not `{e:#}`. This is the ONE failure
+            // path that always reaches the user's real terminal — the
+            // alternate screen has not been entered yet — so it is also the
+            // one that lands in shell scrollback, `script` captures, CI logs
+            // and anything piping stderr. An exec plugin that printed an
+            // `ExecCredential` before failing would otherwise put a live
+            // bearer token in every one of them. See `cluster::redact`.
+            eprintln!(
+                "kube: could not connect to a cluster: {}",
+                cluster::safe_error_text(&e)
+            );
             std::process::exit(1);
         }
     };
@@ -1897,9 +1915,23 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                     tx2.clone(),
                                     move || async move {
                                         cluster::connect_with(&switch_opts).await.map_err(|e| {
+                                            // `safe_error_text`, not `{e:#}`:
+                                            // this text becomes
+                                            // `SessionEvent::ConnectFailed`'s
+                                            // reason and is drawn in the status
+                                            // bar. Switching to a cluster whose
+                                            // plugin fails after printing an
+                                            // ExecCredential is exactly the
+                                            // shape that leaks a token there.
+                                            // The plugin's NAME still reaches
+                                            // the user, from the kubeconfig via
+                                            // `connect_failure_hint` — never
+                                            // from the error, whose own `cmd`
+                                            // field carries the process
+                                            // environment. See `cluster::redact`.
                                             anyhow::anyhow!(connect_failure_hint(
                                                 &target_auth,
-                                                &format!("{e:#}")
+                                                &cluster::safe_error_text(&e)
                                             ))
                                         })
                                     },
@@ -2579,15 +2611,16 @@ mod tests {
         }
 
         #[test]
-        fn an_exec_plugin_dumping_its_stdout_cannot_fill_the_status_bar() {
-            // `Error::AuthExecRun` formats `out: std::process::Output` with
-            // `{out:?}`, so a plugin that prints a partial ExecCredential and
-            // then exits non-zero puts its token into the error as a decimal
-            // byte array. Bound it.
+        fn an_error_that_dumps_unbounded_text_cannot_fill_the_status_bar() {
+            // Length-bounding is about legibility, not secrecy: an
+            // admission-webhook rejection echoed back in a `Status.message` is
+            // unbounded and not ours to shorten at the source. Credential
+            // material is handled by TYPE in `cluster::redact`, upstream of
+            // this — see `truncate_error`'s own comment.
             let dump: String = (0..2000)
                 .map(|i| format!("{}, ", i % 256))
                 .collect::<String>();
-            let e = format!("auth exec command failed: Output {{ stdout: [{dump}] }}");
+            let e = format!("admission webhook denied the request: {dump}");
             let out = truncate_error(e);
             assert_eq!(
                 out.chars().count(),
@@ -2599,8 +2632,154 @@ mod tests {
                 "a truncated error must show that it was truncated; got {out}"
             );
             assert!(
-                out.starts_with("auth exec command failed"),
+                out.starts_with("admission webhook denied the request"),
                 "the useful part is the front, so that is the part kept; got {out}"
+            );
+        }
+
+        // --- Credential-plugin output never reaches stderr or the bar ---
+
+        /// The token a plugin would have printed to stdout before failing.
+        const LEAKED_TOKEN: &str = "SUPER-SECRET-TOKEN-abc123";
+
+        /// A secret in the process environment. `AuthExecRun.cmd` is
+        /// `format!("{cmd:?}")` over a `std::process::Command`, and `Command`'s
+        /// `Debug` prints the environment ahead of the program — so this sits
+        /// at roughly character 12 of the message, comfortably INSIDE the
+        /// 200-character cap. It is the part of this error that the cap never
+        /// protected at all.
+        const LEAKED_ENV: &str = "hunter2";
+
+        /// The exact error a credential plugin produces when it prints an
+        /// `ExecCredential` and then exits non-zero. `Service`, not `Auth`,
+        /// because that is the shape the lazy per-request refresh takes; the
+        /// `redact` module's own tests cover both.
+        fn credential_plugin_failure() -> anyhow::Error {
+            use std::os::unix::process::ExitStatusExt;
+            let out = std::process::Output {
+                status: std::process::ExitStatus::from_raw(256),
+                stdout: format!(
+                    r#"{{"kind":"ExecCredential","status":{{"token":"{LEAKED_TOKEN}"}}}}"#
+                )
+                .into_bytes(),
+                stderr: Vec::new(),
+            };
+            anyhow::Error::new(kube::Error::Service(Box::new(
+                kube::client::AuthError::AuthExecRun {
+                    cmd: format!(
+                        "AWS_SECRET_ACCESS_KEY=\"{LEAKED_ENV}\" \"kubelogin\" \"get-token\""
+                    ),
+                    status: out.status,
+                    out,
+                },
+            )))
+        }
+
+        #[test]
+        fn the_startup_connect_failure_never_prints_the_token_to_stderr() {
+            // `run_with_scope`'s `eprintln!` is the ONE failure path that
+            // always reaches the user's real terminal: it runs before the
+            // alternate screen exists, so its output lands in shell
+            // scrollback, `script` captures and CI logs. It had no truncation
+            // at all — the whole token went out verbatim.
+            let e = credential_plugin_failure();
+            assert!(
+                format!("{e:#}").contains(LEAKED_TOKEN),
+                "the fixture must actually leak, or this test guards nothing"
+            );
+
+            let line = format!(
+                "kube: could not connect to a cluster: {}",
+                cluster::safe_error_text(&e)
+            );
+            assert!(
+                !line.contains(LEAKED_TOKEN),
+                "a bearer token reached stderr: {line}"
+            );
+        }
+
+        #[test]
+        fn every_in_tui_error_path_that_can_carry_a_token_redacts_it() {
+            // Plan 3 tripled these: discovery, the per-kind column fetch and
+            // the events fetch all format a `kube::Error` into `last_error`.
+            // Each is composed here exactly as its call site composes it,
+            // `truncate_error` included — because the cap is not what stops
+            // this. `AuthExecRun`'s `cmd` field is `Command`'s `Debug`, which
+            // prints the process environment at the very FRONT of the message,
+            // inside any cap; and the plugin's stdout follows it.
+            let composed = [
+                truncate_error(format!(
+                    "discovering kinds: {} — showing pods only",
+                    cluster::safe_error_text(&credential_plugin_failure())
+                )),
+                truncate_error(format!(
+                    "fetching {} columns: {}",
+                    "Pod",
+                    cluster::safe_error_text(&credential_plugin_failure())
+                )),
+                truncate_error(cluster::safe_error_text(&credential_plugin_failure())),
+                truncate_error(format!(
+                    "connecting to {}: {}",
+                    "prod",
+                    connect_failure_hint(
+                        &AuthMethod::Exec {
+                            command: "kubelogin".to_string()
+                        },
+                        &cluster::safe_error_text(&credential_plugin_failure())
+                    )
+                )),
+            ];
+            for line in &composed {
+                assert!(
+                    !line.contains(LEAKED_TOKEN),
+                    "a bearer token reached the status bar: {line}"
+                );
+                assert!(
+                    !line.contains(LEAKED_ENV),
+                    "a secret from the plugin's environment reached the status bar: {line}"
+                );
+            }
+            // The switch path must still name the plugin — from the
+            // kubeconfig, never from the error, whose own `cmd` field carries
+            // the process environment.
+            assert!(
+                composed[3].contains("kubelogin"),
+                "redaction must not cost the user the plugin's name: {}",
+                composed[3]
+            );
+        }
+
+        #[test]
+        fn truncation_alone_would_not_have_stopped_the_leak() {
+            // The mutation this guards against is "keep the length cap, drop
+            // the redaction". Two independent reasons the cap is not a
+            // mitigation, asserted separately so neither can be argued away.
+            //
+            // 1. The startup `eprintln!` never went through `truncate_error`
+            //    at all — and it is the path that reaches the real terminal.
+            let stderr_line = format!(
+                "kube: could not connect to a cluster: {:#}",
+                credential_plugin_failure()
+            );
+            assert!(
+                stderr_line.contains(LEAKED_TOKEN),
+                "the whole token used to go to stderr verbatim; got {stderr_line}"
+            );
+
+            // 2. Where the cap DID apply, it bounds LENGTH over content nobody
+            //    controls — and the most sensitive part of this message is at
+            //    the front, not the tail. `AuthExecRun.cmd` is `Command`'s
+            //    `Debug`, which prints the process environment before the
+            //    program name, so it lands around character 12 and no budget
+            //    that leaves the message readable can exclude it.
+            let capped = truncate_error(format!(
+                "discovering kinds: {:#} — showing pods only",
+                credential_plugin_failure()
+            ));
+            assert!(
+                capped.contains(LEAKED_ENV),
+                "the plugin's environment survives the 200-char cap, so the cap is \
+                 not the mitigation; got {capped}"
             );
         }
 
