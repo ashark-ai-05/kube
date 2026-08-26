@@ -80,6 +80,7 @@ impl KindTree {
         for group in &mut self.groups {
             if current_row == row {
                 group.expanded = !group.expanded;
+                self.clamp_selected();
                 return;
             }
 
@@ -101,6 +102,21 @@ impl KindTree {
         match &rows[self.selected] {
             TreeRow::Kind { kind, .. } => Some(kind),
             TreeRow::Group { .. } => None,
+        }
+    }
+
+    /// Keep `selected` inside the flattened view.
+    ///
+    /// The tree reshapes when a group toggles or discovery delivers kinds. An
+    /// unclamped index either points past the end or, worse, at a different
+    /// entity than the user chose. This method ensures the selection stays in
+    /// bounds and `selected_kind()` continues to return `Some` for a valid kind row.
+    pub fn clamp_selected(&mut self) {
+        let len = flatten(self).len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
         }
     }
 }
@@ -199,5 +215,98 @@ mod tests {
         assert_eq!(t.selected_kind().map(|k| k.label.as_str()), Some("Service"));
         t.selected = 0;
         assert_eq!(t.selected_kind(), None, "a group row selects no kind");
+    }
+
+    #[test]
+    fn toggling_a_later_group_walks_rows_not_the_group_array() {
+        // With an earlier group expanded, row index outruns group index.
+        // Indexing tree.groups by the row number silently no-ops here, and
+        // every other test in this file would still pass.
+        let mut t = tree(&[
+            ("core", true, &["Pod", "Service"]), // rows 0,1,2
+            ("apps", false, &["Deployment"]),    // row 3 — group index 1
+        ]);
+        assert_eq!(flatten(&t).len(), 4);
+        t.toggle(3);
+        assert!(
+            t.groups[1].expanded,
+            "row 3 is the apps group header (group index 1, not 3)"
+        );
+        assert_eq!(flatten(&t).len(), 5, "apps should now contribute its kind");
+        assert!(t.groups[0].expanded, "core must be untouched");
+    }
+
+    #[test]
+    fn row_indices_identify_the_group_each_row_belongs_to() {
+        let t = tree(&[
+            ("core", true, &["Pod", "Service"]),
+            ("apps", false, &["Deployment"]),
+            ("batch", true, &["Job"]),
+        ]);
+        let rows = flatten(&t);
+        // Group rows carry their position in `groups`, not their row number.
+        match &rows[0] {
+            TreeRow::Group { index, .. } => assert_eq!(*index, 0),
+            _ => panic!("row 0 should be core group"),
+        }
+        match &rows[3] {
+            TreeRow::Group { index, .. } => assert_eq!(
+                *index, 1,
+                "apps is group 1, row 3 — index must not confuse row and group positions"
+            ),
+            _ => panic!("row 3 should be apps group"),
+        }
+        match &rows[4] {
+            TreeRow::Group { index, .. } => assert_eq!(
+                *index, 2,
+                "batch is group 2, row 4 — index must not confuse row and group positions"
+            ),
+            _ => panic!("row 4 should be batch group"),
+        }
+        // Kind rows carry their owning group's position.
+        match &rows[1] {
+            TreeRow::Kind { group_index, .. } => assert_eq!(*group_index, 0),
+            _ => panic!("row 1 should be kind in core"),
+        }
+        match &rows[5] {
+            TreeRow::Kind { group_index, .. } => assert_eq!(
+                *group_index, 2,
+                "Job belongs to batch (group 2), not to the row position"
+            ),
+            _ => panic!("row 5 should be kind in batch"),
+        }
+    }
+
+    #[test]
+    fn collapsing_a_group_the_selection_points_into_clamps_the_selection() {
+        let mut t = tree(&[("core", true, &["Pod", "Service"])]);
+        t.selected = 2; // selection is on "Service" kind
+        t.toggle(0); // collapse core group
+        assert_eq!(
+            flatten(&t).len(),
+            1,
+            "collapsed group contributes only 1 row"
+        );
+        assert_eq!(
+            t.selected, 0,
+            "selection must be clamped to the last valid row"
+        );
+        assert_eq!(
+            t.selected_kind(),
+            None,
+            "selection now points to the group row"
+        );
+    }
+
+    #[test]
+    fn clamping_an_empty_tree_sets_selected_to_zero() {
+        let mut t = tree(&[("core", true, &["Pod"])]);
+        t.selected = 5;
+        t.toggle(0); // collapse the only group
+        flatten(&t); // trigger any internal flattening in clamp_selected
+        // After collapse, tree has 1 row; selected should be 0
+        t.clamp_selected();
+        assert_eq!(t.selected, 0);
+        assert_eq!(t.selected_kind(), None);
     }
 }
