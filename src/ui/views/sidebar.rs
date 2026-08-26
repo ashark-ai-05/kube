@@ -14,6 +14,7 @@ use crate::ui::theme;
 use crate::ui::tree::{KindTree, TreeRow, flatten};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -99,7 +100,24 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, tree: &mut KindTree, hits: &mut
             width: inner.width,
             height: 1,
         };
-        f.render_widget(Paragraph::new(line), row_area);
+
+        // `tree.selected` already drives the scroll offset above; it must
+        // also change what is drawn, or moving the selection scrolls the
+        // pane while showing the user nothing distinguishable — the same
+        // written-but-never-drawn shape that shipped in Plan 2's table
+        // (`view.state.select(...)` written, `view.selected` read, every
+        // test passed because each one used only one side). Same convention
+        // `render_picker` uses for its selected row: a background fill plus
+        // bold, chrome family only.
+        let row_style = if absolute_row == tree.selected {
+            Style::default()
+                .bg(theme::DUSK)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        f.render_widget(Paragraph::new(line).style(row_style), row_area);
         hits.push(row_area, 0, HitTarget::TreeRow(absolute_row));
     }
 }
@@ -183,6 +201,35 @@ mod tests {
             selected: 0,
             scroll: 0,
         }
+    }
+
+    /// Like `render_to_string`, but also returns the `Style` painted at each
+    /// screen row's label column (x=3: inner.x=1 plus the two-cell indent
+    /// shared by group markers and kind labels alike), so a test can tell
+    /// whether the selection is visually distinct from the rows around it.
+    /// x=3 and the row-to-y mapping below were confirmed against a real
+    /// buffer dump (`buf[(3, y)].style()` for every y) rather than assumed —
+    /// this project has a history of fixtures that guessed at coordinates
+    /// and were vacuous as a result.
+    fn render_with_styles(
+        tree: &mut KindTree,
+        w: u16,
+        h: u16,
+    ) -> (Vec<String>, Vec<Style>, HitRegistry) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = HitRegistry::new();
+        term.draw(|f| {
+            let area = f.area();
+            render_sidebar(f, area, tree, &mut hits);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let lines: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let styles: Vec<Style> = (0..h).map(|y| buf[(3, y)].style()).collect();
+        (lines, styles, hits)
     }
 
     fn render_to_string(tree: &mut KindTree, w: u16, h: u16) -> (String, HitRegistry) {
@@ -277,5 +324,64 @@ mod tests {
         let mut t = tree(&[("core", true, &["Pod"])]);
         let (_text, _hits) = render_to_string(&mut t, 0, 10);
         let (_text, _hits) = render_to_string(&mut t, 10, 0);
+    }
+
+    #[test]
+    fn the_selected_row_is_visually_distinct_from_the_others() {
+        // `tree.selected` already drives scrolling (see
+        // `hit_zones_follow_the_scrolled_sidebar` above). If it does not also
+        // change what is drawn, moving the selection scrolls the pane while
+        // showing the user nothing — and a test that only sets and reads
+        // `tree.selected` through the same field can never see that gap.
+        // Plan 2 shipped exactly this shape in its table view.
+        let mut t = tree(&[("core", true, &["Pod", "Service"])]);
+        t.selected = 2; // "Service": flattened row 2, drawn at y=3 (1 border + 2 rows above)
+        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10);
+        assert!(
+            lines[3].contains("Service"),
+            "expected Service drawn at y=3; got: {}",
+            lines[3]
+        );
+        assert_ne!(
+            styles[3], styles[2],
+            "the selected row renders identically to an unselected one"
+        );
+    }
+
+    #[test]
+    fn the_highlight_follows_the_selection_when_the_sidebar_scrolls() {
+        // The test above alone is not enough: a highlight painted at a fixed
+        // screen row would still pass it, because in that small fixture the
+        // selected row and a hardcoded row happen to coincide. This is the
+        // test that actually distinguishes "highlights the selection" from
+        // "highlights whatever happens to be at row 3" — the highlight must
+        // land on the row the selection occupies AFTER scrolling, not at a
+        // fixed screen position.
+        let mut t = many_kinds(40);
+        t.selected = 30;
+        let (lines, styles, _hits) = render_with_styles(&mut t, 30, 10);
+
+        // Same arithmetic as hit_zones_follow_the_scrolled_sidebar's sibling
+        // fixture: an 8-row window, selected=30, scrolls to offset 23, so
+        // the selection (kind index 29) draws on the LAST visible row, y=8 —
+        // not y=3, which is where the small fixture's selection happened to
+        // land.
+        assert!(
+            lines[8].contains("Kind29"),
+            "expected the selected kind (absolute row 30) at y=8; got: {}",
+            lines[8]
+        );
+        assert_eq!(
+            styles[8].bg,
+            Some(theme::DUSK),
+            "the row the selection actually occupies after scrolling must \
+             carry the highlight"
+        );
+        assert_ne!(
+            styles[1].bg,
+            Some(theme::DUSK),
+            "an unselected row (Kind22, the first row drawn) must not be \
+             highlighted"
+        );
     }
 }
