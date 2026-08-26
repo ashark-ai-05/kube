@@ -67,7 +67,33 @@ These apply to every task and are implicitly part of every task's requirements.
 
 ---
 
-### Task 1: Distinguish RBAC denial from transient failure
+### Task 1: Distinguish RBAC denial from transient failure — ✅ ALREADY SHIPPED, SKIP
+
+**This task is complete.** It was pulled forward and merged to master before Plan 3 execution began, because a real corporate cluster (`prd-ld7`) hit exactly the 403-retries-forever case it describes: `cargo run -- -A` showed `reconnecting` forever against a cluster that forbids cluster-scope pod listing.
+
+**The shipped interface differs slightly from the draft below — use the shipped one:**
+
+```rust
+// src/store/rbac.rs
+pub enum WatchFailure {
+    Forbidden { detail: String },
+    NotFound { detail: String },   // NOTE: carries `detail`, unlike the draft
+    Retryable,
+}
+pub fn classify(err: &watcher::Error) -> WatchFailure;
+pub fn classify_kube_error(err: &kube::Error) -> WatchFailure;  // added for namespace listing
+```
+
+12 tests, all mutation-verified. `src/store/watch.rs` breaks out of its loop on `Forbidden`/`NotFound` and emits an actionable remedy. `src/cluster/namespaces.rs` reuses `classify_kube_error`.
+
+**Later tasks must reuse these rather than re-deriving classification** — duplicated classification is the two-sources-of-truth pattern that caused four Critical/Important findings in Plans 1-2.
+
+The original task text is retained below for reference only. Do not implement it.
+
+---
+
+#### (original, superseded)
+
 
 The foundation for everything else: with 20+ corporate clusters, lacking access to some kinds is normal. Without this, a forbidden kind retries forever and is indistinguishable in the UI from a cluster having a bad moment.
 
