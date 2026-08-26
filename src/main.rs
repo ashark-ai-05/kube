@@ -42,7 +42,7 @@ use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -644,6 +644,60 @@ fn find_object<'a>(
     objects
         .iter()
         .find(|o| o.metadata.namespace.as_deref() == namespace && o.name_any() == name)
+}
+
+/// Whether a batch's store changes should force the table body to redraw.
+///
+/// `coalesce` only tracks WHICH kinds changed in a batch — it has no notion
+/// of `active_kind`, since that lives in `Session`, not in an `AppEvent`.
+/// This is the one place that comparison happens: a batch full of
+/// `coordination.k8s.io/Lease`, `core/Event` or `discovery.k8s.io/
+/// EndpointSlice` deltas (all of which churn continuously on a stock
+/// cluster, none of which the table is showing) must not force a redraw
+/// whose output is pixel-identical to the last frame — the cost Plan 3's
+/// eager, uncapped-by-kind watching of up to 40 kinds would otherwise pay
+/// on every idle tick.
+fn table_body_is_dirty(
+    changed: &HashSet<GroupVersionKind>,
+    active_kind: &GroupVersionKind,
+) -> bool {
+    changed.contains(active_kind)
+}
+
+/// Whether the sidebar's per-kind counts actually changed since the last
+/// frame that read them.
+///
+/// A kind's watch firing does not mean its OBJECT COUNT changed: a Lease
+/// renewal, an EndpointSlice reshuffling backends, or a status-only Pod
+/// update are all in-place changes to objects that already existed, and
+/// recomputing counts after one produces the exact numbers already on
+/// screen. Comparing the settled result of a batch against what was last
+/// drawn — rather than redrawing on every delta that produced it — is the
+/// "coarser condition" that lets the sidebar's counts stay live without
+/// costing a frame per Lease heartbeat. Deliberately not a timer: this only
+/// runs when a batch of real events already woke the loop.
+fn counts_changed(
+    kinds: &[KindInfo],
+    facts: &[(usize, KindAvailability)],
+    last_counts: &HashMap<GroupVersionKind, usize>,
+) -> bool {
+    kinds
+        .iter()
+        .zip(facts)
+        .any(|(k, (count, _))| last_counts.get(&k.gvk) != Some(count))
+}
+
+/// Snapshot `facts` into the map `counts_changed` compares the NEXT batch
+/// against.
+fn record_counts(
+    kinds: &[KindInfo],
+    facts: &[(usize, KindAvailability)],
+) -> HashMap<GroupVersionKind, usize> {
+    kinds
+        .iter()
+        .zip(facts)
+        .map(|(k, (count, _))| (k.gvk.clone(), *count))
+        .collect()
 }
 
 /// Whether to issue a Table fetch for the active kind now.
@@ -1451,6 +1505,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // detection needs (`is_double_click`); crossterm reports presses, not
     // clicks.
     let mut last_click: Option<(usize, Instant)> = None;
+    // What `counts_changed` compares the next batch's counts against, so a
+    // redraw is forced only when a kind's count actually differs from what
+    // is already on screen — not on every delta an in-place update (a Lease
+    // renewal, an EndpointSlice reshuffle) produces. See `counts_changed`.
+    let mut last_counts: HashMap<GroupVersionKind, usize> = HashMap::new();
     // Nothing has been painted yet, so the first batch must draw whatever it is.
     let mut needs_redraw = true;
 
@@ -1471,7 +1530,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // Anything that can change what the frame looks like arms a redraw.
         // With all-motion mouse reporting, a bare mouse move otherwise costs a
         // full repaint, and `columns_for` reformats every object each frame.
-        needs_redraw |= batch.store_dirty;
+        //
+        // Store changes are NOT unconditionally dirty here — see
+        // `table_body_is_dirty`, applied below once `active_kind` is known.
         // Discovery landing changes the whole sidebar.
         needs_redraw |= batch.kinds_discovered;
         // A wake means state read at the TOP of a pass may have changed since
@@ -1546,6 +1607,10 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
 
+        // Store changes only redraw the table body when they name the kind
+        // actually on screen — see `table_body_is_dirty`.
+        needs_redraw |= table_body_is_dirty(&batch.changed_kinds, &active_kind);
+
         // Errors are raised AND retired here: see `next_error`. Without the
         // retiring half a single blip pins an error across every subsequent
         // switch. Done after the session read because which kind's sync
@@ -1575,6 +1640,15 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // change constantly — carrying the user's expansion state and
         // selection across each rebuild. See `refresh_tree`.
         refresh_tree(&mut tree, &kinds, &snapshot.kind_facts, &active_kind);
+
+        // The sidebar's counts redraw only when one of them actually
+        // changed value, not on every in-place update (a Lease renewal, an
+        // EndpointSlice reshuffle) that left every count exactly as it was
+        // — see `counts_changed`. Computed and recorded every pass,
+        // regardless of `needs_redraw`, so the comparison is always against
+        // what was truly last observed rather than what was last DRAWN.
+        needs_redraw |= counts_changed(&kinds, &snapshot.kind_facts, &last_counts);
+        last_counts = record_counts(&kinds, &snapshot.kind_facts);
 
         // Apply any events that came back, but only to the object they were
         // fetched for. A reply for an object the pane has moved off is
@@ -4037,6 +4111,101 @@ mod tests {
                 !table_fetch_due(Some(now - Duration::from_secs(1)), None, now, debounce),
                 "and having fetched it, do not fetch it again on every wake"
             );
+        }
+
+        // --- kind-aware redraw: 40 eagerly-watched kinds must not repaint
+        // the table body just because one of them changed ---
+
+        #[test]
+        fn a_batch_of_only_non_active_kind_changes_does_not_dirty_the_table_body() {
+            // Lease, Event and EndpointSlice all churn continuously on a
+            // stock cluster with no user activity at all. A batch made
+            // entirely of their deltas — none of them the kind on screen —
+            // must not force a redraw whose output would be pixel-identical
+            // to the last frame.
+            let active = pod_gvk();
+            let lease = GroupVersionKind::gvk("coordination.k8s.io", "v1", "Lease");
+            let event = GroupVersionKind::gvk("events.k8s.io", "v1", "Event");
+            let changed: std::collections::HashSet<GroupVersionKind> =
+                [lease, event].into_iter().collect();
+            assert!(
+                !table_body_is_dirty(&changed, &active),
+                "none of the changed kinds is the one on screen"
+            );
+        }
+
+        #[test]
+        fn a_batch_containing_the_active_kind_does_dirty_the_table_body() {
+            let active = pod_gvk();
+            let lease = GroupVersionKind::gvk("coordination.k8s.io", "v1", "Lease");
+            let changed: std::collections::HashSet<GroupVersionKind> =
+                [lease, active.clone()].into_iter().collect();
+            assert!(
+                table_body_is_dirty(&changed, &active),
+                "the active kind is in the batch, alongside unrelated churn"
+            );
+        }
+
+        #[test]
+        fn an_empty_changed_set_does_not_dirty_the_table_body() {
+            let active = pod_gvk();
+            assert!(!table_body_is_dirty(
+                &std::collections::HashSet::new(),
+                &active
+            ));
+        }
+
+        // --- the sidebar's counts redraw only on a genuine count change ---
+
+        fn deployment_gvk() -> GroupVersionKind {
+            GroupVersionKind::gvk("apps", "v1", "Deployment")
+        }
+
+        #[test]
+        fn an_in_place_update_that_leaves_every_count_unchanged_does_not_redraw() {
+            // A Lease renewal, an EndpointSlice reshuffle: the object count
+            // for that kind is exactly what it was. Recomputing it would
+            // draw the identical sidebar.
+            let kinds = vec![kind_info("", "Pod"), kind_info("apps", "Deployment")];
+            let facts = vec![
+                (3, KindAvailability::Watching),
+                (2, KindAvailability::Watching),
+            ];
+            let last_counts: HashMap<GroupVersionKind, usize> =
+                [(pod_gvk(), 3), (deployment_gvk(), 2)]
+                    .into_iter()
+                    .collect();
+            assert!(
+                !counts_changed(&kinds, &facts, &last_counts),
+                "identical counts to what was last recorded must not redraw"
+            );
+        }
+
+        #[test]
+        fn a_genuine_count_change_does_redraw() {
+            let kinds = vec![kind_info("", "Pod"), kind_info("apps", "Deployment")];
+            let facts = vec![
+                (4, KindAvailability::Watching), // Pod count went 3 -> 4
+                (2, KindAvailability::Watching),
+            ];
+            let last_counts: HashMap<GroupVersionKind, usize> =
+                [(pod_gvk(), 3), (deployment_gvk(), 2)]
+                    .into_iter()
+                    .collect();
+            assert!(
+                counts_changed(&kinds, &facts, &last_counts),
+                "a real create/delete must still reach the sidebar"
+            );
+        }
+
+        #[test]
+        fn a_kind_with_no_prior_recorded_count_counts_as_changed() {
+            // Newly discovered, or the very first pass — there is nothing to
+            // compare against, so treat it as a change rather than silently
+            // never drawing it.
+            let kinds = vec![kind_info("", "Pod")];
+            let facts = vec![(1, KindAvailability::Watching)];
+            assert!(counts_changed(&kinds, &facts, &HashMap::new()));
         }
 
         // --- opening the pane by mouse ---

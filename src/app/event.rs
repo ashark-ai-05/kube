@@ -4,6 +4,7 @@ use crate::store::events::EventRow;
 use crossterm::event::Event as CtEvent;
 use indexmap::IndexMap;
 use kube::api::GroupVersionKind;
+use std::collections::HashSet;
 
 /// Health of a single kind's watch. Shown in the status bar so stale data is
 /// never presented as live.
@@ -81,7 +82,16 @@ pub struct FetchedEvents {
 #[derive(Debug, Default)]
 pub struct Coalesced {
     pub inputs: Vec<CtEvent>,
-    pub store_dirty: bool,
+    /// Every kind a `StoreChanged` named in this batch, deduplicated.
+    ///
+    /// A flat `store_dirty: bool` (what this replaced) cannot distinguish a
+    /// delta on the kind the table is showing from one on `coordination.k8s.
+    /// io/Lease` or `core/Event` — both just set the same flag, so ANY of
+    /// the (now up to 40) eagerly-watched kinds forced a full frame repaint.
+    /// Deciding whether that matters needs the gvk, which only the caller
+    /// (via `active_kind`, not known here) can compare against — see
+    /// `main.rs`'s `table_body_is_dirty`.
+    pub changed_kinds: HashSet<GroupVersionKind>,
     pub status_changes: Vec<(GroupVersionKind, WatchStatus)>,
     pub errors: Vec<String>,
     /// Kept in order and never dropped: a `Connecting` collapsed into the
@@ -104,7 +114,7 @@ pub struct Coalesced {
     /// True if discovery reported new kinds in this batch. A flag, not a
     /// list: the kinds themselves live on the session.
     pub kinds_discovered: bool,
-    /// True if a debounce wake arrived. Collapses like `store_dirty` — ten
+    /// True if a debounce wake arrived. Collapses like `changed_kinds` — ten
     /// wakes and one wake both mean "re-evaluate once".
     pub wake: bool,
     pub quit: bool,
@@ -112,9 +122,11 @@ pub struct Coalesced {
 
 /// Collapse a drained batch into one render's work.
 ///
-/// Store changes coalesce to a single dirty flag: 10,000 deltas cost one repaint.
-/// Input is never coalesced — dropping keystrokes is always wrong. Errors are
-/// never dropped. Only the newest status per kind is kept.
+/// Store changes coalesce to a set of the kinds that changed: 10,000 deltas
+/// on one kind cost one entry, and the caller decides what that set means for
+/// a redraw (see `changed_kinds`'s doc comment). Input is never coalesced —
+/// dropping keystrokes is always wrong. Errors are never dropped. Only the
+/// newest status per kind is kept.
 pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
     let mut out = Coalesced::default();
     let mut statuses: IndexMap<GroupVersionKind, WatchStatus> = IndexMap::new();
@@ -122,7 +134,9 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
     for event in events {
         match event {
             AppEvent::Input(e) => out.inputs.push(e),
-            AppEvent::StoreChanged { .. } => out.store_dirty = true,
+            AppEvent::StoreChanged { gvk } => {
+                out.changed_kinds.insert(gvk);
+            }
             AppEvent::WatchStatus { gvk, status } => {
                 statuses.insert(gvk, status);
             }
@@ -162,12 +176,16 @@ mod tests {
     }
 
     #[test]
-    fn many_store_changes_collapse_to_one_dirty_flag() {
+    fn many_store_changes_collapse_to_one_changed_kind() {
         let events: Vec<AppEvent> = (0..10_000)
             .map(|_| AppEvent::StoreChanged { gvk: pod_gvk() })
             .collect();
         let out = coalesce(events);
-        assert!(out.store_dirty, "store changes must mark the view dirty");
+        assert_eq!(
+            out.changed_kinds,
+            [pod_gvk()].into_iter().collect(),
+            "10,000 deltas on one kind must collapse to one entry"
+        );
         assert!(out.inputs.is_empty());
         assert!(!out.quit);
     }
@@ -183,7 +201,7 @@ mod tests {
         assert_eq!(out.inputs.len(), 2, "input must never be coalesced away");
         assert_eq!(out.inputs[0], key('a'));
         assert_eq!(out.inputs[1], key('b'));
-        assert!(out.store_dirty);
+        assert!(out.changed_kinds.contains(&pod_gvk()));
     }
 
     #[test]
@@ -319,8 +337,8 @@ mod tests {
         assert!(out.kinds_discovered);
         assert!(out.wake);
         assert!(
-            !out.store_dirty,
-            "a debounce wake must not mark the store dirty: that would arm \
+            out.changed_kinds.is_empty(),
+            "a debounce wake must not mark any kind changed: that would arm \
              another debounce and the two would trade wakes forever"
         );
     }
