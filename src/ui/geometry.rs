@@ -7,8 +7,42 @@
 //! layout loop. Centralising that replication here means it happens once,
 //! not once per view that grows tabs.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use unicode_width::UnicodeWidthStr;
+
+/// Per-column x-offsets for a ratatui `Table`, reproducing its own two-stage
+/// layout rather than the single `Layout::horizontal(widths).split(area)` a
+/// caller might reach for first.
+///
+/// `Table`'s real layout (`ratatui-widgets-0.3.2/src/table.rs`,
+/// `get_column_widths`; verified in
+/// `docs/superpowers/plan2-api-reference.md` section D14) reserves a
+/// selection-symbol column FIRST — `Layout::horizontal([Length(selection_width),
+/// Fill(0)])` — and only THEN splits what remains by the caller's widths with
+/// `column_spacing`. A naive single-stage split only happens to agree with
+/// this when `selection_width` is 0 (no highlight symbol, or
+/// `HighlightSpacing::WhenSelected` with nothing currently selected); the
+/// moment a row IS selected under the common `WhenSelected` default, or a
+/// highlight symbol is set at all, the selection column silently eats width
+/// and every column header click lands one column short of where `Table`
+/// actually drew it.
+pub fn column_offsets(
+    widths: &[Constraint],
+    area: Rect,
+    column_spacing: u16,
+    selection_width: u16,
+) -> Vec<Rect> {
+    // TODO(Task 6 RED): naive single-stage split, ignores `selection_width`
+    // entirely — the exact bug this function exists to fix.
+    let _ = selection_width;
+    if area.width == 0 || area.height == 0 || widths.is_empty() {
+        return Vec::new();
+    }
+    Layout::horizontal(widths.to_vec())
+        .spacing(column_spacing)
+        .split(area)
+        .to_vec()
+}
 
 /// Per-tab clickable rects for a manually hit-tested `Tabs`-like row.
 ///
@@ -110,5 +144,45 @@ mod tests {
     fn an_empty_label_list_yields_no_tabs() {
         let rects: Vec<Rect> = tab_spans(&[], rect(0, 0, 40, 1), 1);
         assert!(rects.is_empty());
+    }
+
+    // --- column_offsets ---
+
+    #[test]
+    fn column_offsets_account_for_the_selection_column_and_spacing() {
+        // Plan 2's reference established that Layout::horizontal alone is only
+        // correct when the selection symbol is zero-width. A naive split makes
+        // every column header click land on the wrong column.
+        let widths = [
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Fill(1),
+        ];
+        let plain = column_offsets(&widths, rect(0, 0, 60, 1), 1, 0);
+        let with_sel = column_offsets(&widths, rect(0, 0, 60, 1), 1, 2);
+        assert!(with_sel[0].x > plain[0].x, "selection column not reserved");
+        for pair in with_sel.windows(2) {
+            assert!(
+                pair[0].x + pair[0].width <= pair[1].x,
+                "columns overlap: {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_area_yields_no_column_offsets_rather_than_panicking() {
+        let widths = [Constraint::Length(10), Constraint::Fill(1)];
+        assert!(column_offsets(&widths, rect(0, 0, 0, 1), 1, 0).is_empty());
+    }
+
+    #[test]
+    fn a_zero_height_area_yields_no_column_offsets_rather_than_panicking() {
+        let widths = [Constraint::Length(10), Constraint::Fill(1)];
+        assert!(column_offsets(&widths, rect(0, 0, 40, 0), 1, 0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_widths_list_yields_no_column_offsets() {
+        assert!(column_offsets(&[], rect(0, 0, 40, 1), 1, 0).is_empty());
     }
 }

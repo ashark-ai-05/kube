@@ -2,6 +2,7 @@ use crate::app::event::{AppEvent, WatchStatus};
 use crate::store::cache::KindCache;
 use crate::store::multi::{KindAvailability, availability_of};
 use crate::store::rbac::{WatchFailure, classify};
+use crate::store::table::TableData;
 use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher;
@@ -21,6 +22,24 @@ pub struct ResourceStore {
     /// store snapshot under one lock, so the two can never disagree about a
     /// kind the way a status string and a separately-derived guess could.
     availability: HashMap<GroupVersionKind, KindAvailability>,
+    /// Server-rendered columns and rows for a kind, once a `fetch_table`
+    /// (`store::table::fetch_table`) has completed for it.
+    ///
+    /// Lives here, beside `statuses`/`availability`, under the SAME lock and
+    /// keyed by the SAME `GroupVersionKind`, for the reason documented on
+    /// `availability` above: the render path reads objects, status,
+    /// availability AND now table columns from one store snapshot under one
+    /// lock acquisition, so none of them can ever be read for a DIFFERENT
+    /// kind than the others. A side cell holding only "the current table",
+    /// keyed by nothing but "whatever is active right now", would go stale
+    /// the instant the user switches kinds faster than an in-flight fetch
+    /// returns — the returning fetch would land tagged as belonging to
+    /// whichever kind is active BY THEN, not the one it was actually
+    /// requested for. Keying by `GroupVersionKind`, the same key every other
+    /// per-kind fact in this store uses, makes that misattribution
+    /// unrepresentable: a stale fetch for a kind the user has since left
+    /// simply updates that kind's (unread) entry.
+    tables: HashMap<GroupVersionKind, TableData>,
 }
 
 impl Default for ResourceStore {
@@ -35,6 +54,7 @@ impl ResourceStore {
             kinds: HashMap::new(),
             statuses: HashMap::new(),
             availability: HashMap::new(),
+            tables: HashMap::new(),
         }
     }
 
@@ -77,6 +97,18 @@ impl ResourceStore {
             .get(gvk)
             .cloned()
             .unwrap_or(KindAvailability::Watching)
+    }
+
+    pub fn set_table_data(&mut self, gvk: GroupVersionKind, table: TableData) {
+        self.tables.insert(gvk, table);
+    }
+
+    /// `None` until a fetch for this kind has completed. The render path
+    /// must treat that exactly like any other kind with no data yet —
+    /// falling back to the builtin column registry (`store::columns::
+    /// column_source`) rather than blocking or showing nothing.
+    pub fn table_data(&self, gvk: &GroupVersionKind) -> Option<TableData> {
+        self.tables.get(gvk).cloned()
     }
 }
 
@@ -615,6 +647,40 @@ mod tests {
         assert!(
             saw_synced,
             "the watch must reach Synced after the transient error clears"
+        );
+    }
+
+    // --- per-kind fetched table data lives in the store, keyed by gvk ---
+
+    #[test]
+    fn table_data_defaults_to_none_before_any_fetch_completes() {
+        let store = ResourceStore::new();
+        assert!(
+            store.table_data(&pod_gvk()).is_none(),
+            "absence means no fetch has completed yet, not an error"
+        );
+    }
+
+    #[test]
+    fn table_data_is_recorded_and_isolated_per_kind() {
+        use crate::store::table::TableColumn;
+        let mut store = ResourceStore::new();
+        let other = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let table = TableData {
+            columns: vec![TableColumn {
+                name: "Name".to_string(),
+                priority: 0,
+            }],
+            rows: vec![vec!["a".to_string()]],
+        };
+        store.set_table_data(pod_gvk(), table.clone());
+        assert_eq!(
+            store.table_data(&pod_gvk()).expect("just set").rows,
+            table.rows
+        );
+        assert!(
+            store.table_data(&other).is_none(),
+            "one kind's fetched table must not leak into another's"
         );
     }
 

@@ -1,3 +1,4 @@
+use crate::store::table::TableData;
 use chrono::{DateTime, Utc};
 use kube::api::{DynamicObject, GroupVersionKind, ResourceExt};
 use ratatui::layout::Constraint;
@@ -122,6 +123,36 @@ pub fn columns_for(gvk: &GroupVersionKind) -> Vec<Column> {
     ]
 }
 
+/// Where a table's columns and row values come from.
+///
+/// `Builtin` is the always-available client-side registry (`columns_for`) —
+/// hand-written per kind, or the NAME/AGE fallback for anything without an
+/// entry. `Server` is a decoded `meta.k8s.io/v1 Table` response
+/// (`store::table::fetch_table`/`decode_table`): kubectl's own columns,
+/// including a CRD's declared printer columns, which no client-side
+/// registry could ever enumerate ahead of time.
+pub enum ColumnSource {
+    Builtin(Vec<Column>),
+    Server(TableData),
+}
+
+/// Prefer the server's own columns when a fetch has completed for this
+/// kind; fall back to the builtin registry otherwise.
+///
+/// The fallback matters beyond CRDs lacking a `Column` entry: fetching is a
+/// one-shot request issued when the active kind changes, never from the
+/// render path (see `store::table::fetch_table`'s doc comment) — so on the
+/// very first frame after switching kinds, and on any frame after a fetch
+/// that failed or hit a server that returned ordinary JSON instead of a
+/// Table (a drifted Accept header fails silently; see `decode_table`),
+/// `table` is `None`. The table must still render something rather than
+/// going blank while it waits.
+pub fn column_source(gvk: &GroupVersionKind, table: Option<TableData>) -> ColumnSource {
+    // TODO(Task 6 RED): ignores `table` entirely.
+    let _ = table;
+    ColumnSource::Builtin(columns_for(gvk))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +267,36 @@ mod tests {
         assert_eq!(at(3_600), "1h", "exactly one hour switches to hours");
         assert_eq!(at(86_399), "23h", "just under a day stays in hours");
         assert_eq!(at(86_400), "1d", "exactly one day switches to days");
+    }
+
+    // --- column_source ---
+
+    #[test]
+    fn column_source_prefers_server_columns_when_a_table_has_been_fetched() {
+        use crate::store::table::TableColumn;
+        let table = TableData {
+            columns: vec![TableColumn {
+                name: "Custom".to_string(),
+                priority: 0,
+            }],
+            rows: vec![],
+        };
+        let gvk = GroupVersionKind::gvk("example.com", "v1", "Widget");
+        match column_source(&gvk, Some(table)) {
+            ColumnSource::Server(t) => assert_eq!(t.columns[0].name, "Custom"),
+            ColumnSource::Builtin(_) => panic!("expected the fetched table to win"),
+        }
+    }
+
+    #[test]
+    fn column_source_falls_back_to_the_builtin_registry_with_no_table_fetched_yet() {
+        let gvk = GroupVersionKind::gvk("example.com", "v1", "Widget");
+        match column_source(&gvk, None) {
+            ColumnSource::Builtin(cols) => {
+                let headers: Vec<&str> = cols.iter().map(|c| c.header).collect();
+                assert_eq!(headers, vec!["NAME", "AGE"]);
+            }
+            ColumnSource::Server(_) => panic!("must not invent a table with nothing fetched"),
+        }
     }
 }

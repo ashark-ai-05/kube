@@ -71,6 +71,42 @@ pub fn decode_table(json: &serde_json::Value) -> anyhow::Result<TableData> {
     Ok(TableData { columns, rows })
 }
 
+/// Requested sort for the live table: which column (a 0-based index into
+/// each row's cells) and which direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortState {
+    pub column: usize,
+    pub descending: bool,
+}
+
+/// Sort table rows by one column, in place.
+///
+/// Comparison is numeric when BOTH sides of a pair parse as `f64` (so
+/// RESTARTS-style integer columns sort `2 < 9 < 10`, not lexically `10 <
+/// 2 < 9`), and lexical otherwise — kubectl's own columns mix free text
+/// (NAME, STATUS) with numbers, and there is no column-type metadata
+/// available at this layer to decide up front which a given column is.
+///
+/// The sort is stable (`[T]::sort_by`, not `sort_unstable_by`): rows arrive
+/// in the store's insertion order, and reshuffling equal keys on every
+/// redraw would be visible and disorienting to a user watching the table.
+///
+/// A CRD's declared columns and its actual rows are not guaranteed to agree
+/// in length, and a sort request can outlive a kind switch that shrinks the
+/// row width — so a column index at or past ANY row's length leaves every
+/// row untouched rather than panicking on an out-of-bounds index or
+/// partially reordering what it could compare.
+///
+/// Takes `&mut [Vec<String>]` rather than `&mut Vec<Vec<String>>` (clippy's
+/// `ptr_arg`, same reasoning as `store::multi::prioritise`): sorting never
+/// resizes the vector, so a slice is all it needs, and every real caller
+/// holding a `Vec<Vec<String>>` still calls this as `sort_rows(&mut rows,
+/// ...)` unchanged via the usual deref coercion.
+pub fn sort_rows(rows: &mut [Vec<String>], sort: &SortState) {
+    // TODO(Task 6 RED): not yet implemented.
+    let _ = (rows, sort);
+}
+
 /// Ask the API server to render a resource the way kubectl does.
 ///
 /// kube 4.2 has no Table support, so this builds the request by hand and
@@ -183,5 +219,77 @@ mod tests {
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(decode_table(&serde_json::json!({"nope": true})).is_err());
         assert!(decode_table(&serde_json::json!([])).is_err());
+    }
+
+    // --- sort_rows ---
+
+    #[test]
+    fn sorting_is_stable_and_reversible() {
+        let mut rows = vec![
+            vec!["b".into(), "2".into()],
+            vec!["a".into(), "1".into()],
+            vec!["c".into(), "2".into()],
+        ];
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 1,
+                descending: false,
+            },
+        );
+        assert_eq!(rows[0][0], "a");
+        assert_eq!(
+            &[rows[1][0].as_str(), rows[2][0].as_str()],
+            &["b", "c"],
+            "equal keys must keep their original order"
+        );
+    }
+
+    #[test]
+    fn sorting_descending_reverses_the_order() {
+        let mut rows = vec![vec!["a".into()], vec!["c".into()], vec!["b".into()]];
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 0,
+                descending: true,
+            },
+        );
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn sorting_by_a_column_beyond_the_row_width_leaves_the_rows_alone() {
+        let mut rows = vec![vec!["a".into()], vec!["b".into()]];
+        let before = rows.clone();
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 9,
+                descending: false,
+            },
+        );
+        assert_eq!(rows, before, "a ragged CRD table must not panic or scramble");
+    }
+
+    #[test]
+    fn ages_and_counts_sort_numerically_not_lexically() {
+        // "10" before "9" is the classic wrong answer, and RESTARTS is one of
+        // the columns people actually sort by.
+        let mut rows = vec![vec!["9".into()], vec!["10".into()], vec!["2".into()]];
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 0,
+                descending: false,
+            },
+        );
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+            vec!["2", "9", "10"]
+        );
     }
 }
