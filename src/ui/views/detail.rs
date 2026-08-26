@@ -274,6 +274,29 @@ fn render_placeholder(f: &mut Frame, area: Rect, text: &str) {
     f.render_widget(Paragraph::new(text).style(theme::muted_style()), area);
 }
 
+/// Serialize a DynamicObject to YAML string using serde_norway.
+/// The output leads with apiVersion, kind, metadata (kubectl convention) and
+/// requires no post-processing for readability.
+fn object_to_yaml(obj: &DynamicObject) -> String {
+    unimplemented!()
+}
+
+/// Count the number of lines in a YAML string.
+/// Returns the count as u16, saturating if the count exceeds u16::MAX.
+fn yaml_line_count(yaml: &str) -> u16 {
+    unimplemented!()
+}
+
+/// Clamp a scroll position to valid bounds for a document.
+/// Returns a scroll value that, when used with Paragraph::scroll((y, x)),
+/// ensures the viewport never scrolls past the end of the document.
+///
+/// If total_lines <= viewport, returns 0 (document fits entirely).
+/// Otherwise, clamps scroll to the range [0, total_lines - viewport].
+fn clamp_scroll(scroll: u16, total_lines: u16, viewport: u16) -> u16 {
+    unimplemented!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +612,47 @@ mod tests {
             render_detail(f, area, &obj, &mut pane, &mut hits);
         })
         .unwrap();
+    }
+
+    /// Build an object with a custom annotation. Used to test multi-line
+    /// annotation rendering.
+    fn object_with_annotation(key: &str, value: &str) -> DynamicObject {
+        let mut o = DynamicObject::new("test-obj", &ApiResource::erase::<Pod>(&())).within("default");
+        o.data = serde_json::json!({
+            "metadata": {
+                "annotations": {
+                    key: value
+                }
+            }
+        });
+        o
+    }
+
+    #[test]
+    fn yaml_leads_with_apiversion_kind_and_metadata() {
+        // kubectl's own convention. A serialiser that alphabetised the top
+        // level would put `apiVersion` after nothing but still bury `kind`.
+        let y = object_to_yaml(&pod_with_status());
+        let lines: Vec<&str> = y.lines().collect();
+        assert!(lines[0].starts_with("apiVersion:"), "first line was {:?}", lines[0]);
+        assert!(lines.iter().any(|l| l.starts_with("kind:")));
+        assert!(lines.iter().any(|l| l.starts_with("metadata:")));
+    }
+
+    #[test]
+    fn yaml_renders_multiline_annotations_readably() {
+        let obj = object_with_annotation("desc", "line one\nline two\nline three");
+        let y = object_to_yaml(&obj);
+        assert!(y.contains("line one"));
+        assert!(y.contains("line three"));
+        assert!(!y.contains("\\n"), "multi-line value was escaped rather than blocked:\n{y}");
+    }
+
+    #[test]
+    fn scroll_clamps_to_the_document_and_never_underflows() {
+        assert_eq!(clamp_scroll(0, 100, 20), 0);
+        assert_eq!(clamp_scroll(50, 100, 20), 50);
+        assert_eq!(clamp_scroll(200, 100, 20), 80, "cannot scroll past the last screenful");
+        assert_eq!(clamp_scroll(10, 5, 20), 0, "a document shorter than the viewport does not scroll");
     }
 }
