@@ -46,6 +46,19 @@ pub fn is_browsable(caps: &ApiCapabilities) -> bool {
     caps.supports_operation(verbs::LIST) && caps.supports_operation(verbs::WATCH)
 }
 
+/// Sort kinds by group label, then by kind name within each group.
+///
+/// `Discovery::groups()` iterates an unordered HashMap, so groups appear in
+/// arbitrary order. Without explicit sorting, the sidebar would reorder itself
+/// between application restarts. This function enforces a stable order.
+pub fn sort_kinds(kinds: &mut [KindInfo]) {
+    kinds.sort_by(|a, b| {
+        a.group_label
+            .cmp(&b.group_label)
+            .then_with(|| a.gvk.kind.cmp(&b.gvk.kind))
+    });
+}
+
 /// Discover all watchable resource kinds in a cluster.
 ///
 /// Iterates every API group and each group's recommended resource version, filters
@@ -80,6 +93,7 @@ pub async fn discover_kinds(client: &Client) -> Result<Vec<KindInfo>> {
         }
     }
 
+    sort_kinds(&mut kinds);
     Ok(kinds)
 }
 
@@ -125,5 +139,58 @@ mod tests {
     #[test]
     fn subresources_and_write_only_verbs_do_not_make_a_kind_browsable() {
         assert!(!is_browsable(&caps(&["create", "delete", "patch"])));
+    }
+
+    /// Construct a KindInfo for testing sorting.
+    ///
+    /// Uses a dummy resource to isolate the test of sort logic from discovery.
+    fn kind_info(group_label: &str, kind: &str) -> KindInfo {
+        KindInfo {
+            gvk: kube::api::GroupVersionKind::gvk(group_label, "v1", kind),
+            resource: ApiResource {
+                group: group_label.to_string(),
+                api_version: "v1".to_string(),
+                kind: kind.to_string(),
+                version: "v1".to_string(),
+                plural: kind.to_lowercase(),
+            },
+            namespaced: true,
+            group_label: group_label.to_string(),
+        }
+    }
+
+    #[test]
+    fn kinds_come_back_in_a_stable_order_regardless_of_discovery_order() {
+        // Discovery::groups() iterates a HashMap, so input order is arbitrary
+        // and varies between runs. Without an explicit sort the sidebar would
+        // reorder itself every restart.
+        //
+        // This fixture is carefully chosen to distinguish correct sorting from
+        // common mistakes:
+        // - Input is deliberately neither fully sorted nor reverse sorted
+        // - Groups interleave: core kind appears before all apps kinds
+        // - Sorting by kind only: Daemon, Pod, Service, Web (wrong!)
+        // - Sorting by group then kind: apps/Daemon, apps/Web, core/Pod, core/Service (right!)
+        // These differ, so a wrong implementation fails.
+        let mut kinds = vec![
+            kind_info("apps", "Web"),
+            kind_info("core", "Pod"),
+            kind_info("apps", "Daemon"),
+            kind_info("core", "Service"),
+        ];
+        sort_kinds(&mut kinds);
+
+        let got: Vec<String> = kinds
+            .iter()
+            .map(|k| format!("{}/{}", k.group_label, k.gvk.kind))
+            .collect();
+
+        // Expected: sorted by group_label first (alphabetical), then by kind
+        // within each group. "apps" comes before "core", and within each group
+        // kinds are alphabetical.
+        assert_eq!(
+            got,
+            vec!["apps/Daemon", "apps/Web", "core/Pod", "core/Service"]
+        );
     }
 }
