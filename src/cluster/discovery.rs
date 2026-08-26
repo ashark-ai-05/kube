@@ -5,9 +5,9 @@
 //! update. Either alone makes the sidebar show incorrect information.
 
 use anyhow::Result;
+use kube::Client;
 use kube::api::ApiResource;
 use kube::discovery::{ApiCapabilities, Discovery, Scope, verbs};
-use kube::Client;
 
 /// A resource kind that can be watched for changes in the sidebar.
 #[derive(Debug, Clone)]
@@ -27,17 +27,23 @@ pub struct KindInfo {
 /// The core Kubernetes API group has an empty name — displaying a blank sidebar
 /// heading would be worse than useless. This function maps `""` to `"core"`.
 pub fn group_label_for(group: &str) -> String {
-    todo!()
+    if group.is_empty() {
+        "core".to_string()
+    } else {
+        group.to_string()
+    }
 }
 
 /// Whether a resource kind can be watched and listed in the sidebar.
 ///
 /// A kind needs both `list` and `watch` to appear:
+///
 /// - Without `list`, the initial population is empty.
 /// - Without `watch`, the count never updates.
+///
 /// Either alone makes the sidebar show incorrect information.
 pub fn is_browsable(caps: &ApiCapabilities) -> bool {
-    todo!()
+    caps.supports_operation(verbs::LIST) && caps.supports_operation(verbs::WATCH)
 }
 
 /// Discover all watchable resource kinds in a cluster.
@@ -105,8 +111,14 @@ mod tests {
     #[test]
     fn a_kind_needs_both_list_and_watch_to_be_browsable() {
         assert!(is_browsable(&caps(&["list", "watch", "get"])));
-        assert!(!is_browsable(&caps(&["list", "get"])), "no watch: counts would never update");
-        assert!(!is_browsable(&caps(&["watch"])), "no list: the initial population would be empty");
+        assert!(
+            !is_browsable(&caps(&["list", "get"])),
+            "no watch: counts would never update"
+        );
+        assert!(
+            !is_browsable(&caps(&["watch"])),
+            "no list: the initial population would be empty"
+        );
         assert!(!is_browsable(&caps(&[])));
     }
 
