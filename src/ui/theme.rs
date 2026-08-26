@@ -195,6 +195,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognised_event_type_styles_as_normal_not_as_a_warning() {
+        // `Event.type_` (C8) is an unconstrained `String`; a CRD controller
+        // or `events.k8s.io` producer can send a value that is neither
+        // "Normal" nor "Warning" (e.g. "Progressing"). `event_kind_style`'s
+        // `_ => text_style()` fallback already makes this choice — this test
+        // pins it explicitly so a future edit can't silently flip the
+        // default to the Warning/signal colour. Under-styling an unfamiliar
+        // event (it just looks like any other row) is the safer failure
+        // mode: inventing an alarm for a type this code doesn't understand
+        // would be worse than staying quiet about it.
+        assert_eq!(
+            event_kind_style("Progressing"),
+            event_kind_style("Normal"),
+            "an unrecognised type must render like Normal, not invent an alarm"
+        );
+        assert_ne!(
+            event_kind_style("Progressing"),
+            event_kind_style("Warning"),
+            "an unrecognised type must not be styled as a Warning"
+        );
+    }
+
+    #[test]
     fn event_kind_style_never_reuses_a_chrome_token() {
         let chrome = [INK, ABYSS, DUSK, INDIGO, PERIWINKLE, TEAL, VIOLET];
         for kind in ["Normal", "Warning", "Unknown"] {

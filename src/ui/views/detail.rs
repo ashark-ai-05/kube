@@ -289,7 +289,14 @@ fn render_yaml(f: &mut Frame, area: Rect, obj: &DynamicObject, pane: &mut Detail
     use ratatui::widgets::Wrap;
 
     let yaml = get_or_cache_yaml(obj, pane);
-    let total_lines = yaml_line_count(&yaml);
+    // `total_wrapped_rows`, not a `\n`-count: the Paragraph below wraps, so a
+    // single long line (a base64 secret value, a long annotation) can occupy
+    // several screen rows. Clamping on the newline count alone would make
+    // that line's tail — and anything after it — unreachable by scrolling,
+    // the same bug Finding 1 fixed for the Events tab. See
+    // `wrapped_row_count`'s doc comment for why this is hand-rolled instead
+    // of using `Paragraph::line_count`.
+    let total_lines = total_wrapped_rows(yaml.lines(), area.width);
 
     // Clamp scroll to valid bounds: the viewport height is the render area height
     pane.yaml_scroll = clamp_scroll(pane.yaml_scroll, total_lines, area.height);
@@ -357,7 +364,14 @@ fn render_events(
     }
 
     let lines: Vec<Line> = events.iter().map(event_line).collect();
-    let total_lines: u16 = lines.len().try_into().unwrap_or(u16::MAX);
+    // `events_wrapped_line_count`, not `events.len()`: `len()` is the ROW
+    // count, but the rendered content is wrapped text — a handful of events
+    // with long messages can occupy far more screen rows than there are
+    // events. Clamping against the row count made later events permanently
+    // unreachable at any scroll offset whenever the row count alone still
+    // fit the viewport even though the true wrapped height did not (see
+    // `events_whose_messages_wrap_can_still_all_be_reached`).
+    let total_lines = events_wrapped_line_count(events, area.width);
     pane.events_scroll = clamp_scroll(pane.events_scroll, total_lines, area.height);
 
     let paragraph = Paragraph::new(lines)
@@ -373,19 +387,25 @@ fn render_events(
 /// reporting source.
 fn event_line(row: &EventRow) -> Line<'static> {
     let style = theme::event_kind_style(&row.kind);
+    Line::styled(event_line_text(row), style)
+}
+
+/// The plain text `event_line` renders, factored out so
+/// `events_wrapped_line_count` measures the exact same string that ends up
+/// on screen rather than a second, hand-maintained approximation of it.
+fn event_line_text(row: &EventRow) -> String {
     let count = if row.count > 1 {
         format!(" (x{})", row.count)
     } else {
         String::new()
     };
-    let text = format!(
+    format!(
         "{age:<6} {kind:<7} {reason:<20} {message}{count}",
         age = row.age,
         kind = row.kind,
         reason = row.reason,
         message = row.message,
-    );
-    Line::styled(text, style)
+    )
 }
 
 /// Serialize a DynamicObject to YAML string using serde_norway.
@@ -395,10 +415,98 @@ fn object_to_yaml(obj: &DynamicObject) -> String {
     serde_norway::to_string(obj).unwrap_or_else(|_| "Failed to serialize YAML".to_string())
 }
 
-/// Count the number of lines in a YAML string.
-/// Returns the count as u16, saturating if the count exceeds u16::MAX.
-fn yaml_line_count(yaml: &str) -> u16 {
-    yaml.lines().count().try_into().unwrap_or(u16::MAX)
+/// Number of screen rows one logical (pre-wrap) line of `text` occupies once
+/// wrapped to `width` columns under `Wrap { trim: false }` — the setting
+/// both the YAML and Events tabs always render with.
+///
+/// This hand-rolls ratatui's own wrapper (`ratatui-widgets` 0.3.2's
+/// `WordWrapper`, `src/reflow.rs`) closely enough to clamp scrolling safely:
+/// greedy word-wrap on whitespace boundaries, and a single token wider than
+/// `width` forced onto `ceil(token_width / width)` rows of its own — the
+/// same direction of error a real wrapper produces — rather than silently
+/// counted as one (undersized) row, which would recreate the exact
+/// under-counting bug this function exists to fix.
+///
+/// `Paragraph::line_count` (ratatui 0.30's own exact wrapped-line count)
+/// would be preferable to hand-rolling this, and was checked first: it
+/// exists (`ratatui-widgets-0.3.2/src/paragraph.rs`), but is gated behind
+/// the `unstable-rendered-line-info` Cargo feature, which is OFF by default
+/// and not enabled by this project's `Cargo.toml` (`ratatui = "0.30"`, no
+/// features listed) — turning it on would be a dependency-shape change this
+/// task's brief forbids. The method is also explicitly marked
+/// `#[instability::unstable(...)]` with the doc note "the design for text
+/// wrapping is not stable and might affect this API," so it would be a bet
+/// on a surface ratatui itself does not consider settled. Verified
+/// empirically instead: a scratch harness with the feature enabled
+/// (`/tmp/.../scratchpad/wraptest`, not part of this project) compared this
+/// function's output against `Paragraph::line_count` across representative
+/// texts (short/empty/whitespace-only lines, normal sentences, a token wider
+/// than the viewport, width down to 1) — every case matched exactly.
+///
+/// Known divergence risk: this project's own value can still drift from
+/// ratatui's real wrapping on inputs the scratch check didn't cover — wide
+/// (double-width) or zero-width grapheme clusters, combining characters, or
+/// future changes to ratatui's (self-described unstable) wrap algorithm.
+/// That risk is acceptable here because this value only bounds a scroll
+/// position; it never decides what glyphs are drawn.
+fn wrapped_row_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let width = u32::from(width);
+
+    let mut rows: u32 = 1;
+    let mut current: u32 = 0;
+    for token in text.split_inclusive(char::is_whitespace) {
+        let token_width = UnicodeWidthStr::width(token) as u32;
+        if token_width == 0 {
+            continue;
+        }
+        if token_width > width {
+            // A single token wider than the viewport cannot fit on any row,
+            // so it force-wraps across ceil(token_width / width) rows —
+            // mirroring how a real word-wrapper breaks an overlong token
+            // mid-token instead of letting it overflow.
+            if current > 0 {
+                rows += 1;
+                current = 0;
+            }
+            rows += token_width.div_ceil(width) - 1;
+            continue;
+        }
+        if current + token_width > width {
+            rows += 1;
+            current = token_width;
+        } else {
+            current += token_width;
+        }
+    }
+    rows.try_into().unwrap_or(u16::MAX)
+}
+
+/// Sum of `wrapped_row_count` across every logical (pre-wrap) line — what a
+/// wrapped `Paragraph`'s scroll clamp must bound against instead of a raw
+/// line/row count. `lines` is whatever already-split logical lines the
+/// caller has (YAML's `\n`-delimited lines; Events' one-line-per-event
+/// text), since `Paragraph` wraps each of those independently.
+fn total_wrapped_rows<'a>(lines: impl Iterator<Item = &'a str>, width: u16) -> u16 {
+    let mut total: u32 = 0;
+    for line in lines {
+        total = total.saturating_add(u32::from(wrapped_row_count(line, width)));
+    }
+    total.try_into().unwrap_or(u16::MAX)
+}
+
+/// `total_wrapped_rows` specialised to `EventRow`s: each event is one
+/// logical line (`event_line_text`), so this is what `render_events`'
+/// scroll clamp bounds against — see that function's call site for why
+/// `events.len()` (a row count) was wrong.
+fn events_wrapped_line_count(events: &[EventRow], width: u16) -> u16 {
+    let mut total: u32 = 0;
+    for row in events {
+        total = total.saturating_add(u32::from(wrapped_row_count(&event_line_text(row), width)));
+    }
+    total.try_into().unwrap_or(u16::MAX)
 }
 
 /// Clamp a scroll position to valid bounds for a document.
@@ -860,6 +968,71 @@ mod tests {
         );
     }
 
+    /// Render the Events tab with `events_scroll` set far past any
+    /// reasonable bound and return the rendered buffer as text. Exercises
+    /// `clamp_scroll` itself (a huge scroll value must get pulled back to
+    /// the true last screenful) rather than bypassing it — a test that set
+    /// `events_scroll` directly to some pre-computed "correct" value could
+    /// pass by construction even if the clamp were wrong.
+    fn render_events_scrolled_to_end(events: &[EventRow], w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = HitRegistry::new();
+        let obj = pod_with_status();
+        let mut pane = DetailPane {
+            tab: DetailTab::Events,
+            yaml_scroll: 0,
+            events_scroll: 9999,
+            yaml_cache: None,
+        };
+        term.draw(|f| {
+            let area = f.area();
+            render_detail(f, area, &obj, &mut pane, &mut hits, events, None);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn events_whose_messages_wrap_can_still_all_be_reached() {
+        // Clamping on the ROW count rather than the WRAPPED LINE count makes
+        // later events unreachable at any scroll offset: if the row count
+        // alone fits the viewport, the clamp returns 0 even though the real
+        // (wrapped) content is much taller. Whole events vanish from the one
+        // tab that explains why a pod will not start.
+        //
+        // 10-word messages, not the ~40-word message a first draft of this
+        // test used: at 40 words a single event's own wrapped block is
+        // taller than the 7-row viewport, so no scroll position — not even
+        // a perfectly correct one — can show a *later* event's reason label
+        // at the same time as scrolling to the very end (confirmed against
+        // ratatui's own `Paragraph::line_count` via a throwaway harness
+        // before picking these numbers). 10 words keeps each event's block
+        // shorter than the viewport, so the last event's reason line is
+        // fully within the final screenful once the clamp is correct.
+        let events: Vec<EventRow> = (0..3)
+            .map(|i| EventRow {
+                kind: "Warning".to_string(),
+                reason: format!("Reason{i}"),
+                message: "word ".repeat(10),
+                age: "1m".to_string(),
+                count: 1,
+            })
+            .collect();
+        let text = render_events_scrolled_to_end(&events, 30, 10);
+        assert!(
+            text.contains("Reason2"),
+            "the last event could not be reached by scrolling:\n{text}"
+        );
+    }
+
     #[test]
     fn a_zero_width_pane_does_not_panic() {
         let obj = pod_with_status();
@@ -985,6 +1158,49 @@ mod tests {
             y.lines().filter(|l| l.starts_with("metadata:")).count(),
             1,
             "duplicate top-level metadata key — the fixture is not shaped like a real object:\n{y}"
+        );
+    }
+
+    #[test]
+    fn a_long_unbroken_yaml_value_does_not_hide_the_rest_of_the_document() {
+        // A single very long value with no whitespace to wrap on (a base64
+        // secret, an unbroken annotation) is ONE `\n`-delimited line in the
+        // source text but many WRAPPED screen rows once rendered — the same
+        // gap between "row count" and "wrapped row count" Finding 1 fixed
+        // for the Events tab. `yaml_line_count`-style clamping (counting
+        // `\n`s) would under-clamp the scroll and make the tail of the
+        // document — everything serialized after this value — unreachable.
+        //
+        // Confirmed empirically (scratch harness against
+        // `Paragraph::line_count`, not guessed): this document's 9
+        // `\n`-delimited lines wrap to 24 real screen rows at width 28, so a
+        // `\n`-count-based clamp caps scrolling at `9-7=2`, far short of the
+        // `24-7=17` actually needed to reach the final "status:" line.
+        let obj = object_with_annotation("blob", &"x".repeat(400));
+        let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        let mut hits = HitRegistry::new();
+        let mut pane = DetailPane {
+            tab: DetailTab::Yaml,
+            yaml_scroll: 9999,
+            events_scroll: 0,
+            yaml_cache: None,
+        };
+        term.draw(|f| {
+            let area = f.area();
+            render_detail(f, area, &obj, &mut pane, &mut hits, &[], None);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..10u16 {
+            for x in 0..30u16 {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("status:"),
+            "the tail of the document (after the long value) could not be reached by scrolling:\n{text}"
         );
     }
 

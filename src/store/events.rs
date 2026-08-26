@@ -233,6 +233,42 @@ mod tests {
         assert_eq!(rows[1].kind, "Warning");
     }
 
+    #[test]
+    fn events_with_an_unrecognised_type_are_shown_not_dropped() {
+        // `Event.type_` (C8) is an unconstrained `String`, not an enum of
+        // "Normal"/"Warning" — CRD controllers and `events.k8s.io` events do
+        // send other values (e.g. a Kustomize/Flux-style controller emitting
+        // "Progressing"). Every OTHER fixture in this file sets `type_` to
+        // exactly "Normal" or "Warning", so a mutant that filtered
+        // `event_rows` down to only those two values before mapping would
+        // leave the rest of this suite green — this is the one fixture that
+        // can catch it. A dropped event is the worst failure mode this tab
+        // has: it silently under-reports what happened to the object.
+        let mut untyped = event("Normal", "NoTypeAtAll");
+        untyped.type_ = None;
+        let rows = event_rows(
+            &[
+                event("Normal", "Scheduled"),
+                event("Progressing", "Reconciling"),
+                untyped,
+            ],
+            now(),
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "an unfamiliar type (or no type at all) must not make an event disappear"
+        );
+        assert_eq!(
+            rows[1].kind, "Progressing",
+            "the real type must pass through unchanged, not get coerced to Normal/Warning"
+        );
+        assert_eq!(
+            rows[2].kind, "Normal",
+            "a missing type_ defaults to Normal, same as any other event with no type_"
+        );
+    }
+
     // --- event_rows: age ---
 
     #[test]
