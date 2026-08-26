@@ -867,6 +867,42 @@ fn supervise(
     })
 }
 
+/// Watch a set of sibling tasks, reporting the FIRST one that fails at the
+/// moment it fails.
+///
+/// The `supervise` above does this for a single task; this is its plural, and
+/// the difference is the whole point. `futures::future::join_all` — what this
+/// used to be — yields nothing at all until EVERY future it holds has
+/// completed, and a watch task loops forever by design. With forty of them,
+/// one panicking child was therefore never observed: reporting it had to wait
+/// for the other thirty-nine to stop too, which on a healthy cluster never
+/// happens. The dead kind's `WatchStatus` stayed `Synced` from its last delta,
+/// so the status bar went on reading `live` over a table nothing was updating
+/// — precisely the state this supervision exists to make impossible.
+///
+/// `FuturesUnordered` yields each result as that child finishes, so a panic is
+/// visible immediately whatever its siblings are doing. It does not change
+/// cancellation: the caller holds the `AbortOnDrop` guards, and dropping this
+/// future drops them with it.
+async fn supervise_children(
+    children: Vec<tokio::task::JoinHandle<()>>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut running: futures::stream::FuturesUnordered<_> = children.into_iter().collect();
+    while let Some(result) = running.next().await {
+        match result {
+            Ok(()) => {}
+            // Same reasoning as `supervise`: a cluster switch aborts the
+            // outgoing cluster's watches, and that is a teardown, not a crash.
+            Err(e) if is_deliberate_abort(&e) => {}
+            Err(e) => {
+                let _ = tx.send(AppEvent::Error(join_failure_detail("watch", e)));
+                let _ = tx.send(AppEvent::Quit);
+            }
+        }
+    }
+}
+
 /// The kind list to fall back on when discovery itself fails.
 ///
 /// A cluster we cannot enumerate is still a cluster we can watch pods on —
@@ -980,20 +1016,7 @@ fn spawn_discovery_and_watches(
             children.push(handle);
         }
 
-        // Awaiting them all is what turns a child panic into something
-        // visible, exactly as `supervise` does for a single task: tokio
-        // otherwise swallows it at the `JoinHandle` boundary and the UI keeps
-        // drawing against a store nothing is updating.
-        for result in futures::future::join_all(children).await {
-            match result {
-                Ok(()) => {}
-                Err(e) if is_deliberate_abort(&e) => {}
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(join_failure_detail("watch", e)));
-                    let _ = tx.send(AppEvent::Quit);
-                }
-            }
-        }
+        supervise_children(children, tx).await;
         // Held until here so that cancelling THIS task drops them and cancels
         // the children with it. Dropping a `JoinHandle` only detaches.
         drop(cancel_children);
@@ -2169,6 +2192,53 @@ mod tests {
         assert!(
             matches!(got.get(1), Some(AppEvent::Quit)),
             "a dead watch must end the app rather than draw stale data, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_panicking_watch_is_reported_while_its_siblings_still_run() {
+        // Plan 3 watches up to forty kinds at once, and a watch task loops
+        // forever by design — so "report the failures once they have all
+        // finished" reports nothing, ever. This is the case `join_all` cannot
+        // pass: it yields no results at all until EVERY future completes, so
+        // with a sibling that never returns it hangs here until the timeout
+        // below fires. The panic must be visible while the sibling is still
+        // running, which is the only state a real cluster is ever in.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let forever = tokio::spawn(async { std::future::pending::<()>().await });
+        let doomed = tokio::spawn(async { panic!("watcher exploded") });
+        // Both orders, because `join_all` polls in order and a panic in the
+        // FIRST position could be mistaken for "it works" by a weaker test
+        // that only looked at whether any event arrived.
+        let children = vec![forever, doomed];
+
+        // The supervisor is left running — it must keep watching the sibling,
+        // so it does not return. What is under test is that it EMITS promptly,
+        // which is why the timeout is on the channel rather than on the
+        // supervisor. Under `join_all` nothing is ever sent and this times out.
+        let supervisor = tokio::spawn(supervise_children(children, tx));
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(e)) => got.push(e),
+                Ok(None) => break,
+                Err(_) => panic!(
+                    "a panicking watch was not reported within 5s while a sibling \
+                     still ran; got {got:?}"
+                ),
+            }
+        }
+        supervisor.abort();
+
+        assert!(
+            got.iter()
+                .any(|e| matches!(e, AppEvent::Error(m) if m.contains("watcher exploded"))),
+            "the panic payload must reach the user, got {got:?}"
+        );
+        assert!(
+            got.iter().any(|e| matches!(e, AppEvent::Quit)),
+            "a dead watch must end the app rather than let the bar read `live` \
+             over a table nothing updates. got {got:?}"
         );
     }
 
