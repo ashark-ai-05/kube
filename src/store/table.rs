@@ -103,8 +103,26 @@ pub struct SortState {
 /// holding a `Vec<Vec<String>>` still calls this as `sort_rows(&mut rows,
 /// ...)` unchanged via the usual deref coercion.
 pub fn sort_rows(rows: &mut [Vec<String>], sort: &SortState) {
-    // TODO(Task 6 RED): not yet implemented.
-    let _ = (rows, sort);
+    if rows.iter().any(|row| sort.column >= row.len()) {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        let ordering = compare_cells(&a[sort.column], &b[sort.column]);
+        if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+}
+
+/// Compare two cell values numerically if both parse as `f64`, lexically
+/// otherwise.
+fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
 }
 
 /// Ask the API server to render a resource the way kubectl does.
@@ -246,6 +264,50 @@ mod tests {
     }
 
     #[test]
+    fn sorting_is_stable_across_many_equal_keys_not_just_a_three_row_fixture() {
+        // The 3-row fixture above (one repeated key among 3 rows) does not
+        // actually discriminate a stable sort from an unstable one: Rust's
+        // `sort_unstable_by` falls back to an insertion-sort-like pass on
+        // slices this small, which happens to preserve order for exactly
+        // this input — confirmed empirically before writing this test, by
+        // running the same comparator through `sort_unstable_by` and
+        // observing it still passed. Interleaving a few distinct keys among
+        // a long run of equal ones forces genuine partition/swap work, the
+        // same fixture shape `store::multi::prioritise`'s own stability
+        // test needed for the identical reason.
+        let mut rows: Vec<Vec<String>> = (0..40)
+            .map(|i| vec![format!("row-{i:02}"), "2".to_string()])
+            .collect();
+        rows.insert(5, vec!["low-a".to_string(), "1".to_string()]);
+        rows.insert(15, vec!["high".to_string(), "3".to_string()]);
+        rows.insert(25, vec!["low-b".to_string(), "1".to_string()]);
+
+        let expected_order: Vec<String> = rows
+            .iter()
+            .filter(|r| r[1] == "2")
+            .map(|r| r[0].clone())
+            .collect();
+
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 1,
+                descending: false,
+            },
+        );
+
+        let actual_order: Vec<String> = rows
+            .iter()
+            .filter(|r| r[1] == "2")
+            .map(|r| r[0].clone())
+            .collect();
+        assert_eq!(
+            actual_order, expected_order,
+            "rows sharing a sort key must keep their original relative order"
+        );
+    }
+
+    #[test]
     fn sorting_descending_reverses_the_order() {
         let mut rows = vec![vec!["a".into()], vec!["c".into()], vec!["b".into()]];
         sort_rows(
@@ -272,7 +334,10 @@ mod tests {
                 descending: false,
             },
         );
-        assert_eq!(rows, before, "a ragged CRD table must not panic or scramble");
+        assert_eq!(
+            rows, before,
+            "a ragged CRD table must not panic or scramble"
+        );
     }
 
     #[test]

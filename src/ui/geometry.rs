@@ -32,15 +32,15 @@ pub fn column_offsets(
     column_spacing: u16,
     selection_width: u16,
 ) -> Vec<Rect> {
-    // TODO(Task 6 RED): naive single-stage split, ignores `selection_width`
-    // entirely — the exact bug this function exists to fix.
-    let _ = selection_width;
     if area.width == 0 || area.height == 0 || widths.is_empty() {
         return Vec::new();
     }
+    let [_selection_area, columns_area] =
+        Layout::horizontal([Constraint::Length(selection_width), Constraint::Fill(0)])
+            .areas::<2>(area);
     Layout::horizontal(widths.to_vec())
         .spacing(column_spacing)
-        .split(area)
+        .split(columns_area)
         .to_vec()
 }
 

@@ -56,10 +56,15 @@ impl TableView {
     /// selectable state, matching the common spreadsheet/`kubectl -o wide`
     /// two-state convention rather than inventing a third.
     pub fn toggle_sort(&mut self, column: usize) {
-        // TODO(Task 6 RED): always ascending, ignores the previous state.
-        self.sort = Some(SortState {
-            column,
-            descending: false,
+        self.sort = Some(match self.sort {
+            Some(s) if s.column == column => SortState {
+                column,
+                descending: !s.descending,
+            },
+            _ => SortState {
+                column,
+                descending: false,
+            },
         });
     }
 }
@@ -146,7 +151,9 @@ pub fn render_table_with_data(
     // builtin registry's are upper case ("STATUS") — compared
     // case-insensitively so neither source has to match the other's
     // convention.
-    let status_idx = headers.iter().position(|h| h.eq_ignore_ascii_case("status"));
+    let status_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("status"));
 
     // Objects/rows can shrink between frames (a pod is deleted, or a fresh
     // fetch lands with fewer rows), leaving `selected` past the end. Clamp
@@ -834,7 +841,9 @@ mod tests {
         .unwrap();
 
         let buf = term.backend().buffer();
-        let row2: String = (0..60u16).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        let row2: String = (0..60u16)
+            .map(|x| buf[(x, 2)].symbol().to_string())
+            .collect();
         assert!(
             row2.contains("a-thing"),
             "sorted ascending by column 0, 'a-thing' must be the first data row, got:\n{row2}"

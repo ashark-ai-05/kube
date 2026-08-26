@@ -148,9 +148,10 @@ pub enum ColumnSource {
 /// `table` is `None`. The table must still render something rather than
 /// going blank while it waits.
 pub fn column_source(gvk: &GroupVersionKind, table: Option<TableData>) -> ColumnSource {
-    // TODO(Task 6 RED): ignores `table` entirely.
-    let _ = table;
-    ColumnSource::Builtin(columns_for(gvk))
+    match table {
+        Some(t) => ColumnSource::Server(t),
+        None => ColumnSource::Builtin(columns_for(gvk)),
+    }
 }
 
 #[cfg(test)]
