@@ -321,11 +321,6 @@ fn get_or_cache_yaml(obj: &DynamicObject, pane: &mut DetailPane) -> String {
     yaml
 }
 
-/// A clearly-marked stand-in for tab content this task does not own.
-fn render_placeholder(f: &mut Frame, area: Rect, text: &str) {
-    f.render_widget(Paragraph::new(text).style(theme::muted_style()), area);
-}
-
 /// Render the Events tab: a scrollable list of the object's events
 /// (pre-scoped and pre-formatted upstream by `store::events::fetch_events`/
 /// `event_rows`), or an explanation when the fetch failed.
@@ -343,7 +338,32 @@ fn render_events(
     events_error: Option<&str>,
     pane: &mut DetailPane,
 ) {
-    unimplemented!()
+    use ratatui::widgets::Wrap;
+
+    if let Some(err) = events_error {
+        let paragraph = Paragraph::new(format!("Events unavailable: {err}"))
+            .style(Style::default().fg(theme::CORAL))
+            .wrap(Wrap { trim: false });
+        f.render_widget(paragraph, area);
+        return;
+    }
+
+    if events.is_empty() {
+        f.render_widget(
+            Paragraph::new("No events.").style(theme::muted_style()),
+            area,
+        );
+        return;
+    }
+
+    let lines: Vec<Line> = events.iter().map(event_line).collect();
+    let total_lines: u16 = lines.len().try_into().unwrap_or(u16::MAX);
+    pane.events_scroll = clamp_scroll(pane.events_scroll, total_lines, area.height);
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((pane.events_scroll, 0));
+    f.render_widget(paragraph, area);
 }
 
 /// One Events-tab display line: age, type and reason lead (mirroring
@@ -352,7 +372,20 @@ fn render_events(
 /// no FROM column, since `EventRow` (deliberately) does not carry the
 /// reporting source.
 fn event_line(row: &EventRow) -> Line<'static> {
-    unimplemented!()
+    let style = theme::event_kind_style(&row.kind);
+    let count = if row.count > 1 {
+        format!(" (x{})", row.count)
+    } else {
+        String::new()
+    };
+    let text = format!(
+        "{age:<6} {kind:<7} {reason:<20} {message}{count}",
+        age = row.age,
+        kind = row.kind,
+        reason = row.reason,
+        message = row.message,
+    );
+    Line::styled(text, style)
 }
 
 /// Serialize a DynamicObject to YAML string using serde_norway.
@@ -686,7 +719,8 @@ mod tests {
 
     #[test]
     fn the_events_tab_shows_reason_message_and_repeat_count() {
-        let (text, _) = render_to_string_with_events(DetailTab::Events, 60, 20, &[warning_row()], None);
+        let (text, _) =
+            render_to_string_with_events(DetailTab::Events, 60, 20, &[warning_row()], None);
         assert!(text.contains("BackOff"), "expected the reason:\n{text}");
         assert!(
             text.contains("back-off restarting"),

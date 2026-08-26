@@ -100,7 +100,10 @@ pub fn muted_style() -> Style {
 /// colour (matching `phase_style`'s treatment of failing pod phases) rather
 /// than a chrome token — chrome and signal must never cross.
 pub fn event_kind_style(kind: &str) -> Style {
-    unimplemented!()
+    match kind {
+        "Warning" => Style::default().fg(CORAL),
+        _ => text_style(),
+    }
 }
 
 #[cfg(test)]

@@ -21,11 +21,11 @@
 
 use crate::store::columns::format_age;
 use crate::store::rbac::{WatchFailure, classify_kube_error};
-use anyhow::{Context as _, anyhow};
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Event;
-use kube::api::{Api, ListParams};
 use kube::Client;
+use kube::api::{Api, ListParams};
 
 /// One row the Events tab shows for one object's events, already formatted
 /// for display (age computed, kind/reason/message defaulted for the
@@ -48,7 +48,10 @@ pub struct EventRow {
 /// different (and wrong) query than "don't filter on namespace." So the
 /// term is omitted entirely for `None`, never sent empty.
 pub fn field_selector_for(name: &str, namespace: Option<&str>) -> String {
-    unimplemented!()
+    match namespace {
+        Some(ns) => format!("involvedObject.name={name},involvedObject.namespace={ns}"),
+        None => format!("involvedObject.name={name}"),
+    }
 }
 
 /// Compact age for one event, preferring the most recently-updated
@@ -67,14 +70,36 @@ pub fn field_selector_for(name: &str, namespace: Option<&str>) -> String {
 /// fabricated `"0s"` — a wrong age is worse than an honest unknown here,
 /// since `"0s"` reads as "just happened," the opposite of "we don't know."
 fn event_age(event: &Event, now: DateTime<Utc>) -> String {
-    unimplemented!()
+    let ts = event
+        .event_time
+        .as_ref()
+        .map(|t| t.0)
+        .or_else(|| event.last_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| event.first_timestamp.as_ref().map(|t| t.0));
+
+    match ts {
+        Some(t) => format_age(&format!("{t}"), now),
+        None => "?".to_string(),
+    }
 }
 
 /// Format raw `Event`s into display-ready rows. Pure and synchronous —
 /// callers (the render path) must never do the network fetch themselves;
 /// see `fetch_events`.
 pub fn event_rows(events: &[Event], now: DateTime<Utc>) -> Vec<EventRow> {
-    unimplemented!()
+    events
+        .iter()
+        .map(|e| EventRow {
+            kind: e.type_.clone().unwrap_or_else(|| "Normal".to_string()),
+            reason: e.reason.clone().unwrap_or_default(),
+            message: e.message.clone().unwrap_or_default(),
+            age: event_age(e, now),
+            // Kubernetes omits `count` on a singleton (never-repeated) event
+            // rather than sending 1 explicitly, so an absent count means it
+            // happened once, not zero times.
+            count: e.count.unwrap_or(1),
+        })
+        .collect()
 }
 
 /// Turn a failed events list into an error that says what actually
@@ -84,7 +109,19 @@ pub fn event_rows(events: &[Event], now: DateTime<Utc>) -> Vec<EventRow> {
 /// that check here would be the two-sources-of-truth pattern this project
 /// has already paid for once (see `store::rbac`'s own doc comment).
 fn classify_fetch_error(name: &str, err: kube::Error) -> anyhow::Error {
-    unimplemented!()
+    match classify_kube_error(&err) {
+        WatchFailure::Forbidden { detail } => {
+            anyhow!("events forbidden for {name}: {detail}")
+        }
+        WatchFailure::NotFound { detail } => {
+            anyhow!(
+                "events not found for {name} (it may have been removed from the cluster): {detail}"
+            )
+        }
+        WatchFailure::Retryable => {
+            anyhow::Error::new(err).context(format!("listing events for {name}"))
+        }
+    }
 }
 
 /// Fetch and format the events for one object.
@@ -188,7 +225,10 @@ mod tests {
 
     #[test]
     fn warnings_are_distinguishable_from_normal_events() {
-        let rows = event_rows(&[event("Normal", "Scheduled"), event("Warning", "BackOff")], now());
+        let rows = event_rows(
+            &[event("Normal", "Scheduled"), event("Warning", "BackOff")],
+            now(),
+        );
         assert_eq!(rows[0].kind, "Normal");
         assert_eq!(rows[1].kind, "Warning");
     }
@@ -247,7 +287,10 @@ mod tests {
 
     #[test]
     fn a_forbidden_listing_says_so_explicitly() {
-        let err = classify_fetch_error("web-1", api_kube_error(403, "Forbidden", "events is forbidden"));
+        let err = classify_fetch_error(
+            "web-1",
+            api_kube_error(403, "Forbidden", "events is forbidden"),
+        );
         let msg = err.to_string();
         assert!(
             msg.to_lowercase().contains("forbidden"),
