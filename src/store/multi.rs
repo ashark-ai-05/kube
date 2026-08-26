@@ -83,9 +83,16 @@ fn rank(kind: &str) -> usize {
 ///
 /// This must run before `kinds_to_watch` applies its cap: which kinds
 /// survive the cap is only correct if the important ones are first.
-pub fn prioritise(_kinds: &mut Vec<KindInfo>) {
-    // STUB for the TDD red phase: intentionally a no-op.
-    todo!("TDD stub: prioritise is not implemented yet")
+///
+/// Takes `&mut [KindInfo]` rather than `&mut Vec<KindInfo>` (clippy's
+/// `ptr_arg`: a slice is all sorting needs) — callers holding a
+/// `Vec<KindInfo>` still call this as `prioritise(&mut kinds)` unchanged,
+/// via the usual `&mut Vec<T>` -> `&mut [T]` deref coercion.
+pub fn prioritise(kinds: &mut [KindInfo]) {
+    // `sort_by_key` is documented stable (unlike `sort_unstable_by_key`),
+    // which is what keeps equal-rank (in particular, all-unranked) kinds in
+    // their original relative order.
+    kinds.sort_by_key(|k| rank(&k.gvk.kind));
 }
 
 /// Split `kinds` into those to watch and how many were dropped by the cap.
@@ -99,9 +106,11 @@ pub fn prioritise(_kinds: &mut Vec<KindInfo>) {
 /// sidebar that silently shows 40 of 300 kinds reads as "this cluster has
 /// 40 kinds", and the user has no way to tell the difference from the
 /// truth.
-pub fn kinds_to_watch(_kinds: &[KindInfo], _cap: usize) -> (Vec<&KindInfo>, usize) {
-    // STUB for the TDD red phase: intentionally not implemented yet.
-    todo!("TDD stub: kinds_to_watch is not implemented yet")
+pub fn kinds_to_watch(kinds: &[KindInfo], cap: usize) -> (Vec<&KindInfo>, usize) {
+    let take = kinds.len().min(cap);
+    let watched: Vec<&KindInfo> = kinds.iter().take(take).collect();
+    let skipped = kinds.len() - take;
+    (watched, skipped)
 }
 
 /// Map a classified watch failure onto the per-kind availability the
@@ -115,9 +124,15 @@ pub fn kinds_to_watch(_kinds: &[KindInfo], _cap: usize) -> (Vec<&KindInfo>, usiz
 /// so the kind is `Unavailable` with the apiserver's own detail; `Retryable`
 /// is not a failure of availability at all (the watch is still trying), so
 /// it stays `Watching`.
-pub fn availability_of(_failure: &WatchFailure) -> KindAvailability {
-    // STUB for the TDD red phase: intentionally not implemented yet.
-    todo!("TDD stub: availability_of is not implemented yet")
+pub fn availability_of(failure: &WatchFailure) -> KindAvailability {
+    match failure {
+        WatchFailure::Forbidden { detail } | WatchFailure::NotFound { detail } => {
+            KindAvailability::Unavailable {
+                reason: detail.clone(),
+            }
+        }
+        WatchFailure::Retryable => KindAvailability::Watching,
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +180,10 @@ mod tests {
         let kinds = make_kinds(&(0..100).map(|i| format!("Kind{i}")).collect::<Vec<_>>());
         let (watched, skipped) = kinds_to_watch(&kinds, 40);
         assert_eq!(watched.len(), 40);
-        assert_eq!(skipped, 60, "the count dropped must be reportable to the user");
+        assert_eq!(
+            skipped, 60,
+            "the count dropped must be reportable to the user"
+        );
     }
 
     #[test]
@@ -203,29 +221,49 @@ mod tests {
 
     #[test]
     fn prioritising_is_stable_across_many_unranked_kinds() {
-        // The 3-element stability test above can pass "by accident": small
-        // slices may go through an insertion-sort path that happens to be
-        // stable even under an unstable sort. This fixture is large enough
-        // (comfortably past libstd's small-slice insertion-sort threshold)
-        // that only a genuinely stable sort keeps a long unranked run in
-        // its original order.
-        let mut names: Vec<String> = (0..200).map(|i| format!("Unranked{i:03}")).collect();
-        names.insert(0, "Pod".to_string());
-        let expected_unranked_order: Vec<String> = names[1..].to_vec();
+        // A fixture of ONE ranked kind plus a long run of unranked kinds is
+        // not adversarial enough: to a comparator, an all-equal-key run
+        // already satisfies "sorted", so pdqsort's adaptive run-detection
+        // can skip real partitioning and happen to leave it untouched —
+        // "passing" even under `sort_unstable_by_key`. Genuine partitioning
+        // only kicks in when the array isn't already sorted by the
+        // comparator, so this fixture interleaves several *different* ranks
+        // throughout a long run of same-rank (unranked) kinds, forcing real
+        // quicksort partition/swap work across the whole slice.
+        let mut names: Vec<String> = Vec::new();
+        for (i, ranked) in PRIORITY.iter().enumerate() {
+            names.push(ranked.to_string());
+            for j in 0..15 {
+                names.push(format!("Unranked{i:02}_{j:02}"));
+            }
+        }
+        for j in 0..100 {
+            names.push(format!("Tail{j:03}"));
+        }
+
+        let expected_unranked_order: Vec<String> = names
+            .iter()
+            .filter(|n| !PRIORITY.contains(&n.as_str()))
+            .cloned()
+            .collect();
 
         let mut kinds = make_kinds(&names);
         prioritise(&mut kinds);
 
         let got: Vec<&str> = kinds.iter().map(|k| k.gvk.kind.as_str()).collect();
-        assert_eq!(got[0], "Pod");
         assert_eq!(
-            &got[1..],
+            &got[..PRIORITY.len()],
+            PRIORITY,
+            "ranked kinds must lead, in rank order"
+        );
+        assert_eq!(
+            &got[PRIORITY.len()..],
             expected_unranked_order
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .as_slice(),
-            "a large run of equal-rank (unranked) kinds must keep discovery order"
+            "unranked kinds (all sharing one rank) must keep their original discovery order"
         );
     }
 
