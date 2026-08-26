@@ -53,10 +53,7 @@ impl DetailTab {
     }
 
     fn index(self) -> usize {
-        TAB_ORDER
-            .iter()
-            .position(|t| *t == self)
-            .unwrap_or(0)
+        TAB_ORDER.iter().position(|t| *t == self).unwrap_or(0)
     }
 }
 
@@ -100,9 +97,33 @@ impl DetailPane {
 /// `status` block at all) have neither a node nor a phase. `Name` and `Age`
 /// are the only rows guaranteed to exist for every object.
 pub fn overview_rows(obj: &DynamicObject) -> Vec<(String, String)> {
-    // TODO: implement (Step 4).
-    let _ = obj;
-    Vec::new()
+    let mut rows = Vec::new();
+    rows.push(("Name".to_string(), obj.name_any()));
+
+    if let Some(ns) = obj.metadata.namespace.as_ref() {
+        rows.push(("Namespace".to_string(), ns.clone()));
+    }
+
+    if let Some(node) = obj
+        .data
+        .get("spec")
+        .and_then(|s| s.get("nodeName"))
+        .and_then(|n| n.as_str())
+    {
+        rows.push(("Node".to_string(), node.to_string()));
+    }
+
+    if let Some(phase) = obj
+        .data
+        .get("status")
+        .and_then(|s| s.get("phase"))
+        .and_then(|p| p.as_str())
+    {
+        rows.push(("Status".to_string(), phase.to_string()));
+    }
+
+    rows.push(("Age".to_string(), age_row(obj)));
+    rows
 }
 
 /// `metadata.creationTimestamp` formatted the same compact way the table
@@ -134,9 +155,46 @@ pub fn render_detail(
     pane: &mut DetailPane,
     hits: &mut HitRegistry,
 ) {
-    // TODO: implement (Step 4) — tab bar, close affordance, tab content.
-    let _ = (obj, pane, hits);
+    // Without `Clear`, whatever was drawn earlier in this same frame (the
+    // table beneath) shows through wherever this overlay doesn't explicitly
+    // paint a glyph — the same reasoning `render_picker` documents.
     f.render_widget(Clear, area);
+
+    let title = format!(" {} ", obj.name_any());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border_style())
+        .title(Span::styled(title, theme::header_style()))
+        .style(Style::default().bg(theme::ABYSS));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // A pane dragged to nothing must not panic; there is also nothing left
+    // to draw a tab bar or content into.
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    render_tab_bar(f, inner, pane, hits);
+
+    let content_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(1),
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    if content_area.height == 0 {
+        return;
+    }
+
+    match pane.tab {
+        DetailTab::Overview => render_overview(f, content_area, obj),
+        DetailTab::Yaml => {
+            render_placeholder(f, content_area, "YAML view — implemented in Task 8.")
+        }
+        DetailTab::Events => render_placeholder(f, content_area, "Events — implemented in Task 9."),
+    }
 }
 
 /// The top row of `inner`: tab labels on the left (via `geometry::tab_spans`,
@@ -301,7 +359,10 @@ mod tests {
         let rows = overview_rows(&obj);
         let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
         for expected in ["Name", "Namespace", "Node", "Status", "Age"] {
-            assert!(keys.contains(&expected), "overview missing {expected}: {keys:?}");
+            assert!(
+                keys.contains(&expected),
+                "overview missing {expected}: {keys:?}"
+            );
         }
     }
 
@@ -322,8 +383,14 @@ mod tests {
         let rows = overview_rows(&bare_object("my-config"));
         let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
         assert!(!keys.contains(&"Node"), "a ConfigMap has no node: {keys:?}");
-        assert!(!keys.contains(&"Status"), "a ConfigMap has no status: {keys:?}");
-        assert!(!keys.contains(&"Namespace"), "this fixture set no namespace: {keys:?}");
+        assert!(
+            !keys.contains(&"Status"),
+            "a ConfigMap has no status: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"Namespace"),
+            "this fixture set no namespace: {keys:?}"
+        );
     }
 
     #[test]
@@ -369,6 +436,56 @@ mod tests {
     }
 
     #[test]
+    fn the_divider_between_tabs_is_not_swallowed_into_the_next_tabs_zone() {
+        // `tab_hit_zones_align_with_the_labels_actually_drawn` above checks
+        // that whatever is DRAWN at a coordinate matches whatever is
+        // REGISTERED there — but a local reimplementation using
+        // `.chars().count()` and dropping the divider entirely (`x += w`
+        // with no gap) draws and registers from the very same wrong
+        // coordinates, so draw and hit-zone stay internally consistent with
+        // EACH OTHER while both silently disagree with
+        // `geometry::tab_spans`'s real layout — that alignment test alone
+        // cannot see this. This test instead computes the tab bar's
+        // geometry independently, via the actual shared `tab_spans`
+        // function the module is required to use, and confirms the pixel
+        // immediately after a tab ends (the two-column divider) belongs to
+        // NEITHER tab, not that it silently belongs to the one that follows.
+        let (_, hits) = render_to_string(DetailTab::Overview, 60, 20);
+
+        // `render_detail`'s block border leaves `inner` at (1, 1, 58, 18)
+        // for a 60x20 area (one cell of border on every side — confirmed
+        // against the buffer dump in the task report). `render_tab_bar`
+        // then reserves a 3-wide "[x]" close affordance plus a 1-wide gap
+        // on the right before laying out tabs into what remains.
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: 58,
+            height: 18,
+        };
+        let close_width = 3u16;
+        let gap = 1u16;
+        let tabs_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width - close_width - gap,
+            height: 1,
+        };
+        let expected = tab_spans(&["Overview", "YAML", "Events"], tabs_area, 2);
+        assert_eq!(expected.len(), 3, "sanity: all three tabs must fit");
+
+        for pair in expected.windows(2) {
+            let divider_x = pair[0].x + pair[0].width;
+            assert_eq!(
+                hits.hit(divider_x, inner.y),
+                None,
+                "the divider column right after a tab (x={divider_x}) must not \
+                 belong to the tab that follows it"
+            );
+        }
+    }
+
+    #[test]
     fn the_active_tab_is_visually_distinct() {
         let (a, _) = render_styles(DetailTab::Overview);
         let (b, _) = render_styles(DetailTab::Yaml);
@@ -392,7 +509,10 @@ mod tests {
     #[test]
     fn the_overview_tab_shows_the_active_objects_fields() {
         let (text, _) = render_to_string(DetailTab::Overview, 60, 20);
-        assert!(text.contains("web-1"), "expected the object's name:\n{text}");
+        assert!(
+            text.contains("web-1"),
+            "expected the object's name:\n{text}"
+        );
         assert!(text.contains("node-7"), "expected the node row:\n{text}");
         assert!(text.contains("Running"), "expected the status row:\n{text}");
     }
