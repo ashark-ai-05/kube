@@ -325,23 +325,46 @@ fn append_query_param(uri: &http::Uri, key: &str, value: &str) -> anyhow::Result
 /// cluster before relying on it.
 pub const TABLE_REFETCH_DEBOUNCE: Duration = Duration::from_millis(750);
 
+/// A ceiling on how long a Table can go un-refetched once it is known stale.
+///
+/// `refetch_is_due`'s debounce is trailing-edge only: it fires once a kind
+/// has gone `TABLE_REFETCH_DEBOUNCE` without a further change. A kind whose
+/// watch delivers MORE often than that — a rolling update of a 50-replica
+/// Deployment, with Pod status transitions arriving well under 750ms apart
+/// for minutes — never settles, so it never refetches at all. The status bar
+/// and the sidebar's counts keep ticking (both read live objects, not the
+/// Table), while `column_source` prefers `ColumnSource::Server` once any
+/// fetch has landed — so the entire table BODY, not just its columns,
+/// freezes at whatever snapshot was fetched before the churn started, with
+/// "live" printed next to it the whole time.
+///
+/// This bounds the worst case: once the last successful fetch is this old
+/// AND something has changed since it, a refetch is due regardless of
+/// whether the debounce has settled. Not tuned against a real cluster, same
+/// caveat as `TABLE_REFETCH_DEBOUNCE`.
+pub const MAX_TABLE_STALENESS: Duration = Duration::from_secs(3);
+
 /// Whether a Table refetch is due for a kind, given when the last fetch for
 /// it completed (if ever) and when the watch last reported a change.
 ///
 /// The watch is the trigger, not a poll loop: an idle kind with no changes
-/// costs nothing, because nothing ever calls this for it. Two conditions
-/// both have to hold:
+/// costs nothing, because nothing ever calls this for it. Fires when EITHER:
 ///
-/// - **Something changed since the last fetch.** `last_fetch` predating
-///   `last_change` (or not existing at all) means the fetch on hand is
-///   stale; a `last_fetch` at or after `last_change` means it already
-///   reflects everything observed so far, so refetching would just repeat
-///   the same request — this is what keeps a fairly static namespace from
-///   being refetched merely because time passed.
-/// - **The change has settled.** `now` must be at least `debounce` past
-///   `last_change`, so a burst of deltas (a rollout touching fifty pods)
-///   collapses into one refetch after the burst quiets down, not one per
-///   delta.
+/// - **Something changed since the last fetch, and the change has
+///   settled.** `last_fetch` predating `last_change` (or not existing at
+///   all) means the fetch on hand is stale; `now` must then be at least
+///   `debounce` past `last_change`, so a burst of deltas (a rollout
+///   touching fifty pods) collapses into one refetch after the burst
+///   quiets down, not one per delta. A `last_fetch` at or after
+///   `last_change` means it already reflects everything observed so far,
+///   so refetching would just repeat the same request — this is what keeps
+///   a fairly static namespace from being refetched merely because time
+///   passed.
+/// - **The last fetch is older than `MAX_TABLE_STALENESS`, and something
+///   has changed since it.** This is the ceiling: a kind changing faster
+///   than `debounce` never satisfies the settle condition above, so without
+///   this it would never refetch at all — see `MAX_TABLE_STALENESS`'s own
+///   doc comment.
 ///
 /// `now` is a parameter rather than read from the clock internally so this
 /// stays a pure function callers can test against fixed instants.
@@ -355,7 +378,14 @@ pub fn refetch_is_due(
         None => true,
         Some(t) => t < last_change,
     };
-    fetch_is_stale && now.saturating_duration_since(last_change) >= debounce
+    if !fetch_is_stale {
+        return false;
+    }
+    let settled = now.saturating_duration_since(last_change) >= debounce;
+    let ceiling_exceeded = last_fetch
+        .map(|t| now.saturating_duration_since(t) >= MAX_TABLE_STALENESS)
+        .unwrap_or(false);
+    settled || ceiling_exceeded
 }
 
 #[cfg(test)]
@@ -835,6 +865,51 @@ mod tests {
         let now = instant_plus(base, 50 + 200);
         assert!(!refetch_is_due(
             Some(last_fetch),
+            last_change,
+            now,
+            Duration::from_millis(750)
+        ));
+    }
+
+    #[test]
+    fn sustained_churn_faster_than_the_debounce_still_refetches_via_the_ceiling() {
+        // A rolling update: something changes every 100ms, forever — never
+        // settling for a full 750ms debounce window. Without
+        // `MAX_TABLE_STALENESS` this never fires: `now` is checked exactly
+        // when each change lands, so `now - last_change` is always ~0 and
+        // the settle condition never holds. Simulated for 5 real seconds of
+        // churn (50 ticks) so this fails loudly if the ceiling is ever
+        // widened past that.
+        let base = Instant::now();
+        let mut last_fetch: Option<Instant> = Some(base);
+        let mut fired = false;
+        for tick in 1..=50u64 {
+            let now = instant_plus(base, tick * 100);
+            let last_change = now; // a fresh change lands right as we check
+            if refetch_is_due(last_fetch, last_change, now, Duration::from_millis(750)) {
+                fired = true;
+                last_fetch = Some(now);
+            }
+        }
+        assert!(
+            fired,
+            "a kind changing every 100ms for 5 seconds must eventually \
+             refetch — otherwise the table body freezes for the entire \
+             rollout while the status bar keeps reporting 'live'"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_does_not_fire_early_for_a_fast_but_short_burst() {
+        // A burst that only lasts a second or two, well under the 3s
+        // ceiling, must still wait for the ordinary debounce — the ceiling
+        // is a backstop for SUSTAINED churn, not a second, shorter debounce.
+        let base = Instant::now();
+        let last_fetch = Some(base);
+        let last_change = instant_plus(base, 1_500); // 1.5s of churn so far
+        let now = last_change; // checked immediately, debounce not settled
+        assert!(!refetch_is_due(
+            last_fetch,
             last_change,
             now,
             Duration::from_millis(750)
