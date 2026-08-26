@@ -31,14 +31,27 @@ pub enum WatchFailure {
 /// the user actually has access to. The former is the safer direction.
 pub fn classify(err: &watcher::Error) -> WatchFailure {
     match err {
-        watcher::Error::InitialListFailed(kube::Error::Api(status))
-        | watcher::Error::WatchStartFailed(kube::Error::Api(status))
-        | watcher::Error::WatchFailed(kube::Error::Api(status)) => classify_status(status),
+        watcher::Error::InitialListFailed(e)
+        | watcher::Error::WatchStartFailed(e)
+        | watcher::Error::WatchFailed(e) => classify_kube_error(e),
         watcher::Error::WatchError(status) => classify_status(status),
-        watcher::Error::InitialListFailed(_)
-        | watcher::Error::WatchStartFailed(_)
-        | watcher::Error::WatchFailed(_)
-        | watcher::Error::NoResourceVersion => WatchFailure::Retryable,
+        watcher::Error::NoResourceVersion => WatchFailure::Retryable,
+    }
+}
+
+/// Classify a bare `kube::Error` the same way `classify` does for one
+/// wrapped inside a `watcher::Error`.
+///
+/// Pulled out so a caller that isn't watching anything — `cluster::namespaces`
+/// lists namespaces with a single `Api::list`, not a watch — can tell a
+/// permanent 403 from a transient failure through the SAME logic `classify`
+/// uses, rather than a second copy of "unwrap into `kube::Error::Api(Status)`
+/// and check the code". Two copies of that check are exactly the
+/// two-sources-of-truth pattern earlier reviews of this project flagged.
+pub fn classify_kube_error(err: &kube::Error) -> WatchFailure {
+    match err {
+        kube::Error::Api(status) => classify_status(status),
+        _ => WatchFailure::Retryable,
     }
 }
 
@@ -166,6 +179,34 @@ mod tests {
     fn no_resource_version_is_retryable() {
         assert_eq!(
             classify(&watcher::Error::NoResourceVersion),
+            WatchFailure::Retryable
+        );
+    }
+
+    // --- classify_kube_error: the same logic, for a caller with no watcher::Error to unwrap ---
+
+    #[test]
+    fn classify_kube_error_recognises_a_bare_403() {
+        // `cluster::namespaces::list_namespaces` calls `Api::list` directly —
+        // there is no `watcher::Error` to unwrap, so this is what it classifies
+        // against instead. Must agree with `classify`'s own 403 handling.
+        let err = api_error(403, "Forbidden", "namespaces is forbidden");
+        assert!(matches!(
+            classify_kube_error(&err),
+            WatchFailure::Forbidden { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_kube_error_leaves_a_500_retryable() {
+        let err = api_error(500, "InternalError", "etcdserver: request timed out");
+        assert_eq!(classify_kube_error(&err), WatchFailure::Retryable);
+    }
+
+    #[test]
+    fn classify_kube_error_leaves_a_transport_error_retryable() {
+        assert_eq!(
+            classify_kube_error(&transport_error()),
             WatchFailure::Retryable
         );
     }

@@ -1,5 +1,5 @@
 use crate::app::event::AppEvent;
-use crate::cluster::{ClusterId, ClusterRegistry, ConnectionState};
+use crate::cluster::{ClusterId, ClusterRegistry, ConnectionState, NamespaceListError};
 use crate::store::handles::WatchHandles;
 use crate::store::watch::{ResourceStore, SharedStore};
 use kube::Client;
@@ -66,6 +66,18 @@ pub struct Session {
     /// picked a namespace" unrepresentable rather than something each call
     /// site has to remember to reset.
     pub namespace_is_fallback: bool,
+    /// The last answer to "what namespaces does the API say exist", if any
+    /// fetch has completed. `None` until the namespace picker has been
+    /// opened at least once (see `main.rs`, which spawns the fetch when it
+    /// opens and delivers the result back through `AppEvent`).
+    ///
+    /// Lives here, under the same lock as `client`/`namespace`, rather than
+    /// in a local the event loop threads through frames on its own — a
+    /// second place to keep this in sync with a cluster switch (which must
+    /// invalidate a listing fetched against the PREVIOUS cluster) is exactly
+    /// the two-sources-of-truth shape earlier reviews of this project
+    /// flagged for `client` and `namespace` themselves.
+    pub namespaces_from_api: Option<Result<Vec<String>, NamespaceListError>>,
     /// Bumped by every switch so a slow connect that has been superseded can
     /// tell it is stale and stand down.
     pub generation: u64,
@@ -96,6 +108,7 @@ impl Session {
             client,
             namespace,
             namespace_is_fallback,
+            namespaces_from_api: None,
             generation: 0,
             pending: HashMap::new(),
         }
@@ -235,6 +248,14 @@ pub async fn switch_cluster<C, F, W>(
             // to default" hint from startup no longer applies.
             s.namespace = namespace.clone();
             s.namespace_is_fallback = false;
+
+            // A namespace listing fetched against the OUTGOING cluster names
+            // namespaces that may not even exist on this one. Clearing it
+            // rather than carrying it over is what makes "picker shows a
+            // stale cluster's namespaces after a switch" unrepresentable,
+            // the same reasoning `client` and `namespace` are replaced
+            // wholesale for above rather than patched in place.
+            s.namespaces_from_api = None;
 
             // 6. Watch the store minted just above — never the one the previous
             //    cluster's watches were writing into.
@@ -1139,6 +1160,33 @@ mod tests {
             session.lock().await.namespace.as_deref(),
             Some("payments"),
             "prod is still on screen, so prod's scope must still be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_clears_a_namespace_listing_fetched_against_the_previous_cluster() {
+        // A namespace list fetched against prod names namespaces that may
+        // not exist on dev at all. Carrying it over would let the picker
+        // offer (or silently accept) a name that is valid nowhere near the
+        // cluster the user just switched to.
+        let session = session_scoped_to(Some("payments"), false);
+        session.lock().await.namespaces_from_api = Some(Ok(vec!["payments".to_string()]));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None,
+            tx,
+            || async { Ok(offline_client()) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+
+        assert_eq!(
+            session.lock().await.namespaces_from_api,
+            None,
+            "a switch must not carry the previous cluster's namespace listing forward"
         );
     }
 
