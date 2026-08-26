@@ -78,14 +78,18 @@ fn cluster_picker_items(entries: &[ClusterEntry]) -> Vec<PickerItem> {
 /// Neither source is trusted over the other; the union is what the picker
 /// offers.
 fn merge_namespace_names<'a>(
-    _api: Option<&'a [String]>,
+    api: Option<&'a [String]>,
     loaded: impl Iterator<Item = &'a str>,
-    _current: Option<&'a str>,
+    current: Option<&'a str>,
 ) -> Vec<String> {
-    // STUB (failing-tests commit): uses only the loaded-objects source,
-    // ignoring the API listing and the current namespace entirely. Real
-    // implementation lands in the next commit.
-    let names: BTreeSet<&str> = loaded.collect();
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    if let Some(api) = api {
+        names.extend(api.iter().map(String::as_str));
+    }
+    names.extend(loaded);
+    if let Some(c) = current {
+        names.insert(c);
+    }
     names.into_iter().map(str::to_string).collect()
 }
 
@@ -112,13 +116,9 @@ fn namespace_picker_items(
         .filter_map(|o| o.metadata.namespace.clone())
         .collect();
 
-    // STUB (failing-tests commit): an `Err` (including Forbidden) is treated
-    // exactly like "nothing fetched yet" — no explanation is ever shown, so
-    // a forbidden listing looks identical to one nobody has asked for. Real
-    // implementation lands in the next commit.
     let (api_list, forbidden_note): (Option<&[String]>, Option<String>) = match api_namespaces {
         Some(Ok(list)) => (Some(list.as_slice()), None),
-        Some(Err(_)) => (None, None),
+        Some(Err(e)) => (None, Some(e.explanation())),
         None => (None, None),
     };
 
@@ -257,22 +257,28 @@ enum PickerOutcome {
 /// listing namespaces (like listing pods) is forbidden — see
 /// `namespace_picker_items`'s doc comment for the other half of that fix.
 fn resolve_confirm(overlay: &Overlay, index: Option<usize>) -> PickerOutcome {
-    // STUB (failing-tests commit): always treats the picker's typed filter as
-    // the answer, even when it matches an existing item — the exact
-    // regression the "existing behaviour must not regress" test guards
-    // against — and never resolves a cluster picker choice at all. Real
-    // implementation lands in the next commit.
-    let _ = index;
+    let Some(i) = index else {
+        return PickerOutcome::NoOp;
+    };
     match overlay {
-        Overlay::None | Overlay::ClusterPicker(_) => PickerOutcome::NoOp,
-        Overlay::NamespacePicker(p) => {
-            let typed = p.filter.trim();
-            if typed.is_empty() {
-                PickerOutcome::NoOp
-            } else {
-                PickerOutcome::NamespaceChosen(Some(typed.to_string()))
+        Overlay::None => PickerOutcome::NoOp,
+        Overlay::ClusterPicker(p) => match resolve_picker_choice(p, i) {
+            Some(label) => PickerOutcome::ClusterChosen(label),
+            None => PickerOutcome::NoOp,
+        },
+        Overlay::NamespacePicker(p) => match resolve_picker_choice(p, i) {
+            Some(label) => PickerOutcome::NamespaceChosen(namespace_choice_from_label(&label)),
+            None => {
+                let typed = p.filter.trim();
+                if typed.is_empty() {
+                    PickerOutcome::NoOp
+                } else if is_valid_namespace_name(typed) {
+                    PickerOutcome::NamespaceChosen(Some(typed.to_string()))
+                } else {
+                    PickerOutcome::InvalidNamespaceTyped(typed.to_string())
+                }
             }
-        }
+        },
     }
 }
 

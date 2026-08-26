@@ -87,6 +87,16 @@ pub fn status_for_failure_count(consecutive_errors: u32) -> WatchStatus {
 /// (`-n <namespace>` or the `n` picker); a watch that was already
 /// namespace-scoped and still got denied has no such escape hatch — the
 /// user lacks access to that namespace, full stop.
+///
+/// "press n to pick one" was, before `cluster::namespaces` existed, a claim
+/// the picker could not always back up: it was built only from namespaces
+/// already seen in loaded objects, so on exactly the cluster this message
+/// fires for (0 pods loaded, forbidden at cluster scope) it opened empty.
+/// It is checked true again now for both of the picker's own failure modes —
+/// when listing namespaces is itself forbidden the picker says so and still
+/// accepts a typed name (`main.rs`'s `resolve_confirm`), which needs no
+/// listing permission at all — so the wording did not need to change, only
+/// the picker underneath it.
 pub fn forbidden_message(kind_plural: &str, namespace: Option<&str>, detail: &str) -> String {
     match namespace {
         None => format!(
@@ -353,6 +363,19 @@ mod tests {
             msg.contains("access denied"),
             "the apiserver's own reason should still be included; got {msg}"
         );
+    }
+
+    #[test]
+    fn the_cluster_scope_remedy_actually_offers_pressing_n() {
+        // This message tells the user to press `n`. That claim is only
+        // honest if doing so offers something — before `cluster::namespaces`
+        // existed, the picker was built solely from namespaces already seen
+        // in loaded objects, so on exactly this cluster (0 pods loaded,
+        // forbidden at cluster scope) it opened empty. Pinning the exact
+        // wording here so a future edit to this string is forced to reckon
+        // with whether the picker it points at can still back it up.
+        let msg = forbidden_message("pods", None, "pods is forbidden");
+        assert!(msg.contains("press n to pick one"), "got {msg}");
     }
 
     #[test]

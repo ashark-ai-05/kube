@@ -56,12 +56,23 @@ pub async fn list_namespaces(client: &Client) -> Result<Vec<String>, NamespaceLi
 /// constructible by hand, and a `kube::Error::Api` is built the same way
 /// `store::rbac`'s own tests build one.
 fn classify_list_result(
-    _result: kube::Result<ObjectList<Namespace>>,
+    result: kube::Result<ObjectList<Namespace>>,
 ) -> Result<Vec<String>, NamespaceListError> {
-    // STUB (failing-tests commit): ignores the argument entirely, so neither
-    // a successful list nor a 403 is reported correctly yet. Real
-    // implementation lands in the next commit.
-    Ok(Vec::new())
+    match result {
+        Ok(list) => {
+            let mut names: Vec<String> = list
+                .items
+                .into_iter()
+                .filter_map(|ns| ns.metadata.name)
+                .collect();
+            names.sort();
+            Ok(names)
+        }
+        Err(e) => match classify_kube_error(&e) {
+            WatchFailure::Forbidden { detail } => Err(NamespaceListError::Forbidden(detail)),
+            _ => Err(NamespaceListError::Other(e.to_string())),
+        },
+    }
 }
 
 /// Whether `name` could be a valid Kubernetes namespace name: a DNS-1123
@@ -72,11 +83,16 @@ fn classify_list_result(
 /// anything typed, so a name that could never be valid is rejected locally
 /// rather than spent on a request that is certain to fail with an apiserver
 /// validation error.
-pub fn is_valid_namespace_name(_name: &str) -> bool {
-    // STUB (failing-tests commit): accepts everything, including exactly the
-    // shapes the type-to-enter guard must reject. Real implementation lands
-    // in the next commit.
-    true
+pub fn is_valid_namespace_name(name: &str) -> bool {
+    let len = name.chars().count();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[cfg(test)]

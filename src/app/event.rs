@@ -75,10 +75,7 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
                 statuses.insert(gvk, status);
             }
             AppEvent::Session(s) => out.session_events.push(s),
-            // STUB (failing-tests commit): dropped rather than recorded, so
-            // the picker never learns a fetch answered. Real implementation
-            // lands in the next commit.
-            AppEvent::NamespacesListed(_) => {}
+            AppEvent::NamespacesListed(r) => out.namespace_list = Some(r),
             AppEvent::Error(e) => out.errors.push(e),
             AppEvent::Quit => out.quit = true,
         }
