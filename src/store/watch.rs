@@ -174,6 +174,53 @@ impl ResourceStore {
 
 pub type SharedStore = Arc<RwLock<ResourceStore>>;
 
+/// Identifies a particular `SharedStore` instance, comparable and
+/// clonable — unlike a `SharedStore` itself, which cannot implement `Debug`
+/// (`ResourceStore` implements neither) and so cannot travel through
+/// `AppEvent` directly.
+///
+/// Wraps a CLONE of the `SharedStore` `Arc` rather than a bare pointer
+/// address taken with `Arc::as_ptr`. A bare address is not a safe identity
+/// here: `switch_cluster`/`restart_watch` drop the outgoing store, and once
+/// nothing else references that allocation the global allocator is free to
+/// hand its exact address to the very next `Arc::new` of the same
+/// layout — which `ResourceStore::new()` (called by both of them, on every
+/// switch) is. Confirmed empirically: two back-to-back `Arc::new(RwLock::
+/// new(ResourceStore::new()))` calls with nothing else keeping the first
+/// alive produced the SAME address, so two `StoreId`s built that way
+/// compared equal despite naming different clusters. Holding a clone keeps
+/// each allocation alive for as long as any `StoreId` referencing it
+/// survives, which is what makes two `StoreId`s that were ever unequal
+/// GUARANTEED to stay unequal — the property `Arc::ptr_eq` gives
+/// `spawn_discovery_and_watches`'s own staleness check, which compares two
+/// live `Arc`s directly rather than a value that outlives one of them.
+#[derive(Clone)]
+pub struct StoreId(SharedStore);
+
+impl StoreId {
+    pub fn of(store: &SharedStore) -> Self {
+        StoreId(store.clone())
+    }
+}
+
+impl PartialEq for StoreId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoreId {}
+
+impl std::fmt::Debug for StoreId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ResourceStore` implements neither `Debug` nor anything else safe
+        // to print without an async lock acquisition, which `Debug::fmt`
+        // cannot perform. The address is enough to tell two `StoreId`s
+        // apart in a log without touching the guarded store.
+        write!(f, "StoreId({:p})", Arc::as_ptr(&self.0))
+    }
+}
+
 /// Threshold: a watch that fails this many times in a row is likely RBAC denial,
 /// not a transient network blip. Escalate to Failed so the UI can show "unavailable"
 /// instead of permanent "reconnecting".

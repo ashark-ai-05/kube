@@ -25,7 +25,7 @@ use kube_tui::store::table::{
     SortState, TABLE_REFETCH_DEBOUNCE, TableData, fetch_table, refetch_is_due, row_identity,
     sort_table_rows, sorted_indices,
 };
-use kube_tui::store::watch::spawn_watch;
+use kube_tui::store::watch::{StoreId, spawn_watch};
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
 use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
@@ -738,12 +738,20 @@ fn is_double_click(previous: Option<(usize, Instant)>, row: usize, now: Instant)
 ///
 /// Events live here, beside the identity they belong to, rather than in a
 /// `Vec<EventRow>` of their own next to an `Option<DetailPane>`. That is what
-/// makes them unable to go stale: a fetch reply carries the identity it was
-/// issued for (`app::event::FetchedEvents`) and is applied only if it matches
-/// the identity in THIS struct, so a reply that arrives after the user has
-/// moved the pane to another object — or closed it — is dropped rather than
-/// displayed. Two parallel fields could be written independently; one struct
-/// cannot be.
+/// makes them unable to go stale WITHIN a cluster: a fetch reply carries the
+/// identity it was issued for (`app::event::FetchedEvents`) and is applied
+/// only if it matches the identity in THIS struct, so a reply that arrives
+/// after the user has moved the pane to another object — or closed it — is
+/// dropped rather than displayed. Two parallel fields could be written
+/// independently; one struct cannot be.
+///
+/// `store` extends that same guarantee ACROSS a cluster switch or namespace
+/// change: (gvk, namespace, name) alone is not a cluster-wide identity — a
+/// StatefulSet in one cluster and a Pod in another routinely share a
+/// namespace and a name — so the event loop closes this pane outright the
+/// moment its `store` no longer matches the session's current one, rather
+/// than leaving it open on whatever object happens to coincide in the store
+/// that replaced it. See `events_reply_applies`.
 ///
 /// The object itself is deliberately NOT stored: it is re-resolved from the
 /// live object list every frame (`find_object`), so the YAML and Overview
@@ -752,6 +760,7 @@ struct OpenDetail {
     gvk: GroupVersionKind,
     namespace: Option<String>,
     name: String,
+    store: StoreId,
     events: Vec<EventRow>,
     events_error: Option<String>,
 }
@@ -761,10 +770,41 @@ impl OpenDetail {
     ///
     /// All three parts are compared. A name alone is not an identity: the
     /// same name exists in every namespace, and a Deployment and its Pods
-    /// routinely share one.
+    /// routinely share one. Does NOT compare `store` — callers that need
+    /// this scoped to the current cluster/session use
+    /// `events_reply_applies`, which does.
     fn is_for(&self, gvk: &GroupVersionKind, namespace: Option<&str>, name: &str) -> bool {
         self.gvk == *gvk && self.namespace.as_deref() == namespace && self.name == name
     }
+}
+
+/// Whether a completed events fetch should be applied to the currently open
+/// detail pane.
+///
+/// `OpenDetail::is_for` alone answers "same kind, namespace and name" — true
+/// within a cluster, but not across one: a StatefulSet in a different
+/// cluster (or a different namespace scope of the same cluster) can share a
+/// Pod's namespace and name. `store` scopes the comparison to the exact
+/// `SharedStore` instance the pane is open against — which the event loop
+/// keeps in sync by closing the pane outright whenever a switch replaces the
+/// store out from under it — so a reply issued before a switch can never be
+/// mistaken for one belonging to a pane opened after it, even when both name
+/// the same object.
+fn events_reply_applies(open: &OpenDetail, fetched: &FetchedEvents) -> bool {
+    open.store == fetched.store
+        && open.is_for(&fetched.gvk, fetched.namespace.as_deref(), &fetched.name)
+}
+
+/// Whether a completed namespace listing should be written into the session.
+///
+/// A listing carries no object identity to compare (see `AppEvent::
+/// NamespacesListed`'s doc comment) — only the store it was fetched against.
+/// Written out as its own named predicate, rather than inlined as a bare
+/// `==` at the one call site, for the same reason `events_reply_applies` is:
+/// a guard worth stating explicitly is worth being able to test without
+/// spinning up the whole event loop.
+fn namespace_listing_applies(current_store: StoreId, fetched_store: StoreId) -> bool {
+    current_store == fetched_store
 }
 
 /// Everything a frame draws that is read-only for the duration of the draw.
@@ -1118,13 +1158,17 @@ fn spawn_table_fetch(
 
 /// Fetch one object's events for the detail pane.
 ///
-/// The reply carries the identity it was issued for so the loop can drop it
-/// if the pane has moved on — see `app::event::FetchedEvents`.
+/// The reply carries the identity it was issued for — including `store`, the
+/// `SharedStore` the pane was open against when the fetch was spawned — so
+/// the loop can drop it if the pane has moved on, WITHIN a cluster
+/// (`OpenDetail::is_for`) or across one (`events_reply_applies`). See
+/// `app::event::FetchedEvents`.
 fn spawn_events_fetch(
     client: Client,
     gvk: GroupVersionKind,
     namespace: Option<String>,
     name: String,
+    store: StoreId,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
@@ -1135,6 +1179,7 @@ fn spawn_events_fetch(
             gvk,
             namespace,
             name,
+            store,
             result,
         }));
     });
@@ -1155,6 +1200,7 @@ fn open_detail(
     active_kind: &GroupVersionKind,
     view: &TableView,
     client: &Client,
+    store: StoreId,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some((namespace, name)) = selected_object(
@@ -1175,6 +1221,7 @@ fn open_detail(
         gvk: active_kind.clone(),
         namespace: namespace.clone(),
         name: name.clone(),
+        store: store.clone(),
         events: Vec::new(),
         events_error: None,
     });
@@ -1183,6 +1230,7 @@ fn open_detail(
         active_kind.clone(),
         namespace,
         name,
+        store,
         tx.clone(),
     );
 }
@@ -1210,6 +1258,7 @@ fn refresh_events_if_needed(
         open.gvk.clone(),
         open.namespace.clone(),
         open.name.clone(),
+        open.store.clone(),
         tx.clone(),
     );
 }
@@ -1562,9 +1611,22 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // why this must not live in a local the event loop threads through
         // frames on its own. Done BEFORE the snapshot read just below, so an
         // answer that arrives in this batch is what that read actually sees.
-        if let Some(result) = batch.namespace_list.clone() {
-            session.lock().await.namespaces_from_api = Some(result);
-            needs_redraw = true;
+        //
+        // Applied only if the store it was fetched against still matches
+        // the session's CURRENT one — checked inside the same lock
+        // acquisition as the write, the same idiom
+        // `spawn_discovery_and_watches` uses via `Arc::ptr_eq`. Without
+        // this, a listing fetched against prod and answered after a switch
+        // to dev reinstalls itself into `namespaces_from_api` after the
+        // very switch that cleared it (`switch_cluster`/`restart_watch`
+        // both set it to `None`), and picking a namespace from it then
+        // scopes dev's watch to a namespace that may not exist there.
+        if let Some((store_id, result)) = batch.namespace_list.clone() {
+            let mut s = session.lock().await;
+            if namespace_listing_applies(StoreId::of(&s.store), store_id) {
+                s.namespaces_from_api = Some(result);
+                needs_redraw = true;
+            }
         }
 
         // A cluster switch REPLACES the store and changes which cluster is
@@ -1606,6 +1668,19 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
+
+        // `switch_cluster`/`restart_watch` never reuse a store — a switch
+        // mints a fresh one even when reconnecting to the SAME cluster. An
+        // `OpenDetail` whose store no longer matches the one just read
+        // belongs to a cluster or scope nobody is looking at any more, so it
+        // is closed here rather than left open on whatever object happens to
+        // share its (gvk, namespace, name) in the store that replaced it —
+        // see `events_reply_applies` for why that coincidence matters.
+        if let Some(open) = &detail
+            && open.store != StoreId::of(&store)
+        {
+            detail = None;
+        }
 
         // Store changes only redraw the table body when they name the kind
         // actually on screen — see `table_body_is_dirty`.
@@ -1651,11 +1726,13 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         last_counts = record_counts(&kinds, &snapshot.kind_facts);
 
         // Apply any events that came back, but only to the object they were
-        // fetched for. A reply for an object the pane has moved off is
-        // dropped here rather than shown under this one's name.
+        // fetched for AND the store it was fetched against — a reply for an
+        // object the pane has moved off, or one issued before a cluster
+        // switch, is dropped here rather than shown under this one's name.
+        // See `events_reply_applies`.
         for fetched in &batch.events_fetched {
             if let Some(open) = detail.as_mut()
-                && open.is_for(&fetched.gvk, fetched.namespace.as_deref(), &fetched.name)
+                && events_reply_applies(open, fetched)
             {
                 match &fetched.result {
                     Ok(rows) => {
@@ -1750,6 +1827,14 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
 
         let mut quit = false;
+        // What this pass has ACTUALLY written as the active kind so far,
+        // distinct from `active_kind` (read once, before any input in this
+        // batch was processed). Two sidebar clicks queued in the same
+        // batch — the second picking the kind the pass STARTED on — must
+        // compare against what the first one just wrote, not the stale
+        // top-of-loop snapshot, or the second looks like "already active"
+        // and silently does nothing.
+        let mut active_kind_now = active_kind.clone();
         for input in &batch.inputs {
             // A resize changes the layout but produces no action, so it has to
             // arm the redraw itself.
@@ -1795,6 +1880,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             &active_kind,
                             &view,
                             &client,
+                            StoreId::of(&store),
                             &tx,
                         );
                         // Cleared so a third click is a fresh first click
@@ -1849,22 +1935,54 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             let row = tree.selected;
                             tree.toggle(row);
                         }
-                        Some(gvk) if gvk != active_kind => {
-                            session.lock().await.active_kind = gvk;
-                            // The table is about to show a different kind
-                            // with different columns, so nothing about the
-                            // old one survives: not the selection, not the
-                            // sort (column 3 of Pods is not column 3 of
-                            // ConfigMaps), and not a detail pane opened on an
-                            // object of the previous kind.
-                            view.selected = 0;
-                            view.offset = 0;
-                            view.sort = None;
-                            detail = None;
-                            // The new kind's columns have never been fetched,
-                            // and its watch may be perfectly quiet — so
-                            // nothing else would wake this loop to notice.
-                            let _ = tx.send(AppEvent::Wake);
+                        Some(gvk) if gvk != active_kind_now => {
+                            let switched = {
+                                let mut s = session.lock().await;
+                                // Discovery can replace `s.kinds` between
+                                // this pass's snapshot (read at the top of
+                                // the loop, into the local `kinds`) and this
+                                // write — a switch racing this very click,
+                                // or a fresh discovery landing mid-batch.
+                                // Writing a kind the CURRENT session no
+                                // longer knows about would point the table
+                                // at a kind this cluster may not even have.
+                                if s.kinds.iter().any(|k| k.gvk == gvk) {
+                                    s.active_kind = gvk.clone();
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if switched {
+                                // The table is about to show a different
+                                // kind with different columns, so nothing
+                                // about the old one survives: not the
+                                // selection, not the sort (column 3 of Pods
+                                // is not column 3 of ConfigMaps), not a
+                                // detail pane opened on an object of the
+                                // previous kind, and not a pending
+                                // double-click — a `last_click` surviving
+                                // the switch would let a click on the NEW
+                                // kind's row 2, following one on the OLD
+                                // kind's row 2 within the double-click
+                                // window, register as a double-click on a
+                                // row the user never clicked twice.
+                                view.selected = 0;
+                                view.offset = 0;
+                                view.sort = None;
+                                detail = None;
+                                last_click = None;
+                                // What later inputs in THIS batch compare
+                                // against, so a second sidebar click sees
+                                // what was just written here rather than
+                                // the stale top-of-loop snapshot.
+                                active_kind_now = gvk;
+                                // The new kind's columns have never been
+                                // fetched, and its watch may be perfectly
+                                // quiet — so nothing else would wake this
+                                // loop to notice.
+                                let _ = tx.send(AppEvent::Wake);
+                            }
                         }
                         Some(_) => {}
                     }
@@ -1879,6 +1997,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         &active_kind,
                         &view,
                         &client,
+                        StoreId::of(&store),
                         &tx,
                     );
                     needs_redraw = true;
@@ -1935,10 +2054,14 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         scroll: 0,
                     });
                     let fetch_client = client.clone();
+                    let fetch_store = StoreId::of(&store);
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
                         let result = list_namespaces(&fetch_client).await;
-                        let _ = tx2.send(AppEvent::NamespacesListed(result));
+                        let _ = tx2.send(AppEvent::NamespacesListed {
+                            store: fetch_store,
+                            result,
+                        });
                     });
                     needs_redraw = true;
                 }
@@ -4249,19 +4372,40 @@ mod tests {
 
         // --- events cannot be shown under the wrong object ---
 
-        fn open_on(name: &str) -> OpenDetail {
+        fn a_store() -> SharedStore {
+            Arc::new(RwLock::new(ResourceStore::new()))
+        }
+
+        fn open_on(name: &str, store: StoreId) -> OpenDetail {
             OpenDetail {
                 gvk: pod_gvk(),
                 namespace: Some("demo".to_string()),
                 name: name.to_string(),
+                store,
                 events: Vec::new(),
                 events_error: None,
             }
         }
 
+        fn fetched_for(
+            gvk: GroupVersionKind,
+            namespace: Option<&str>,
+            name: &str,
+            store: StoreId,
+        ) -> FetchedEvents {
+            FetchedEvents {
+                gvk,
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                store,
+                result: Ok(Vec::new()),
+            }
+        }
+
         #[test]
         fn an_events_reply_is_accepted_only_for_the_object_the_pane_is_open_on() {
-            let open = open_on("web-alpha");
+            let store = StoreId::of(&a_store());
+            let open = open_on("web-alpha", store);
             assert!(open.is_for(&pod_gvk(), Some("demo"), "web-alpha"));
             assert!(
                 !open.is_for(&pod_gvk(), Some("demo"), "web-mike"),
@@ -4280,6 +4424,47 @@ mod tests {
                 ),
                 "a Deployment and a Pod can share a name"
             );
+        }
+
+        #[test]
+        fn a_same_identity_reply_from_a_different_store_is_not_applied() {
+            // The scenario `is_for` alone cannot catch: prod's default/web-0
+            // pane is open, a fetch is spawned against prod, the user
+            // switches to dev, and dev happens to have an UNRELATED object
+            // sharing the same (gvk, namespace, name) — a coincidence, not
+            // rare, given how few names ("web-0", "default") get reused
+            // across environments. `is_for` alone would accept prod's stale
+            // reply because gvk/namespace/name all match; `events_reply_applies`
+            // must not, because the reply's store is not the pane's.
+            let prod = StoreId::of(&a_store());
+            let dev = StoreId::of(&a_store());
+            let open = open_on("web-0", dev); // pane now open against dev
+            let stale_reply = fetched_for(pod_gvk(), Some("demo"), "web-0", prod);
+            assert!(
+                !events_reply_applies(&open, &stale_reply),
+                "a reply issued against a store that is no longer current \
+                 must be dropped even when kind/namespace/name coincide"
+            );
+        }
+
+        #[test]
+        fn a_same_store_reply_with_matching_identity_is_applied() {
+            let store = StoreId::of(&a_store());
+            let open = open_on("web-0", store.clone());
+            let reply = fetched_for(pod_gvk(), Some("demo"), "web-0", store);
+            assert!(events_reply_applies(&open, &reply));
+        }
+
+        #[test]
+        fn a_namespace_listing_from_a_superseded_store_does_not_apply() {
+            let current = StoreId::of(&a_store());
+            let stale = StoreId::of(&a_store());
+            assert!(
+                !namespace_listing_applies(current.clone(), stale),
+                "a listing fetched against a cluster the user has since \
+                 switched away from must not reinstall itself"
+            );
+            assert!(namespace_listing_applies(current.clone(), current));
         }
 
         // --- draw order ---

@@ -1,6 +1,7 @@
 use crate::app::session::SessionEvent;
 use crate::cluster::NamespaceListError;
 use crate::store::events::EventRow;
+use crate::store::watch::StoreId;
 use crossterm::event::Event as CtEvent;
 use indexmap::IndexMap;
 use kube::api::GroupVersionKind;
@@ -35,7 +36,20 @@ pub enum AppEvent {
     /// task (see `cluster::namespaces::list_namespaces`) and arrives back
     /// through this channel rather than blocking the draw that opens the
     /// picker.
-    NamespacesListed(Result<Vec<String>, NamespaceListError>),
+    ///
+    /// `store` identifies the `SharedStore` that was current when the fetch
+    /// was spawned. A cluster switch or a namespace change replaces the
+    /// store wholesale (`switch_cluster`/`restart_watch`) without cancelling
+    /// an in-flight listing fetch, so without this a stale prod listing can
+    /// reinstall itself into `Session::namespaces_from_api` after the very
+    /// switch that cleared it. The caller compares this against the
+    /// CURRENTLY active store before applying, inside the same lock
+    /// acquisition it would write under anyway — the same idiom
+    /// `spawn_discovery_and_watches` already uses via `Arc::ptr_eq`.
+    NamespacesListed {
+        store: StoreId,
+        result: Result<Vec<String>, NamespaceListError>,
+    },
     /// The answer to one `store::events::fetch_events` call, for the detail
     /// pane's Events tab. See `FetchedEvents` for why it carries the identity
     /// it was fetched for rather than just the rows.
@@ -61,18 +75,24 @@ pub enum AppEvent {
 /// One completed events fetch, tagged with the object it was fetched FOR.
 ///
 /// Carrying kind, namespace and name — not just the rows — is what makes a
-/// stale reply harmless. The detail pane can be re-pointed at another object,
-/// or closed, while a fetch is in flight; a reply that carried only rows
-/// would be applied to whatever happens to be open when it lands, showing one
-/// object's events under another object's name on the exact tab someone opens
-/// to find out what is wrong. The caller compares this identity against the
-/// pane's own before applying anything, so that misattribution cannot be
-/// represented rather than merely being avoided by careful sequencing.
+/// same-cluster stale reply harmless: the detail pane can be re-pointed at
+/// another object, or closed, while a fetch is in flight, and a reply that
+/// carried only rows would be applied to whatever happens to be open when it
+/// lands. That identity alone does NOT make misattribution unrepresentable
+/// ACROSS a cluster switch or namespace change, though: a StatefulSet in one
+/// cluster and a Pod in another routinely share a namespace and a name, and
+/// `switch_cluster`/`restart_watch` do not cancel an in-flight fetch. `store`
+/// closes that gap — it identifies the `SharedStore` the fetch was spawned
+/// against, and the caller compares it against `OpenDetail`'s own (which a
+/// store mismatch closes outright; see `main.rs`) before applying anything,
+/// so a reply from a superseded store cannot land under a same-named object
+/// in the one that replaced it.
 #[derive(Debug, Clone)]
 pub struct FetchedEvents {
     pub gvk: GroupVersionKind,
     pub namespace: Option<String>,
     pub name: String,
+    pub store: StoreId,
     /// `String`, not `anyhow::Error`: `AppEvent` is `Clone` and `Debug` and
     /// `anyhow::Error` is neither.
     pub result: Result<Vec<EventRow>, String>,
@@ -98,12 +118,14 @@ pub struct Coalesced {
     /// `Connected` behind it would lose the only frame that says the app is
     /// waiting on a cluster that takes tens of seconds to answer.
     pub session_events: Vec<SessionEvent>,
-    /// The most recent namespace-listing result seen in this batch, if any.
-    /// Only ever one fetch is in flight at a time in practice, but if the
-    /// picker were opened, closed and reopened fast enough to queue two
-    /// results in one batch, the newer one is what the picker should show —
-    /// same reasoning as `status_changes` keeping only the latest per kind.
-    pub namespace_list: Option<Result<Vec<String>, NamespaceListError>>,
+    /// The most recent namespace-listing result seen in this batch, if any,
+    /// alongside the store it was fetched against (see
+    /// `AppEvent::NamespacesListed`'s doc comment). Only ever one fetch is in
+    /// flight at a time in practice, but if the picker were opened, closed
+    /// and reopened fast enough to queue two results in one batch, the newer
+    /// one is what the picker should show — same reasoning as
+    /// `status_changes` keeping only the latest per kind.
+    pub namespace_list: Option<(StoreId, Result<Vec<String>, NamespaceListError>)>,
     /// Every events fetch that completed in this batch, in arrival order and
     /// never dropped. Unlike `namespace_list`, keeping only the newest would
     /// be wrong: each reply is scoped to a DIFFERENT object, and the caller —
@@ -141,7 +163,9 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
                 statuses.insert(gvk, status);
             }
             AppEvent::Session(s) => out.session_events.push(s),
-            AppEvent::NamespacesListed(r) => out.namespace_list = Some(r),
+            AppEvent::NamespacesListed { store, result } => {
+                out.namespace_list = Some((store, result))
+            }
             AppEvent::EventsFetched(f) => out.events_fetched.push(f),
             AppEvent::KindsDiscovered => out.kinds_discovered = true,
             AppEvent::Wake => out.wake = true,
@@ -157,13 +181,23 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::watch::ResourceStore;
     use crossterm::event::{
         Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
     };
     use kube::api::GroupVersionKind;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn pod_gvk() -> GroupVersionKind {
         GroupVersionKind::gvk("", "v1", "Pod")
+    }
+
+    /// A distinct `SharedStore` for identity purposes only — `StoreId::of`
+    /// compares allocations, not contents, so an empty store is as good as a
+    /// populated one for telling two "sessions" apart in a test.
+    fn a_store() -> crate::store::watch::SharedStore {
+        Arc::new(RwLock::new(ResourceStore::new()))
     }
 
     fn key(c: char) -> CtEvent {
@@ -260,13 +294,20 @@ mod tests {
         // queue two results in the same batch, the newer one is what the
         // picker should actually show.
         use crate::cluster::NamespaceListError;
+        let store = StoreId::of(&a_store());
         let out = coalesce(vec![
-            AppEvent::NamespacesListed(Err(NamespaceListError::Forbidden("stale".to_string()))),
-            AppEvent::NamespacesListed(Ok(vec!["alpha".to_string(), "beta".to_string()])),
+            AppEvent::NamespacesListed {
+                store: store.clone(),
+                result: Err(NamespaceListError::Forbidden("stale".to_string())),
+            },
+            AppEvent::NamespacesListed {
+                store: store.clone(),
+                result: Ok(vec!["alpha".to_string(), "beta".to_string()]),
+            },
         ]);
         assert_eq!(
             out.namespace_list,
-            Some(Ok(vec!["alpha".to_string(), "beta".to_string()])),
+            Some((store, Ok(vec!["alpha".to_string(), "beta".to_string()]))),
             "the newer fetch result must win, not the stale forbidden one"
         );
     }
@@ -287,6 +328,7 @@ mod tests {
             gvk: pod_gvk(),
             namespace: Some("demo".to_string()),
             name: name.to_string(),
+            store: StoreId::of(&a_store()),
             result: Ok(vec![EventRow {
                 kind: "Warning".to_string(),
                 reason: reason.to_string(),
