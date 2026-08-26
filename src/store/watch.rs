@@ -1,6 +1,7 @@
 use crate::app::event::{AppEvent, WatchStatus};
 use crate::store::cache::KindCache;
-use futures::StreamExt;
+use crate::store::rbac::classify;
+use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher;
 use kube::{Api, Client};
@@ -74,10 +75,110 @@ pub fn status_for_failure_count(consecutive_errors: u32) -> WatchStatus {
     }
 }
 
-/// Drive a watcher for one kind into the store, emitting an event after each delta.
+/// Build the status-bar message for a 403 that will never resolve on its own.
 ///
-/// `watcher` already handles relist-on-410-Gone internally, so this loop only
-/// has to translate errors into visible status rather than reconnect by hand.
+/// Leads with the remedy, not the apiserver's own text: this string passes
+/// through `truncate_error`'s ~200-char budget (`main.rs`) before it ever
+/// reaches the screen, and truncation cuts the *tail* of the string. Whatever
+/// is useful has to be at the front, or the one truncated-away detail is the
+/// action the user actually needed.
+///
+/// The remedy differs by scope: cluster-scope watches can retry narrower
+/// (`-n <namespace>` or the `n` picker); a watch that was already
+/// namespace-scoped and still got denied has no such escape hatch — the
+/// user lacks access to that namespace, full stop.
+pub fn forbidden_message(kind_plural: &str, _namespace: Option<&str>, detail: &str) -> String {
+    // STUB: does not yet distinguish cluster-scope from namespace-scope, and
+    // carries no remedy. Fixed in the next commit.
+    format!("watch {kind_plural}: {detail}")
+}
+
+/// Build the status-bar message for a kind that no longer exists on the
+/// cluster (most commonly: its CRD was uninstalled mid-session).
+pub fn not_found_message(kind_plural: &str, detail: &str) -> String {
+    // STUB: same as `forbidden_message` above — fixed in the next commit.
+    format!("watch {kind_plural}: {detail}")
+}
+
+/// Drive one watch stream into the store, emitting an event after each delta.
+///
+/// `watcher` already handles relist-on-410-Gone internally, so most of this
+/// loop only has to translate errors into visible status rather than
+/// reconnect by hand. The one case it must handle itself: a 403/404 wrapped
+/// inside a `watcher::Error` is not something retrying will ever fix (see
+/// `crate::store::rbac`), so those stop the loop instead of looping forever.
+///
+/// Generic over the stream type (rather than taking `Api`/`Client` directly)
+/// so tests can drive it with a canned sequence of events/errors without a
+/// cluster.
+async fn drive_watch<S>(
+    mut stream: S,
+    gvk: GroupVersionKind,
+    ar: ApiResource,
+    _namespace: Option<String>,
+    store: SharedStore,
+    tx: UnboundedSender<AppEvent>,
+) where
+    S: Stream<Item = watcher::Result<watcher::Event<DynamicObject>>> + Unpin,
+{
+    // A watch that keeps failing is usually RBAC denial, not a network
+    // blip. Escalating after a few consecutive errors lets the UI say
+    // "unavailable" instead of lying with a permanent "reconnecting".
+    let mut consecutive_errors: u32 = 0;
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => {
+                consecutive_errors = 0;
+                let synced = matches!(event, watcher::Event::InitDone | watcher::Event::Apply(_));
+                store.write().await.apply(&gvk, &ar, event);
+                if synced {
+                    store
+                        .write()
+                        .await
+                        .set_status(gvk.clone(), WatchStatus::Synced);
+                    let _ = tx.send(AppEvent::WatchStatus {
+                        gvk: gvk.clone(),
+                        status: WatchStatus::Synced,
+                    });
+                }
+                let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
+            }
+            Err(e) => {
+                // STUB: not yet branching on `classify(&e)` — every error is
+                // treated as retryable, which is the bug being fixed. Kept
+                // here (rather than left uncalled) so the next commit's diff
+                // is a behavior change, not a fresh wiring-up of `classify`.
+                let _ = classify(&e);
+                consecutive_errors += 1;
+                let status = status_for_failure_count(consecutive_errors);
+                store.write().await.set_status(gvk.clone(), status);
+                let _ = tx.send(AppEvent::WatchStatus {
+                    gvk: gvk.clone(),
+                    status,
+                });
+                let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
+            }
+        }
+    }
+
+    // The watcher is designed to be infinite; if the stream ends, the watch
+    // is dead and the view is now stale. Say so rather than leaving the last
+    // status showing as if it were live.
+    store
+        .write()
+        .await
+        .set_status(gvk.clone(), WatchStatus::Failed);
+    let _ = tx.send(AppEvent::WatchStatus {
+        gvk: gvk.clone(),
+        status: WatchStatus::Failed,
+    });
+    let _ = tx.send(AppEvent::Error(format!(
+        "watch {} ended unexpectedly",
+        ar.kind
+    )));
+}
+
 pub fn spawn_watch(
     client: Client,
     ar: ApiResource,
@@ -94,59 +195,7 @@ pub fn spawn_watch(
 
         let stream = watcher::watcher(api, watcher::Config::default());
         futures::pin_mut!(stream);
-
-        // A watch that keeps failing is usually RBAC denial, not a network
-        // blip. Escalating after a few consecutive errors lets the UI say
-        // "unavailable" instead of lying with a permanent "reconnecting".
-        let mut consecutive_errors: u32 = 0;
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(event) => {
-                    consecutive_errors = 0;
-                    let synced =
-                        matches!(event, watcher::Event::InitDone | watcher::Event::Apply(_));
-                    store.write().await.apply(&gvk, &ar, event);
-                    if synced {
-                        store
-                            .write()
-                            .await
-                            .set_status(gvk.clone(), WatchStatus::Synced);
-                        let _ = tx.send(AppEvent::WatchStatus {
-                            gvk: gvk.clone(),
-                            status: WatchStatus::Synced,
-                        });
-                    }
-                    let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    let status = status_for_failure_count(consecutive_errors);
-                    store.write().await.set_status(gvk.clone(), status);
-                    let _ = tx.send(AppEvent::WatchStatus {
-                        gvk: gvk.clone(),
-                        status,
-                    });
-                    let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
-                }
-            }
-        }
-
-        // The watcher is designed to be infinite; if the stream ends, the watch
-        // is dead and the view is now stale. Say so rather than leaving the last
-        // status showing as if it were live.
-        store
-            .write()
-            .await
-            .set_status(gvk.clone(), WatchStatus::Failed);
-        let _ = tx.send(AppEvent::WatchStatus {
-            gvk: gvk.clone(),
-            status: WatchStatus::Failed,
-        });
-        let _ = tx.send(AppEvent::Error(format!(
-            "watch {} ended unexpectedly",
-            ar.kind
-        )));
+        drive_watch(stream, gvk, ar, namespace, store, tx).await;
     })
 }
 
@@ -155,7 +204,9 @@ mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+    use kube::core::Status;
     use kube::runtime::watcher;
+    use tokio::sync::mpsc;
 
     fn pod_gvk() -> GroupVersionKind {
         GroupVersionKind::gvk("", "v1", "Pod")
@@ -163,6 +214,24 @@ mod tests {
 
     fn pod(name: &str) -> DynamicObject {
         DynamicObject::new(name, &ApiResource::erase::<Pod>(&())).within("default")
+    }
+
+    fn forbidden_error(message: &str) -> watcher::Error {
+        watcher::Error::InitialListFailed(kube::Error::Api(Box::new(Status {
+            code: 403,
+            reason: "Forbidden".to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        })))
+    }
+
+    fn not_found_error(message: &str) -> watcher::Error {
+        watcher::Error::InitialListFailed(kube::Error::Api(Box::new(Status {
+            code: 404,
+            reason: "NotFound".to_string(),
+            message: message.to_string(),
+            ..Default::default()
+        })))
     }
 
     #[test]
@@ -236,5 +305,173 @@ mod tests {
             "a persistently failing watch is usually RBAC denial, not a blip"
         );
         assert_eq!(status_for_failure_count(99), WatchStatus::Failed);
+    }
+
+    // --- forbidden_message / not_found_message content ---
+
+    #[test]
+    fn cluster_scope_forbidden_message_leads_with_the_namespace_remedy() {
+        let msg = forbidden_message("pods", None, "pods is forbidden: access denied");
+        assert!(
+            msg.starts_with("pods forbidden at cluster scope"),
+            "the remedy must lead, not trail, so truncation can't eat it; got {msg}"
+        );
+        assert!(msg.contains("-n <namespace>"), "got {msg}");
+        assert!(
+            msg.contains("access denied"),
+            "the apiserver's own reason should still be included; got {msg}"
+        );
+    }
+
+    #[test]
+    fn namespace_scoped_forbidden_message_does_not_suggest_a_flag_already_used() {
+        // Negative case for the test above: the user already scoped to a
+        // namespace and still got denied, so re-suggesting `-n` would be
+        // nonsensical. A wrong implementation that always emits the
+        // cluster-scope remedy would pass the cluster-scope test above but
+        // fail this one.
+        let msg = forbidden_message("pods", Some("payments"), "pods is forbidden");
+        assert!(
+            !msg.contains("-n <namespace>"),
+            "already namespace-scoped — suggesting -n again is not actionable; got {msg}"
+        );
+        assert!(msg.contains("payments"), "got {msg}");
+    }
+
+    #[test]
+    fn not_found_message_mentions_the_kind_is_gone() {
+        let msg = not_found_message("widgets", "widgets.example.com not found");
+        assert!(msg.contains("widgets"), "got {msg}");
+    }
+
+    // --- drive_watch: permanent failures stop the loop, transient ones don't ---
+
+    fn test_store() -> SharedStore {
+        Arc::new(RwLock::new(ResourceStore::new()))
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_error_stops_the_watch_and_marks_it_failed() {
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // A wrong "doesn't break" implementation would go on to apply the
+        // event that follows the forbidden error; asserting the store never
+        // saw it is what actually proves the loop stopped, not just that it
+        // eventually reports Failed (which the old 3-strikes escalation
+        // already did).
+        let events = vec![
+            Err(forbidden_error("pods is forbidden")),
+            Ok(watcher::Event::Apply(pod("should-never-be-applied"))),
+        ];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk.clone(), ar, None, store.clone(), tx).await;
+
+        assert_eq!(store.read().await.status(&gvk), WatchStatus::Failed);
+        assert!(
+            store.read().await.objects(&gvk).is_empty(),
+            "the event after a permanent failure must never reach the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_not_found_error_stops_the_watch_and_marks_it_failed() {
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let events = vec![
+            Err(not_found_error("widgets not found")),
+            Ok(watcher::Event::Apply(pod("should-never-be-applied"))),
+        ];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk.clone(), ar, None, store.clone(), tx).await;
+
+        assert_eq!(store.read().await.status(&gvk), WatchStatus::Failed);
+        assert!(store.read().await.objects(&gvk).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_does_not_stop_the_watch() {
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // The fake stream is finite, so `drive_watch` always reaches its
+        // "stream ended unexpectedly" epilogue and the *final* stored status
+        // ends up Failed regardless of this fix — a real long-lived watch
+        // never naturally ends, so that epilogue is a separate concern from
+        // what's under test here. What proves the transient error didn't
+        // stop anything is that the event after it was still processed
+        // (reflected in the object count) and that the watch did reach
+        // Synced at some point along the way (reflected in the emitted
+        // status events), not the terminal snapshot.
+        let events = vec![
+            Err(watcher::Error::NoResourceVersion),
+            Ok(watcher::Event::Apply(pod("a"))),
+            Ok(watcher::Event::InitDone),
+        ];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk.clone(), ar, None, store.clone(), tx).await;
+
+        assert_eq!(
+            store.read().await.objects(&gvk).len(),
+            1,
+            "a transient error must not stop the watch from processing what follows it"
+        );
+
+        let mut saw_synced = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::WatchStatus {
+                status: WatchStatus::Synced,
+                ..
+            } = ev
+            {
+                saw_synced = true;
+            }
+        }
+        assert!(
+            saw_synced,
+            "the watch must reach Synced after the transient error clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_error_emits_the_actionable_message_not_the_raw_one() {
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let events = vec![Err(forbidden_error(
+            "pods is forbidden: User \"u\" cannot list resource \"pods\" at the cluster scope",
+        ))];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk, ar, None, store, tx).await;
+
+        let mut saw_remedy = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Error(msg) = ev
+                && msg.contains("-n <namespace>")
+            {
+                saw_remedy = true;
+            }
+        }
+        assert!(
+            saw_remedy,
+            "a forbidden watch must emit the actionable -n remedy, not just the raw apiserver text"
+        );
     }
 }

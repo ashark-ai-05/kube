@@ -1259,6 +1259,23 @@ mod tests {
             assert!(out.starts_with("→→→"));
         }
 
+        #[test]
+        fn the_forbidden_watch_remedy_survives_truncation() {
+            // The apiserver's own message (which we always append) can be
+            // arbitrarily long — it echoes RBAC rule names, resource names,
+            // sometimes the requesting identity. If the remedy were appended
+            // after that text instead of leading it, this is exactly the
+            // scenario that would silently drop it.
+            use kube_tui::store::watch::forbidden_message;
+            let long_detail = "x".repeat(500);
+            let msg = forbidden_message("pods", None, &long_detail);
+            let shown = truncate_error(msg);
+            assert!(
+                shown.contains("-n <namespace>"),
+                "the actionable remedy must survive the status bar's truncation budget; got {shown}"
+            );
+        }
+
         // --- Errors are retired as well as raised ---
 
         fn gvk() -> GroupVersionKind {
