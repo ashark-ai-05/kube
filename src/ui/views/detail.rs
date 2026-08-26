@@ -191,7 +191,7 @@ pub fn render_detail(
     match pane.tab {
         DetailTab::Overview => render_overview(f, content_area, obj),
         DetailTab::Yaml => {
-            render_placeholder(f, content_area, "YAML view — implemented in Task 8.")
+            render_yaml(f, content_area, obj, &mut pane.yaml_scroll)
         }
         DetailTab::Events => render_placeholder(f, content_area, "Events — implemented in Task 9."),
     }
@@ -269,6 +269,24 @@ fn render_overview(f: &mut Frame, area: Rect, obj: &DynamicObject) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render the YAML tab content: a scrollable view of the object serialized to YAML.
+/// The scroll position is clamped to valid bounds to prevent scrolling past the end.
+fn render_yaml(f: &mut Frame, area: Rect, obj: &DynamicObject, scroll: &mut u16) {
+    use ratatui::widgets::Wrap;
+
+    let yaml = object_to_yaml(obj);
+    let total_lines = yaml_line_count(&yaml);
+
+    // Clamp scroll to valid bounds: the viewport height is the render area height
+    *scroll = clamp_scroll(*scroll, total_lines, area.height);
+
+    let paragraph = Paragraph::new(yaml)
+        .wrap(Wrap { trim: false })
+        .scroll((*scroll, 0));
+
+    f.render_widget(paragraph, area);
+}
+
 /// A clearly-marked stand-in for tab content this task does not own.
 fn render_placeholder(f: &mut Frame, area: Rect, text: &str) {
     f.render_widget(Paragraph::new(text).style(theme::muted_style()), area);
@@ -278,13 +296,13 @@ fn render_placeholder(f: &mut Frame, area: Rect, text: &str) {
 /// The output leads with apiVersion, kind, metadata (kubectl convention) and
 /// requires no post-processing for readability.
 fn object_to_yaml(obj: &DynamicObject) -> String {
-    unimplemented!()
+    serde_norway::to_string(obj).unwrap_or_else(|_| "Failed to serialize YAML".to_string())
 }
 
 /// Count the number of lines in a YAML string.
 /// Returns the count as u16, saturating if the count exceeds u16::MAX.
 fn yaml_line_count(yaml: &str) -> u16 {
-    unimplemented!()
+    yaml.lines().count().try_into().unwrap_or(u16::MAX)
 }
 
 /// Clamp a scroll position to valid bounds for a document.
@@ -294,7 +312,11 @@ fn yaml_line_count(yaml: &str) -> u16 {
 /// If total_lines <= viewport, returns 0 (document fits entirely).
 /// Otherwise, clamps scroll to the range [0, total_lines - viewport].
 fn clamp_scroll(scroll: u16, total_lines: u16, viewport: u16) -> u16 {
-    unimplemented!()
+    if total_lines <= viewport {
+        0
+    } else {
+        scroll.min(total_lines - viewport)
+    }
 }
 
 #[cfg(test)]
@@ -543,20 +565,25 @@ mod tests {
     #[test]
     fn the_yaml_and_events_tabs_render_a_marked_placeholder_not_overview_content() {
         let (yaml_text, _) = render_to_string(DetailTab::Yaml, 60, 20);
+        // The YAML tab now shows actual serialized YAML (not a placeholder),
+        // so it should contain kubectl-style content with proper YAML structure.
         assert!(
-            !yaml_text.contains("node-7"),
-            "YAML tab must not silently show Overview content:\n{yaml_text}"
+            yaml_text.contains("apiVersion:"),
+            "YAML tab must show serialized YAML content:\n{yaml_text}"
         );
         assert!(
-            yaml_text.to_lowercase().contains("yaml"),
-            "YAML placeholder must say what it is:\n{yaml_text}"
+            yaml_text.contains("kind:"),
+            "YAML tab must show kind field:\n{yaml_text}"
+        );
+        // The key assertion: YAML tab must NOT show the Overview layout
+        // (Overview shows "Name" / "Namespace" / "Node" / "Status" rows with aligned labels).
+        assert!(
+            !yaml_text.contains("Name      "),
+            "YAML tab must not show Overview-formatted field labels:\n{yaml_text}"
         );
 
         let (events_text, _) = render_to_string(DetailTab::Events, 60, 20);
-        assert!(
-            !events_text.contains("node-7"),
-            "Events tab must not silently show Overview content:\n{events_text}"
-        );
+        // Events tab still shows placeholder
         assert!(
             events_text.to_lowercase().contains("events"),
             "Events placeholder must say what it is:\n{events_text}"
