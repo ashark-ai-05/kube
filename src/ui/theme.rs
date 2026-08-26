@@ -93,6 +93,16 @@ pub fn muted_style() -> Style {
     Style::default().fg(MIST)
 }
 
+/// Colour an Events-tab row by its type ("Normal"/"Warning" — `Event.type_`
+/// is a plain `String`, not an enum; see
+/// `docs/superpowers/plan3-api-reference.md` C8). Warning is a signal, the
+/// whole reason anyone opens the Events tab, so it takes a signal-family
+/// colour (matching `phase_style`'s treatment of failing pod phases) rather
+/// than a chrome token — chrome and signal must never cross.
+pub fn event_kind_style(kind: &str) -> Style {
+    unimplemented!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +168,37 @@ mod tests {
                 .fg
                 .expect("phase styles must set a foreground");
             assert!(!chrome.contains(&fg), "{phase} rendered in a chrome colour");
+        }
+    }
+
+    #[test]
+    fn event_kind_style_marks_warnings_distinctly_from_normal() {
+        assert_ne!(
+            event_kind_style("Warning"),
+            event_kind_style("Normal"),
+            "the whole reason someone opens the Events tab is to spot warnings"
+        );
+    }
+
+    #[test]
+    fn warning_events_use_a_signal_family_colour() {
+        let fg = event_kind_style("Warning")
+            .fg
+            .expect("event styles must set a foreground");
+        assert!(
+            fg == CORAL || fg == AMBER,
+            "warnings must use a signal-family colour, got {fg:?}"
+        );
+    }
+
+    #[test]
+    fn event_kind_style_never_reuses_a_chrome_token() {
+        let chrome = [INK, ABYSS, DUSK, INDIGO, PERIWINKLE, TEAL, VIOLET];
+        for kind in ["Normal", "Warning", "Unknown"] {
+            let fg = event_kind_style(kind)
+                .fg
+                .expect("event styles must set a foreground");
+            assert!(!chrome.contains(&fg), "{kind} rendered in a chrome colour");
         }
     }
 

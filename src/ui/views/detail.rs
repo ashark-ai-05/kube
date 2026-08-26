@@ -15,9 +15,15 @@
 //! comment prescribes, instead of a second, locally-invented layout loop.
 //!
 //! YAML tab renders serialized kubectl-style YAML via `serde_norway` (Task 8).
-//! Events tab *content* is out of scope for Task 9 and renders a placeholder.
+//! Events tab renders `store::events::EventRow`s (Task 9): a scrollable list
+//! when the fetch succeeded (even with zero rows — a healthy object with
+//! nothing to report), or an explanation when it failed. The two must never
+//! render the same way: an empty Events tab reads as "nothing wrong here,"
+//! the most dangerous possible lie for the exact tab someone opens to find
+//! out what's wrong.
 
 use crate::store::columns::format_age;
+use crate::store::events::EventRow;
 use crate::ui::geometry::tab_spans;
 use crate::ui::hit::{HitRegistry, HitTarget};
 use crate::ui::theme;
@@ -150,18 +156,20 @@ fn age_row(obj: &DynamicObject) -> String {
 /// active tab's content, registering clickable zones for every tab and for
 /// closing the pane.
 ///
-/// `events` is deliberately not a parameter here: Task 9 owns the Events
-/// tab's content and the `EventRow` type it will read from, neither of which
-/// exist yet. Adding a placeholder type now would force Task 9 to either
-/// match a guessed shape or immediately break this signature again — see
-/// the task report for the full reasoning. Task 9 extends this signature
-/// (and the `DetailTab::Events` arm below) when it lands.
+/// `events`/`events_error` are supplied by the caller, never fetched here:
+/// this function stays synchronous and does no I/O, exactly like every
+/// other render function in this module (`fetch_events` is a request, see
+/// `store::events`). `events_error` takes priority over `events` being
+/// empty — see the module doc comment for why the two must render
+/// differently.
 pub fn render_detail(
     f: &mut Frame,
     area: Rect,
     obj: &DynamicObject,
     pane: &mut DetailPane,
     hits: &mut HitRegistry,
+    events: &[EventRow],
+    events_error: Option<&str>,
 ) {
     // Without `Clear`, whatever was drawn earlier in this same frame (the
     // table beneath) shows through wherever this overlay doesn't explicitly
@@ -199,7 +207,7 @@ pub fn render_detail(
     match pane.tab {
         DetailTab::Overview => render_overview(f, content_area, obj),
         DetailTab::Yaml => render_yaml(f, content_area, obj, pane),
-        DetailTab::Events => render_placeholder(f, content_area, "Events — implemented in Task 9."),
+        DetailTab::Events => render_events(f, content_area, events, events_error, pane),
     }
 }
 
@@ -318,6 +326,35 @@ fn render_placeholder(f: &mut Frame, area: Rect, text: &str) {
     f.render_widget(Paragraph::new(text).style(theme::muted_style()), area);
 }
 
+/// Render the Events tab: a scrollable list of the object's events
+/// (pre-scoped and pre-formatted upstream by `store::events::fetch_events`/
+/// `event_rows`), or an explanation when the fetch failed.
+///
+/// `events_error` is checked FIRST and unconditionally wins over `events`
+/// being empty — see the module doc comment for why a forbidden listing
+/// must never render like a healthy, uneventful object. Warnings render in
+/// `theme::event_kind_style`'s signal colour, matching how the table already
+/// colours failing pod phases (`theme::phase_style`), so a problem is
+/// visible without reading every row.
+fn render_events(
+    f: &mut Frame,
+    area: Rect,
+    events: &[EventRow],
+    events_error: Option<&str>,
+    pane: &mut DetailPane,
+) {
+    unimplemented!()
+}
+
+/// One Events-tab display line: age, type and reason lead (mirroring
+/// `kubectl describe`'s Events table), then the message. No OBJECT column —
+/// every row already belongs to the one object this pane is open on — and
+/// no FROM column, since `EventRow` (deliberately) does not carry the
+/// reporting source.
+fn event_line(row: &EventRow) -> Line<'static> {
+    unimplemented!()
+}
+
 /// Serialize a DynamicObject to YAML string using serde_norway.
 /// The output leads with apiVersion, kind, metadata (kubectl convention) and
 /// requires no post-processing for readability.
@@ -376,6 +413,20 @@ mod tests {
     }
 
     fn render_to_string(active: DetailTab, w: u16, h: u16) -> (String, HitRegistry) {
+        render_to_string_with_events(active, w, h, &[], None)
+    }
+
+    /// As `render_to_string`, but with the Events tab's data under caller
+    /// control — needed by every test that checks how `events`/
+    /// `events_error` actually render, rather than always exercising the
+    /// "nothing fetched yet" default.
+    fn render_to_string_with_events(
+        active: DetailTab,
+        w: u16,
+        h: u16,
+        events: &[EventRow],
+        events_error: Option<&str>,
+    ) -> (String, HitRegistry) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
@@ -387,7 +438,7 @@ mod tests {
         };
         term.draw(|f| {
             let area = f.area();
-            render_detail(f, area, &obj, &mut pane, &mut hits);
+            render_detail(f, area, &obj, &mut pane, &mut hits, events, events_error);
         })
         .unwrap();
 
@@ -419,7 +470,7 @@ mod tests {
         };
         term.draw(|f| {
             let area = f.area();
-            render_detail(f, area, &obj, &mut pane, &mut hits);
+            render_detail(f, area, &obj, &mut pane, &mut hits, &[], None);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -591,10 +642,10 @@ mod tests {
     }
 
     #[test]
-    fn the_yaml_and_events_tabs_render_a_marked_placeholder_not_overview_content() {
+    fn the_yaml_tab_shows_serialized_yaml_not_overview_content() {
         let (yaml_text, _) = render_to_string(DetailTab::Yaml, 60, 20);
-        // The YAML tab now shows actual serialized YAML (not a placeholder),
-        // so it should contain kubectl-style content with proper YAML structure.
+        // The YAML tab shows actual serialized YAML (not a placeholder), so
+        // it should contain kubectl-style content with proper YAML structure.
         assert!(
             yaml_text.contains("apiVersion:"),
             "YAML tab must show serialized YAML content:\n{yaml_text}"
@@ -609,12 +660,169 @@ mod tests {
             !yaml_text.contains("Name      "),
             "YAML tab must not show Overview-formatted field labels:\n{yaml_text}"
         );
+    }
 
-        let (events_text, _) = render_to_string(DetailTab::Events, 60, 20);
-        // Events tab still shows placeholder
+    // --- Events tab ---
+
+    fn normal_row() -> EventRow {
+        EventRow {
+            kind: "Normal".to_string(),
+            reason: "Scheduled".to_string(),
+            message: "pod scheduled onto node-7".to_string(),
+            age: "5m".to_string(),
+            count: 1,
+        }
+    }
+
+    fn warning_row() -> EventRow {
+        EventRow {
+            kind: "Warning".to_string(),
+            reason: "BackOff".to_string(),
+            message: "back-off restarting failed container".to_string(),
+            age: "1m".to_string(),
+            count: 5,
+        }
+    }
+
+    #[test]
+    fn the_events_tab_shows_reason_message_and_repeat_count() {
+        let (text, _) = render_to_string_with_events(DetailTab::Events, 60, 20, &[warning_row()], None);
+        assert!(text.contains("BackOff"), "expected the reason:\n{text}");
         assert!(
-            events_text.to_lowercase().contains("events"),
-            "Events placeholder must say what it is:\n{events_text}"
+            text.contains("back-off restarting"),
+            "expected the message:\n{text}"
+        );
+        assert!(
+            text.contains("x5"),
+            "a repeating event's count must be visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_but_permitted_events_list_does_not_claim_to_be_forbidden() {
+        // A healthy object legitimately has zero events. This must read as
+        // "nothing to report," never as an error.
+        let (text, _) = render_to_string_with_events(DetailTab::Events, 60, 20, &[], None);
+        assert!(
+            !text.to_lowercase().contains("forbidden"),
+            "a healthy empty state must not scare the user:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("events"),
+            "the empty state should still say what it is:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_forbidden_events_fetch_renders_an_explanation_not_an_empty_list() {
+        // Mutation check: a wrong implementation that ignores events_error
+        // and renders based solely on events.is_empty() must fail this.
+        let (text, _) = render_to_string_with_events(
+            DetailTab::Events,
+            60,
+            20,
+            &[],
+            Some("events forbidden for web-1: pods is forbidden"),
+        );
+        assert!(
+            text.to_lowercase().contains("forbidden"),
+            "a forbidden listing must say so, not render as an empty list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn events_error_wins_even_when_stale_events_are_also_passed() {
+        // A refresh that failed after a previous successful fetch must not
+        // silently keep showing the stale rows as if nothing were wrong.
+        let (text, _) = render_to_string_with_events(
+            DetailTab::Events,
+            60,
+            20,
+            &[normal_row()],
+            Some("events forbidden for web-1: pods is forbidden"),
+        );
+        assert!(
+            text.to_lowercase().contains("forbidden"),
+            "an error must win over stale rows:\n{text}"
+        );
+    }
+
+    #[test]
+    fn warning_events_are_visually_distinct_from_normal_events() {
+        let rows = vec![normal_row(), warning_row()];
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut hits = HitRegistry::new();
+        let obj = pod_with_status();
+        let mut pane = DetailPane {
+            tab: DetailTab::Events,
+            yaml_scroll: 0,
+            events_scroll: 0,
+            yaml_cache: None,
+        };
+        term.draw(|f| {
+            let area = f.area();
+            render_detail(f, area, &obj, &mut pane, &mut hits, &rows, None);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let mut text = String::new();
+        for y in 0..20u16 {
+            for x in 0..60u16 {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let normal_y = lines
+            .iter()
+            .position(|l| l.contains("Scheduled"))
+            .expect("normal row drawn") as u16;
+        let warning_y = lines
+            .iter()
+            .position(|l| l.contains("BackOff"))
+            .expect("warning row drawn") as u16;
+        let normal_x = lines[normal_y as usize].find("Scheduled").unwrap() as u16;
+        let warning_x = lines[warning_y as usize].find("BackOff").unwrap() as u16;
+
+        let normal_style = buf[(normal_x, normal_y)].style();
+        let warning_style = buf[(warning_x, warning_y)].style();
+        assert_ne!(
+            normal_style.fg, warning_style.fg,
+            "warning events must look different from normal ones"
+        );
+    }
+
+    #[test]
+    fn events_scroll_is_clamped_to_the_actual_content_length() {
+        // Reuses `clamp_scroll` — must not write a second scroll clamp.
+        let rows: Vec<EventRow> = (0..50)
+            .map(|i| EventRow {
+                kind: "Normal".to_string(),
+                reason: format!("Reason{i}"),
+                message: "m".to_string(),
+                age: "1m".to_string(),
+                count: 1,
+            })
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut hits = HitRegistry::new();
+        let obj = pod_with_status();
+        let mut pane = DetailPane {
+            tab: DetailTab::Events,
+            yaml_scroll: 0,
+            events_scroll: 9999,
+            yaml_cache: None,
+        };
+        term.draw(|f| {
+            let area = f.area();
+            render_detail(f, area, &obj, &mut pane, &mut hits, &rows, None);
+        })
+        .unwrap();
+        assert!(
+            pane.events_scroll < 9999,
+            "scroll must be clamped to the actual content length, got {}",
+            pane.events_scroll
         );
     }
 
@@ -631,7 +839,7 @@ mod tests {
                 width: 0,
                 height: 10,
             };
-            render_detail(f, area, &obj, &mut pane, &mut hits);
+            render_detail(f, area, &obj, &mut pane, &mut hits, &[], None);
         })
         .unwrap();
     }
@@ -649,7 +857,7 @@ mod tests {
                 width: 10,
                 height: 0,
             };
-            render_detail(f, area, &obj, &mut pane, &mut hits);
+            render_detail(f, area, &obj, &mut pane, &mut hits, &[], None);
         })
         .unwrap();
     }
@@ -664,7 +872,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         term.draw(|f| {
             let area = f.area();
-            render_detail(f, area, &obj, &mut pane, &mut hits);
+            render_detail(f, area, &obj, &mut pane, &mut hits, &[], None);
         })
         .unwrap();
     }

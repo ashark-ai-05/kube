@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod columns;
+pub mod events;
 pub mod handles;
 pub mod multi;
 pub mod rbac;
