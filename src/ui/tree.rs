@@ -47,9 +47,26 @@ pub enum TreeRow<'a> {
 ///
 /// Each expanded group contributes one row for itself plus one per kind.
 /// Each collapsed group contributes only one row for itself.
-pub fn flatten(_tree: &KindTree) -> Vec<TreeRow<'_>> {
-    // TODO: implement
-    Vec::new()
+pub fn flatten(tree: &KindTree) -> Vec<TreeRow<'_>> {
+    let mut rows = Vec::new();
+
+    for (group_idx, group) in tree.groups.iter().enumerate() {
+        rows.push(TreeRow::Group {
+            index: group_idx,
+            group,
+        });
+
+        if group.expanded {
+            for kind in &group.kinds {
+                rows.push(TreeRow::Kind {
+                    group_index: group_idx,
+                    kind,
+                });
+            }
+        }
+    }
+
+    rows
 }
 
 impl KindTree {
@@ -58,14 +75,33 @@ impl KindTree {
     /// If the row is a kind (not a group), does nothing.
     /// If the row index is out of bounds, does nothing.
     pub fn toggle(&mut self, row: usize) {
-        // TODO: implement
-        let _ = row;
+        let mut current_row = 0;
+
+        for group in &mut self.groups {
+            if current_row == row {
+                group.expanded = !group.expanded;
+                return;
+            }
+
+            current_row += 1;
+            if group.expanded {
+                current_row += group.kinds.len();
+            }
+        }
     }
 
     /// Get the kind at the current selection, or None if the selection is a group.
     pub fn selected_kind(&self) -> Option<&TreeKind> {
-        // TODO: implement
-        None
+        let rows = flatten(self);
+
+        if self.selected >= rows.len() {
+            return None;
+        }
+
+        match &rows[self.selected] {
+            TreeRow::Kind { kind, .. } => Some(kind),
+            TreeRow::Group { .. } => None,
+        }
     }
 }
 
@@ -85,7 +121,7 @@ mod tests {
                 kinds: kinds
                     .iter()
                     .map(|k| TreeKind {
-                        gvk: GroupVersionKind::gvk(*label, "v1", k),
+                        gvk: GroupVersionKind::gvk(label, "v1", k),
                         label: k.to_string(),
                         count: None,
                         availability: crate::store::multi::KindAvailability::Watching,
@@ -136,7 +172,10 @@ mod tests {
         let mut t = tree(&[("core", true, &["Pod"]), ("apps", true, &["Deployment"])]);
         t.toggle(0);
         assert!(!t.groups[0].expanded);
-        assert!(t.groups[1].expanded, "collapsing one group must not collapse another");
+        assert!(
+            t.groups[1].expanded,
+            "collapsing one group must not collapse another"
+        );
     }
 
     #[test]
