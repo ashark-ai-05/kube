@@ -8,6 +8,7 @@
 //! not once per view that grows tabs.
 
 use ratatui::layout::Rect;
+use unicode_width::UnicodeWidthStr;
 
 /// Per-tab clickable rects for a manually hit-tested `Tabs`-like row.
 ///
@@ -23,9 +24,32 @@ use ratatui::layout::Rect;
 /// a `Rect` extending past it: `x` only ever increases as tabs are laid out,
 /// so once one tab overflows, every tab after it would too.
 pub fn tab_spans(labels: &[&str], area: Rect, divider_width: u16) -> Vec<Rect> {
-    // TODO: implement
-    let _ = (labels, area, divider_width);
-    Vec::new()
+    let mut rects = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return rects;
+    }
+
+    let right_edge = area.x.saturating_add(area.width);
+    let mut x = area.x;
+
+    for label in labels {
+        let width = UnicodeWidthStr::width(*label) as u16;
+        let end = x.saturating_add(width);
+        if end > right_edge {
+            // `x` only grows, so every label after this one would overflow
+            // too — drop the rest rather than emitting rects past the area.
+            break;
+        }
+        rects.push(Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        });
+        x = end.saturating_add(divider_width);
+    }
+
+    rects
 }
 
 #[cfg(test)]

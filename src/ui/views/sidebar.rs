@@ -25,8 +25,83 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 /// screen row `y` and the row a click at `y` resolves to are always the same
 /// flattened index — both are read from the identical `window` slice below.
 pub fn render_sidebar(f: &mut Frame, area: Rect, tree: &mut KindTree, hits: &mut HitRegistry) {
-    // TODO: implement
-    let _ = (f, area, tree, hits);
+    // The tree reshapes underneath an open sidebar (a group toggles,
+    // discovery adds a kind) — clamp before touching `selected` for anything
+    // below, the same defensive clamp `render_table`/`render_picker` perform.
+    tree.clamp_selected();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title("Kinds");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // This view owns scrolling exactly as `render_table` does: advance the
+    // offset by the least amount that keeps `selected` visible, then derive
+    // the visible window from that offset. Rendering and hit-registration
+    // below both walk this one `window`, so they cannot drift apart.
+    let rows_visible = inner.height as usize;
+    tree.scroll = scroll::scroll_offset(tree.selected, tree.scroll, rows_visible);
+
+    let rows = flatten(tree);
+    let window = scroll::window(tree.scroll, rows_visible, rows.len());
+
+    for (offset, row) in rows[window.clone()].iter().enumerate() {
+        let absolute_row = window.start + offset;
+        let y = inner.y.saturating_add(offset as u16);
+
+        let line = match row {
+            TreeRow::Group { group, .. } => {
+                let marker = if group.expanded { "▾" } else { "▸" };
+                Line::from(Span::styled(
+                    format!("{marker} {}", group.label),
+                    theme::label_style(),
+                ))
+            }
+            TreeRow::Kind { kind, .. } => {
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(kind.label.clone(), theme::text_style()),
+                ];
+                match &kind.availability {
+                    // A watch that hit a permanent failure must say why —
+                    // rendering a blank or a "0" here would read as "this
+                    // kind is empty" rather than "you can't see this kind",
+                    // and on a corporate cluster lacking RBAC on some kinds
+                    // is the normal case, not the exception.
+                    KindAvailability::Unavailable { reason } => {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(reason.clone(), theme::muted_style()));
+                    }
+                    KindAvailability::NotWatched => {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled("not watched", theme::muted_style()));
+                    }
+                    KindAvailability::Watching => {
+                        if let Some(count) = kind.count {
+                            spans.push(Span::raw("  "));
+                            spans.push(Span::styled(count.to_string(), theme::count_style()));
+                        }
+                    }
+                }
+                Line::from(spans)
+            }
+        };
+
+        let row_area = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(line), row_area);
+        hits.push(row_area, 0, HitTarget::TreeRow(absolute_row));
+    }
 }
 
 #[cfg(test)]
