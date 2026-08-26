@@ -10,7 +10,10 @@ use kube_tui::app::session::{
 };
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::cluster::{AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
+use kube_tui::cluster::{
+    AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState, NamespaceListError,
+    is_valid_namespace_name, list_namespaces,
+};
 use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
@@ -62,28 +65,99 @@ fn cluster_picker_items(entries: &[ClusterEntry]) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Build the namespace picker's item list from the namespaces actually
-/// present in the objects currently loaded, plus an "all namespaces" entry.
+/// Merge the namespace picker's three sources — the API's own listing (when
+/// permitted), the namespaces seen in objects already loaded, and the
+/// namespace currently being watched — into one deduplicated, alphabetically
+/// sorted list of names.
 ///
-/// There is no cluster-wide namespace listing wired up (that would be its
-/// own `Namespace` watch) — this reflects what the current watch has
-/// actually seen, which is complete whenever the default all-namespaces
-/// scope is active and partial otherwise.
-fn namespace_picker_items(objects: &[Arc<DynamicObject>]) -> Vec<PickerItem> {
-    let names: BTreeSet<String> = objects
+/// All three matter independently, in either direction: the API can know
+/// about a namespace the current watch hasn't loaded a single object from
+/// yet (an empty namespace, or one this watch is simply scoped away from),
+/// and the current watch can hold objects in a namespace the API listing
+/// call didn't return — e.g. it was created after that GET completed.
+/// Neither source is trusted over the other; the union is what the picker
+/// offers.
+fn merge_namespace_names<'a>(
+    api: Option<&'a [String]>,
+    loaded: impl Iterator<Item = &'a str>,
+    current: Option<&'a str>,
+) -> Vec<String> {
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    if let Some(api) = api {
+        names.extend(api.iter().map(String::as_str));
+    }
+    names.extend(loaded);
+    if let Some(c) = current {
+        names.insert(c);
+    }
+    names.into_iter().map(str::to_string).collect()
+}
+
+/// Build the namespace picker's item list.
+///
+/// `api_namespaces` is the last answer `cluster::namespaces::list_namespaces`
+/// gave (`Session::namespaces_from_api`), `objects` is what the current watch
+/// has actually loaded, and `current` is the namespace scope in effect right
+/// now (`None` for all-namespaces). Listing namespaces is itself
+/// cluster-scoped and can be forbidden by the same RBAC that forbids listing
+/// pods — exactly the cluster where this picker is needed most, since that
+/// RBAC is also why `objects` can be empty. When it is, the "all namespaces"
+/// entry (always present, so the picker is never a bare empty box) carries an
+/// explanation instead of silently offering a list that looks complete but
+/// isn't: typing a name and pressing Enter is the one thing that still works
+/// with no listing permission at all (see `main`'s `resolve_confirm`).
+fn namespace_picker_items(
+    api_namespaces: Option<&Result<Vec<String>, NamespaceListError>>,
+    objects: &[Arc<DynamicObject>],
+    current: Option<&str>,
+) -> Vec<PickerItem> {
+    let loaded: BTreeSet<String> = objects
         .iter()
         .filter_map(|o| o.metadata.namespace.clone())
         .collect();
+
+    let (api_list, forbidden_note): (Option<&[String]>, Option<String>) = match api_namespaces {
+        Some(Ok(list)) => (Some(list.as_slice()), None),
+        Some(Err(e)) => (None, Some(e.explanation())),
+        None => (None, None),
+    };
+
+    let names = merge_namespace_names(api_list, loaded.iter().map(String::as_str), current);
+
+    let mut all_detail = "watch every namespace".to_string();
+    if current.is_none() {
+        all_detail.push_str("  ·  current");
+    }
+    if let Some(note) = &forbidden_note {
+        all_detail.push_str("  ·  ");
+        all_detail.push_str(note);
+    }
+
     let mut items = Vec::with_capacity(names.len() + 1);
     items.push(PickerItem {
         label: ALL_NAMESPACES_LABEL.to_string(),
-        detail: "watch every namespace".to_string(),
-        accent: None,
+        detail: all_detail,
+        accent: if current.is_none() {
+            Some(theme::VIRIDIAN)
+        } else {
+            None
+        },
     });
-    items.extend(names.into_iter().map(|n| PickerItem {
-        label: n,
-        detail: String::new(),
-        accent: None,
+    items.extend(names.into_iter().map(|n| {
+        let is_current = current == Some(n.as_str());
+        PickerItem {
+            detail: if is_current {
+                "current".to_string()
+            } else {
+                String::new()
+            },
+            accent: if is_current {
+                Some(theme::VIRIDIAN)
+            } else {
+                None
+            },
+            label: n,
+        }
     }));
     items
 }
@@ -154,6 +228,58 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
         .get(filtered_index)
         .and_then(|&real| picker.items.get(real))
         .map(|item| item.label.clone())
+}
+
+/// What confirming the open picker (Enter, or a click on a specific row)
+/// resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerOutcome {
+    ClusterChosen(String),
+    /// `None` is the all-namespaces scope, same convention as
+    /// `namespace_choice_from_label`.
+    NamespaceChosen(Option<String>),
+    /// The filter matched no item, and the typed text isn't a name a
+    /// namespace could ever have — rejected before it becomes a request
+    /// that is certain to fail.
+    InvalidNamespaceTyped(String),
+    NoOp,
+}
+
+/// Resolve a confirmed picker index to what it actually means to do.
+///
+/// For the cluster picker this is unchanged from before: an index that
+/// resolves to nothing (nothing was open, or the index is stale) is a no-op.
+/// For the namespace picker, a resolved index still wins — an item the user
+/// can see and pick always takes priority over whatever they typed to narrow
+/// down to it. Only when the filter matches NOTHING is the typed text tried
+/// as a namespace name in its own right: this is the one path that needs no
+/// API permission at all, so it is what still works on a cluster where
+/// listing namespaces (like listing pods) is forbidden — see
+/// `namespace_picker_items`'s doc comment for the other half of that fix.
+fn resolve_confirm(overlay: &Overlay, index: Option<usize>) -> PickerOutcome {
+    let Some(i) = index else {
+        return PickerOutcome::NoOp;
+    };
+    match overlay {
+        Overlay::None => PickerOutcome::NoOp,
+        Overlay::ClusterPicker(p) => match resolve_picker_choice(p, i) {
+            Some(label) => PickerOutcome::ClusterChosen(label),
+            None => PickerOutcome::NoOp,
+        },
+        Overlay::NamespacePicker(p) => match resolve_picker_choice(p, i) {
+            Some(label) => PickerOutcome::NamespaceChosen(namespace_choice_from_label(&label)),
+            None => {
+                let typed = p.filter.trim();
+                if typed.is_empty() {
+                    PickerOutcome::NoOp
+                } else if is_valid_namespace_name(typed) {
+                    PickerOutcome::NamespaceChosen(Some(typed.to_string()))
+                } else {
+                    PickerOutcome::InvalidNamespaceTyped(typed.to_string())
+                }
+            }
+        },
+    }
 }
 
 /// Turn a failed connect into something the user can act on.
@@ -647,6 +773,17 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         if !batch.session_events.is_empty() {
             needs_redraw = true;
         }
+        // The answer to a namespace-listing fetch (spawned when the picker
+        // opened; see `Action::OpenNamespacePicker` below) arrives here.
+        // Written under the session lock, same as `client`/`namespace`
+        // themselves — see `Session::namespaces_from_api`'s doc comment for
+        // why this must not live in a local the event loop threads through
+        // frames on its own. Done BEFORE the snapshot read just below, so an
+        // answer that arrives in this batch is what that read actually sees.
+        if let Some(result) = batch.namespace_list.clone() {
+            session.lock().await.namespaces_from_api = Some(result);
+            needs_redraw = true;
+        }
 
         // A cluster switch REPLACES the store and changes which cluster is
         // active, so both are re-read every pass rather than captured once: a
@@ -660,7 +797,15 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // a switch replaces all of these together, so reading any of them
         // from a local would show the previous cluster's scope over the new
         // cluster's data.
-        let (store, active_cluster, entries, namespace, namespace_is_fallback) = {
+        let (
+            store,
+            active_cluster,
+            entries,
+            namespace,
+            namespace_is_fallback,
+            client,
+            namespaces_from_api,
+        ) = {
             let s = session.lock().await;
             (
                 s.store.clone(),
@@ -668,6 +813,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 s.registry.entries().to_vec(),
                 s.namespace.clone(),
                 s.namespace_is_fallback,
+                s.client.clone(),
+                s.namespaces_from_api.clone(),
             )
         };
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
@@ -694,7 +841,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 clamp_selection(p);
             }
             Overlay::NamespacePicker(p) => {
-                p.items = namespace_picker_items(&objects);
+                p.items = namespace_picker_items(
+                    namespaces_from_api.as_ref(),
+                    &objects,
+                    namespace.as_deref(),
+                );
                 clamp_selection(p);
             }
             Overlay::None => {}
@@ -743,12 +894,31 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     needs_redraw = true;
                 }
                 Action::OpenNamespacePicker => {
+                    // Opens immediately with whatever is already known — the
+                    // objects already loaded, the previous fetch if one has
+                    // ever completed, and the namespace currently being
+                    // watched — never blocking on the network. The listing
+                    // itself is I/O, so it runs on a spawned task and its
+                    // answer arrives back through `AppEvent::NamespacesListed`
+                    // (handled above, before this loop's snapshot read),
+                    // which is what lets the picker fill in without the draw
+                    // that opened it ever waiting on it.
                     overlay = Overlay::NamespacePicker(Picker {
                         title: "Namespaces".into(),
-                        items: namespace_picker_items(&objects),
+                        items: namespace_picker_items(
+                            namespaces_from_api.as_ref(),
+                            &objects,
+                            namespace.as_deref(),
+                        ),
                         filter: String::new(),
                         selected: 0,
                         scroll: 0,
+                    });
+                    let fetch_client = client.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        let result = list_namespaces(&fetch_client).await;
+                        let _ = tx2.send(AppEvent::NamespacesListed(result));
                     });
                     needs_redraw = true;
                 }
@@ -771,108 +941,98 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     }
                 }
                 Action::PickerSelect(_) | Action::PickerConfirm => {
-                    if let Some(i) = confirm_index {
-                        match std::mem::take(&mut overlay) {
-                            Overlay::ClusterPicker(p) => {
-                                if let Some(label) = resolve_picker_choice(&p, i) {
-                                    let target = ClusterId(label);
-                                    // Inherits `allow_interactive_auth: false`
-                                    // from `opts`: this connect runs with the
-                                    // alternate screen live, so no exec plugin
-                                    // may prompt into it. See
-                                    // `ConnectOptions::allow_interactive_auth`.
-                                    let mut switch_opts = opts.clone();
-                                    switch_opts.context = Some(target.0.clone());
-                                    // How the target authenticates, so a
-                                    // refusal to prompt can say which command
-                                    // to run instead of just failing.
-                                    let target_auth = entries
-                                        .iter()
-                                        .find(|e| e.id == target)
-                                        .map(|e| e.context.auth.clone())
-                                        .unwrap_or(AuthMethod::None);
-                                    let session2 = session.clone();
-                                    let tx2 = tx.clone();
-                                    let pod_ar2 = pod_ar.clone();
-                                    tokio::spawn(async move {
-                                        switch_cluster(
-                                            session2,
-                                            target,
-                                            // Contexts frequently set no namespace and
-                                            // `default` is empty on these clusters — so a
-                                            // switch overrides whatever `-A`/`-n` chose for
-                                            // the INITIAL connect with all-namespaces.
-                                            // `switch_cluster` records this scope on the
-                                            // session and hands the SAME value to the closure
-                                            // below, so what the status bar reports and what
-                                            // the watch actually watches cannot disagree.
-                                            None,
-                                            tx2.clone(),
-                                            move || async move {
-                                                cluster::connect_with(&switch_opts).await.map_err(
-                                                    |e| {
-                                                        anyhow::anyhow!(connect_failure_hint(
-                                                            &target_auth,
-                                                            &format!("{e:#}")
-                                                        ))
-                                                    },
-                                                )
-                                            },
-                                            move |client, store, ns| {
-                                                supervise(
-                                                    "watch",
-                                                    spawn_watch(
-                                                        client,
-                                                        pod_ar2,
-                                                        ns,
-                                                        store,
-                                                        tx2.clone(),
-                                                    ),
-                                                    tx2,
-                                                )
-                                            },
-                                        )
-                                        .await;
-                                    });
-                                }
-                            }
-                            Overlay::NamespacePicker(p) => {
-                                if let Some(label) = resolve_picker_choice(&p, i) {
-                                    let ns_choice = namespace_choice_from_label(&label);
-                                    let pod_ar2 = pod_ar.clone();
-                                    let tx2 = tx.clone();
-                                    // `restart_watch` reads the session's CURRENT client
-                                    // from the same lock it uses to tear down and replace
-                                    // the store — not a copy captured earlier, which could
-                                    // have gone stale if a cluster switch completed in the
-                                    // gap between capturing it and taking the lock. See
-                                    // `Session::client`'s doc comment for the interleaving
-                                    // this closes. It records the scope under that same
-                                    // guard and passes it on to the closure, so nothing
-                                    // here has to update a display copy afterwards.
-                                    restart_watch(
-                                        session.clone(),
-                                        ns_choice,
-                                        move |client, store, ns| {
-                                            supervise(
-                                                "watch",
-                                                spawn_watch(
-                                                    client,
-                                                    pod_ar2,
-                                                    ns,
-                                                    store,
-                                                    tx2.clone(),
-                                                ),
-                                                tx2,
-                                            )
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
-                            Overlay::None => {}
+                    match resolve_confirm(&overlay, confirm_index) {
+                        PickerOutcome::NoOp => {}
+                        PickerOutcome::InvalidNamespaceTyped(typed) => {
+                            // Left open rather than closed: the picker
+                            // couldn't have done anything with this text
+                            // anyway, so closing it would just make the user
+                            // reopen it to try again. `is_valid_namespace_name`
+                            // rejected it locally — no request was ever sent.
+                            let _ = tx.send(AppEvent::Error(format!(
+                                "'{typed}' is not a valid namespace name — lowercase \
+                                 alphanumerics and '-', 1-63 chars, cannot start or end with '-'"
+                            )));
+                            needs_redraw = true;
                         }
-                        needs_redraw = true;
+                        PickerOutcome::ClusterChosen(label) => {
+                            overlay = Overlay::None;
+                            let target = ClusterId(label);
+                            // Inherits `allow_interactive_auth: false`
+                            // from `opts`: this connect runs with the
+                            // alternate screen live, so no exec plugin
+                            // may prompt into it. See
+                            // `ConnectOptions::allow_interactive_auth`.
+                            let mut switch_opts = opts.clone();
+                            switch_opts.context = Some(target.0.clone());
+                            // How the target authenticates, so a
+                            // refusal to prompt can say which command
+                            // to run instead of just failing.
+                            let target_auth = entries
+                                .iter()
+                                .find(|e| e.id == target)
+                                .map(|e| e.context.auth.clone())
+                                .unwrap_or(AuthMethod::None);
+                            let session2 = session.clone();
+                            let tx2 = tx.clone();
+                            let pod_ar2 = pod_ar.clone();
+                            tokio::spawn(async move {
+                                switch_cluster(
+                                    session2,
+                                    target,
+                                    // Contexts frequently set no namespace and
+                                    // `default` is empty on these clusters — so a
+                                    // switch overrides whatever `-A`/`-n` chose for
+                                    // the INITIAL connect with all-namespaces.
+                                    // `switch_cluster` records this scope on the
+                                    // session and hands the SAME value to the closure
+                                    // below, so what the status bar reports and what
+                                    // the watch actually watches cannot disagree.
+                                    None,
+                                    tx2.clone(),
+                                    move || async move {
+                                        cluster::connect_with(&switch_opts).await.map_err(|e| {
+                                            anyhow::anyhow!(connect_failure_hint(
+                                                &target_auth,
+                                                &format!("{e:#}")
+                                            ))
+                                        })
+                                    },
+                                    move |client, store, ns| {
+                                        supervise(
+                                            "watch",
+                                            spawn_watch(client, pod_ar2, ns, store, tx2.clone()),
+                                            tx2,
+                                        )
+                                    },
+                                )
+                                .await;
+                            });
+                            needs_redraw = true;
+                        }
+                        PickerOutcome::NamespaceChosen(ns_choice) => {
+                            overlay = Overlay::None;
+                            let pod_ar2 = pod_ar.clone();
+                            let tx2 = tx.clone();
+                            // `restart_watch` reads the session's CURRENT client
+                            // from the same lock it uses to tear down and replace
+                            // the store — not a copy captured earlier, which could
+                            // have gone stale if a cluster switch completed in the
+                            // gap between capturing it and taking the lock. See
+                            // `Session::client`'s doc comment for the interleaving
+                            // this closes. It records the scope under that same
+                            // guard and passes it on to the closure, so nothing
+                            // here has to update a display copy afterwards.
+                            restart_watch(session.clone(), ns_choice, move |client, store, ns| {
+                                supervise(
+                                    "watch",
+                                    spawn_watch(client, pod_ar2, ns, store, tx2.clone()),
+                                    tx2,
+                                )
+                            })
+                            .await;
+                            needs_redraw = true;
+                        }
                     }
                 }
                 Action::None => {}
@@ -1128,19 +1288,256 @@ mod tests {
         #[test]
         fn namespace_picker_items_list_distinct_namespaces_plus_all_namespaces() {
             // Namespaces out of alphabetical order and repeated across
-            // objects, so dedup and sort are both actually exercised.
+            // objects, so dedup and sort are both actually exercised. No API
+            // listing and no current scope, so this exercises only the
+            // loaded-objects source.
             let objects = vec![
                 pod_in("a", "zeta"),
                 pod_in("b", "alpha"),
                 pod_in("c", "zeta"),
                 pod_in("d", "prod"),
             ];
-            let items = namespace_picker_items(&objects);
+            let items = namespace_picker_items(None, &objects, None);
             let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
             assert_eq!(
                 labels,
                 vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
                 "all-namespaces sentinel first, then distinct namespaces sorted"
+            );
+        }
+
+        // --- The three sources: API listing, loaded objects, current scope ---
+
+        #[test]
+        fn merge_namespace_names_deduplicates_sorts_and_keeps_every_sources_own_name() {
+            // Each source contributes a name the others don't have, and the
+            // API list is handed in already out of sorted order — a wrong
+            // implementation that merely concatenated and happened to sort
+            // only one source would still diverge from this. "zeta" is
+            // shared between the API and loaded sources, so dedup is
+            // actually exercised too, not just union.
+            let api = vec!["zeta".to_string(), "mercury".to_string()];
+            let loaded = vec!["alpha", "zeta"];
+            let names = merge_namespace_names(Some(&api), loaded.into_iter(), Some("venus"));
+            assert_eq!(
+                names,
+                vec![
+                    "alpha".to_string(),
+                    "mercury".to_string(),
+                    "venus".to_string(),
+                    "zeta".to_string(),
+                ],
+                "expected the sorted union of all three sources, deduplicated"
+            );
+        }
+
+        #[test]
+        fn namespace_picker_items_includes_a_namespace_seen_only_in_loaded_objects() {
+            // The API list is missing "beta" entirely — a watch can see an
+            // object in a namespace created after the listing GET completed.
+            let api: Result<Vec<String>, NamespaceListError> = Ok(vec!["alpha".to_string()]);
+            let objects = vec![pod_in("a", "beta")];
+            let items = namespace_picker_items(Some(&api), &objects, None);
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"beta"),
+                "a namespace seen only in loaded objects must still appear; got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn namespace_picker_items_includes_a_namespace_returned_only_by_the_api() {
+            // The reverse: nothing has been loaded into the table yet (the
+            // exact shape of the reported bug — 0 objects), but the API
+            // already knows about "gamma".
+            let api: Result<Vec<String>, NamespaceListError> = Ok(vec!["gamma".to_string()]);
+            let objects: Vec<Arc<DynamicObject>> = vec![];
+            let items = namespace_picker_items(Some(&api), &objects, None);
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"gamma"),
+                "a namespace known only to the API must still appear; got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn namespace_picker_items_marks_the_current_namespace() {
+            let api: Result<Vec<String>, NamespaceListError> =
+                Ok(vec!["alpha".to_string(), "beta".to_string()]);
+            let objects: Vec<Arc<DynamicObject>> = vec![];
+            let items = namespace_picker_items(Some(&api), &objects, Some("beta"));
+            let beta = items
+                .iter()
+                .find(|i| i.label == "beta")
+                .expect("beta must be listed");
+            let alpha = items
+                .iter()
+                .find(|i| i.label == "alpha")
+                .expect("alpha must be listed");
+            assert!(
+                beta.detail.contains("current"),
+                "the current namespace must be marked as such; got {:?}",
+                beta.detail
+            );
+            assert!(
+                !alpha.detail.contains("current"),
+                "a namespace that isn't current must not be marked as one; got {:?}",
+                alpha.detail
+            );
+        }
+
+        #[test]
+        fn a_forbidden_listing_shows_an_explanation_instead_of_an_empty_picker() {
+            // The exact shape of the reported bug: 0 objects loaded (pods
+            // forbidden at cluster scope) AND listing namespaces itself
+            // forbidden. The picker must not look like an empty box the user
+            // can't tell is broken from one that is working correctly.
+            let api: Result<Vec<String>, NamespaceListError> =
+                Err(NamespaceListError::Forbidden("nope".to_string()));
+            let objects: Vec<Arc<DynamicObject>> = vec![];
+            let items = namespace_picker_items(Some(&api), &objects, None);
+            assert!(
+                !items.is_empty(),
+                "the picker must never render as a bare empty list"
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|i| i.detail.contains("could not be listed")),
+                "the picker must explain that listing failed; got {:?}",
+                items.iter().map(|i| &i.detail).collect::<Vec<_>>()
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|i| i.detail.to_lowercase().contains("type")
+                        && i.detail.to_lowercase().contains("enter")),
+                "the picker must say a name can be typed directly; got {:?}",
+                items.iter().map(|i| &i.detail).collect::<Vec<_>>()
+            );
+        }
+
+        // --- resolve_confirm: what Enter (or a click) actually does ---
+
+        fn ns_items(labels: &[&str]) -> Vec<PickerItem> {
+            labels
+                .iter()
+                .map(|n| PickerItem {
+                    label: n.to_string(),
+                    detail: String::new(),
+                    accent: None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn resolve_confirm_for_cluster_picker_selects_the_resolved_item() {
+            // Unchanged behaviour for the cluster picker, now routed through
+            // the shared `resolve_confirm` rather than inline in the event
+            // loop.
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items: ns_items(&["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]),
+                filter: "wsdc".into(),
+                selected: 0,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(
+                resolve_confirm(&overlay, index),
+                PickerOutcome::ClusterChosen("tst-wsdc".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_confirm_for_cluster_picker_with_no_match_does_not_invent_a_cluster() {
+            // There is no type-to-enter escape hatch for clusters — a
+            // kubeconfig either has the context or it doesn't, and a typo
+            // must not attempt to connect to whatever was typed.
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items: ns_items(&["prod-eu", "prod-us"]),
+                filter: "no-such-cluster".into(),
+                selected: 0,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(resolve_confirm(&overlay, index), PickerOutcome::NoOp);
+        }
+
+        #[test]
+        fn resolve_confirm_selects_the_matching_item_over_the_typed_filter_text() {
+            // The existing-behaviour regression guard: filter "e" matches
+            // "prod-eu" (filtered position 0) and "dev" (filtered position
+            // 1); with `selected = 1` the picker is highlighting "dev". If
+            // Enter used the typed text "e" instead — itself a
+            // syntactically valid namespace name — this would resolve to
+            // "e", a different (and wrong) answer, so the fixture actually
+            // discriminates the two implementations.
+            let overlay = Overlay::NamespacePicker(Picker {
+                title: "Namespaces".into(),
+                items: ns_items(&["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]),
+                filter: "e".into(),
+                selected: 1,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(
+                resolve_confirm(&overlay, index),
+                PickerOutcome::NamespaceChosen(Some("dev".to_string())),
+                "an item the user can see and pick must win over the typed filter"
+            );
+        }
+
+        #[test]
+        fn resolve_confirm_treats_unmatched_valid_filter_text_as_a_namespace_to_switch_to() {
+            let overlay = Overlay::NamespacePicker(Picker {
+                title: "Namespaces".into(),
+                items: ns_items(&[ALL_NAMESPACES_LABEL, "prod-eu", "prod-us"]),
+                filter: "my-new-ns".into(),
+                selected: 0,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(
+                resolve_confirm(&overlay, index),
+                PickerOutcome::NamespaceChosen(Some("my-new-ns".to_string())),
+                "the only path that needs no listing permission at all must still work"
+            );
+        }
+
+        #[test]
+        fn resolve_confirm_rejects_unmatched_invalid_filter_text() {
+            let overlay = Overlay::NamespacePicker(Picker {
+                title: "Namespaces".into(),
+                items: ns_items(&[ALL_NAMESPACES_LABEL, "prod-eu"]),
+                filter: "Not Valid!".into(),
+                selected: 0,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(
+                resolve_confirm(&overlay, index),
+                PickerOutcome::InvalidNamespaceTyped("Not Valid!".to_string()),
+                "a name that could never be valid must be rejected, not sent to the apiserver"
+            );
+        }
+
+        #[test]
+        fn resolve_confirm_with_an_empty_filter_selects_whatever_is_highlighted() {
+            // An empty filter matches everything (`filtered_indices`'s own
+            // contract), so this must never fall into the typed-text branch.
+            let overlay = Overlay::NamespacePicker(Picker {
+                title: "Namespaces".into(),
+                items: ns_items(&[ALL_NAMESPACES_LABEL, "prod-eu"]),
+                filter: String::new(),
+                selected: 1,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(
+                resolve_confirm(&overlay, index),
+                PickerOutcome::NamespaceChosen(Some("prod-eu".to_string()))
             );
         }
 
@@ -1257,6 +1654,23 @@ mod tests {
             let out = truncate_error(e);
             assert_eq!(out.chars().count(), MAX_ERROR_CHARS + 1);
             assert!(out.starts_with("→→→"));
+        }
+
+        #[test]
+        fn the_forbidden_watch_remedy_survives_truncation() {
+            // The apiserver's own message (which we always append) can be
+            // arbitrarily long — it echoes RBAC rule names, resource names,
+            // sometimes the requesting identity. If the remedy were appended
+            // after that text instead of leading it, this is exactly the
+            // scenario that would silently drop it.
+            use kube_tui::store::watch::forbidden_message;
+            let long_detail = "x".repeat(500);
+            let msg = forbidden_message("pods", None, &long_detail);
+            let shown = truncate_error(msg);
+            assert!(
+                shown.contains("-n <namespace>"),
+                "the actionable remedy must survive the status bar's truncation budget; got {shown}"
+            );
         }
 
         // --- Errors are retired as well as raised ---

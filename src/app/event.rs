@@ -1,4 +1,5 @@
 use crate::app::session::SessionEvent;
+use crate::cluster::NamespaceListError;
 use crossterm::event::Event as CtEvent;
 use indexmap::IndexMap;
 use kube::api::GroupVersionKind;
@@ -27,6 +28,12 @@ pub enum AppEvent {
     /// Progress of a cluster switch. Carries no data the store owns — the
     /// registry is the source of truth; this only says something changed.
     Session(SessionEvent),
+    /// The result of fetching namespaces from the API, in answer to the
+    /// namespace picker opening. Fetching is I/O, so it runs on a spawned
+    /// task (see `cluster::namespaces::list_namespaces`) and arrives back
+    /// through this channel rather than blocking the draw that opens the
+    /// picker.
+    NamespacesListed(Result<Vec<String>, NamespaceListError>),
     Error(String),
     Quit,
 }
@@ -42,6 +49,12 @@ pub struct Coalesced {
     /// `Connected` behind it would lose the only frame that says the app is
     /// waiting on a cluster that takes tens of seconds to answer.
     pub session_events: Vec<SessionEvent>,
+    /// The most recent namespace-listing result seen in this batch, if any.
+    /// Only ever one fetch is in flight at a time in practice, but if the
+    /// picker were opened, closed and reopened fast enough to queue two
+    /// results in one batch, the newer one is what the picker should show —
+    /// same reasoning as `status_changes` keeping only the latest per kind.
+    pub namespace_list: Option<Result<Vec<String>, NamespaceListError>>,
     pub quit: bool,
 }
 
@@ -62,6 +75,7 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
                 statuses.insert(gvk, status);
             }
             AppEvent::Session(s) => out.session_events.push(s),
+            AppEvent::NamespacesListed(r) => out.namespace_list = Some(r),
             AppEvent::Error(e) => out.errors.push(e),
             AppEvent::Quit => out.quit = true,
         }
@@ -163,6 +177,33 @@ mod tests {
                 SessionEvent::Connecting(id.clone()),
                 SessionEvent::Connected(id),
             ]
+        );
+    }
+
+    #[test]
+    fn the_latest_namespace_listing_result_wins() {
+        // Mirrors `latest_status_per_gvk_wins`: at most one fetch is
+        // normally in flight, but if the picker is reopened fast enough to
+        // queue two results in the same batch, the newer one is what the
+        // picker should actually show.
+        use crate::cluster::NamespaceListError;
+        let out = coalesce(vec![
+            AppEvent::NamespacesListed(Err(NamespaceListError::Forbidden("stale".to_string()))),
+            AppEvent::NamespacesListed(Ok(vec!["alpha".to_string(), "beta".to_string()])),
+        ]);
+        assert_eq!(
+            out.namespace_list,
+            Some(Ok(vec!["alpha".to_string(), "beta".to_string()])),
+            "the newer fetch result must win, not the stale forbidden one"
+        );
+    }
+
+    #[test]
+    fn a_batch_with_no_namespace_listing_event_reports_none() {
+        let out = coalesce(vec![AppEvent::StoreChanged { gvk: pod_gvk() }]);
+        assert_eq!(
+            out.namespace_list, None,
+            "unrelated events must not manufacture a listing result"
         );
     }
 
