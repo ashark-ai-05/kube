@@ -1,5 +1,5 @@
 use anyhow::{Context as _, anyhow};
-use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::config::{ExecInteractiveMode, KubeConfigOptions, Kubeconfig};
 use std::path::{Path, PathBuf};
 
 /// How a context authenticates. Surfaced in the UI so that an auth failure
@@ -55,8 +55,9 @@ pub fn auth_method_for(kc: &Kubeconfig, user_name: &str) -> AuthMethod {
 /// Options controlling how a client is built.
 ///
 /// The derived `Default` gives `kubeconfig_paths: vec![]`, `context: None`
-/// (use the kubeconfig's current-context), and `accept_invalid_certs: false`
-/// (TLS verification stays on unless explicitly disabled).
+/// (use the kubeconfig's current-context), `accept_invalid_certs: false`
+/// (TLS verification stays on unless explicitly disabled), and
+/// `allow_interactive_auth: false` — see that field.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
     /// Kubeconfig files to load and merge, in precedence order.
@@ -66,6 +67,26 @@ pub struct ConnectOptions {
     /// Skip TLS verification. Defaults to false and should stay that way
     /// outside deliberate debugging.
     pub accept_invalid_certs: bool,
+    /// Whether an exec credential plugin may take over this process's
+    /// terminal.
+    ///
+    /// Defaults to FALSE, because that is the only safe answer for a connect
+    /// made from inside a running TUI, and the default is what a cloned
+    /// `ConnectOptions` carries into a cluster switch. Only the startup
+    /// connect — which happens before raw mode, the alternate screen and
+    /// mouse capture are turned on — may set it.
+    ///
+    /// `kube_client`'s exec path gives the plugin `Stdio::inherit()` for
+    /// stdin and stderr whenever `interactive_mode != Some(Never)`, and
+    /// `interactive_mode` is absent from almost every real kubeconfig, so
+    /// interactive is the default path rather than an exotic one. Inside the
+    /// TUI that means an expired `kubelogin`/`gke-gcloud-auth-plugin` prints
+    /// its SSO URL into the ratatui buffer with no carriage returns (raw mode
+    /// staircases it, and ratatui's diff renderer will never repaint over
+    /// it), and if it prompts it blocks on a stdin that crossterm's
+    /// `EventStream` is concurrently draining: the switch never completes and
+    /// keystrokes are eaten.
+    pub allow_interactive_auth: bool,
 }
 
 /// Resolve which kubeconfig files to read, following KUBECONFIG semantics:
@@ -92,6 +113,29 @@ pub fn merge_kubeconfigs(configs: Vec<Kubeconfig>) -> anyhow::Result<Kubeconfig>
     })
 }
 
+/// Forbid every exec credential plugin in this kubeconfig from taking over
+/// the terminal.
+///
+/// `kube_client::client::auth` decides interactivity per auth_info: absent
+/// `interactiveMode` means interactive, and the plugin then inherits OUR
+/// stdin and stderr. Setting it explicitly takes the choice away from the
+/// plugin rather than trying to suspend and restore the terminal around a
+/// connect, which is a much larger design change for the same outcome.
+///
+/// The effect is a clean split: a plugin with a valid cached token works
+/// exactly as before, and one that needs to prompt fails with an error we can
+/// put in the status bar instead of corrupting the screen and hanging on a
+/// stdin something else is already reading.
+pub fn disable_interactive_exec(kc: &mut Kubeconfig) {
+    for named in &mut kc.auth_infos {
+        if let Some(auth_info) = &mut named.auth_info
+            && let Some(exec) = &mut auth_info.exec
+        {
+            exec.interactive_mode = Some(ExecInteractiveMode::Never);
+        }
+    }
+}
+
 /// Build a client for the requested context, merging every configured
 /// kubeconfig first so one unified file (or several) can define many clusters.
 pub async fn connect_with(opts: &ConnectOptions) -> anyhow::Result<kube::Client> {
@@ -102,11 +146,19 @@ pub async fn connect_with(opts: &ConnectOptions) -> anyhow::Result<kube::Client>
                 .with_context(|| format!("reading kubeconfig {}", path.display()))?,
         );
     }
-    let merged = if loaded.is_empty() {
+    let mut merged = if loaded.is_empty() {
         Kubeconfig::read().context("reading kubeconfig")?
     } else {
         merge_kubeconfigs(loaded)?
     };
+
+    // Before `from_custom_kubeconfig`, which is what eventually runs the
+    // plugin: `Client::try_from` builds the auth layer eagerly, so the exec
+    // subprocess is spawned inside this function, not lazily on first
+    // request. See `ConnectOptions::allow_interactive_auth`.
+    if !opts.allow_interactive_auth {
+        disable_interactive_exec(&mut merged);
+    }
 
     let kco = KubeConfigOptions {
         context: opts.context.clone(),
@@ -309,6 +361,94 @@ users:
         assert!(
             !o.accept_invalid_certs,
             "TLS verification must default to on"
+        );
+    }
+
+    // --- Exec credential plugins must never take over a live TUI ---
+
+    /// Every auth_info in the fixture that actually has an `exec` block,
+    /// paired with the interactive mode currently set on it.
+    fn exec_modes(kc: &Kubeconfig) -> Vec<(String, Option<ExecInteractiveMode>)> {
+        kc.auth_infos
+            .iter()
+            .filter_map(|named| {
+                let exec = named.auth_info.as_ref()?.exec.as_ref()?;
+                Some((named.name.clone(), exec.interactive_mode.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_kubeconfig_starts_out_letting_every_exec_plugin_be_interactive() {
+        // The premise of the fix, pinned so the test below cannot pass
+        // vacuously: real kubeconfigs omit `interactiveMode`, and
+        // kube_client reads absent as INTERACTIVE — it hands the plugin
+        // Stdio::inherit() for stdin and stderr. Interactive is the default
+        // path, not an exotic one.
+        let modes = exec_modes(&kc());
+        assert_eq!(
+            modes.len(),
+            2,
+            "the fixture must actually contain exec users, got {modes:?}"
+        );
+        assert!(
+            modes.iter().all(|(_, m)| m.is_none()),
+            "as loaded, no exec block pins a mode: {modes:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_interactive_exec_covers_every_auth_info_with_an_exec_block() {
+        // One left interactive is enough to garble the screen and hang the
+        // switch, so this must be all of them — including
+        // `exec-with-stale-token`, whose cached token makes it look like it
+        // would never need to run the plugin.
+        let mut kc = kc();
+        disable_interactive_exec(&mut kc);
+        let modes = exec_modes(&kc);
+        assert_eq!(modes.len(), 2, "no exec block may be dropped: {modes:?}");
+        for (name, mode) in &modes {
+            assert_eq!(
+                mode.as_ref(),
+                Some(&ExecInteractiveMode::Never),
+                "{name} may still prompt into our alternate screen"
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_interactive_exec_leaves_non_exec_users_untouched() {
+        // Nothing else about the kubeconfig may change: the cert, token and
+        // auth-provider users must still authenticate exactly as before.
+        let mut kc = kc();
+        disable_interactive_exec(&mut kc);
+        assert_eq!(auth_method_for(&kc, "cert-user"), AuthMethod::ClientCert);
+        assert_eq!(auth_method_for(&kc, "token-user"), AuthMethod::Token);
+        assert_eq!(
+            auth_method_for(&kc, "oidc-user"),
+            AuthMethod::AuthProvider {
+                name: "oidc".to_string()
+            }
+        );
+        assert_eq!(
+            auth_method_for(&kc, "exec-user"),
+            AuthMethod::Exec {
+                command: "kubelogin".to_string()
+            },
+            "the plugin still runs — it just may not prompt"
+        );
+    }
+
+    #[test]
+    fn interactive_auth_is_off_by_default_so_a_switch_cannot_inherit_it() {
+        // A cluster switch clones the startup `ConnectOptions` and overrides
+        // only the context, so whatever this defaults to is what a connect
+        // made from inside the live alternate screen gets. It must be the
+        // safe answer; only the startup connect, made before the terminal is
+        // touched, opts in.
+        assert!(
+            !ConnectOptions::default().allow_interactive_auth,
+            "a connect from inside the TUI must never let a plugin take the terminal"
         );
     }
 }

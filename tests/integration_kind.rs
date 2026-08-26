@@ -5,15 +5,17 @@
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ApiResource, GroupVersionKind};
 use kube_tui::app::event::{AppEvent, WatchStatus};
+use kube_tui::store::handles::WatchHandles;
+use kube_tui::store::table::fetch_table;
 use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard, RwLock, mpsc};
 
-/// The two tests share the `demo` namespace and its deployment: one asserts a
-/// pod count while the other deletes a pod. Rust runs tests in parallel by
-/// default, so they must be serialised against each other. A mutex enforces
-/// this in the code rather than relying on someone remembering
+/// These tests share the `demo` namespace and its deployment — some assert a
+/// pod count or its rendered columns, others delete a pod. Rust runs tests in
+/// parallel by default, so they must be serialised against each other. A
+/// mutex enforces this in the code rather than relying on someone remembering
 /// `--test-threads=1`.
 ///
 /// This is `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
@@ -140,5 +142,148 @@ async fn store_reflects_a_deletion_made_during_the_watch() {
     assert!(
         gone,
         "deleted pod {victim} never disappeared from the store"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
+async fn fetch_table_returns_kubectl_equivalent_columns() {
+    let _serial = cluster_lock().await;
+    let client = kube_tui::cluster::connect()
+        .await
+        .expect("connect to cluster");
+
+    // fetch_table is a hand-rolled raw HTTP request (kube 4.2 has no Table
+    // support at all — see docs/superpowers/plan2-api-reference.md B4): it
+    // sets `Accept: application/json;as=Table;v=1;g=meta.k8s.io` on a request
+    // built by hand and hopes the server honours it. No unit test can catch a
+    // drifted header, because decode_table only ever sees hand-written JSON
+    // that already looks like a Table. This is the first time that header
+    // actually leaves the process.
+    let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "demo");
+    let table = fetch_table(&client, pods.resource_url()).await.expect(
+        "fetch_table failed — if the Accept header has drifted from what this \
+         server accepts, it silently answers with an ordinary PodList instead \
+         of a Table, and decode_table rejects that for having no \
+         columnDefinitions",
+    );
+
+    let column_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+    for expected in ["Name", "Ready", "Status"] {
+        assert!(
+            column_names.contains(&expected),
+            "expected a {expected} column among kubectl's own printer columns for \
+             pods, got {column_names:?}"
+        );
+    }
+
+    assert!(
+        !table.rows.is_empty(),
+        "expected at least one row for the demo namespace's pods, got none — \
+         either the fixture is missing or the server returned an empty Table \
+         despite reporting the right columns"
+    );
+
+    // decode_table pads ragged rows and truncates over-long ones so a real
+    // row always matches the declared column count; confirm that held for
+    // whatever the server actually sent, not just for decode_table's own
+    // synthetic fixtures.
+    for row in &table.rows {
+        assert_eq!(
+            row.len(),
+            table.columns.len(),
+            "a real row's width must match the declared column count, got {row:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a cluster; run ./scripts/dev-cluster.sh then cargo test -- --ignored"]
+async fn switching_clusters_aborts_the_previous_watch() {
+    let _serial = cluster_lock().await;
+    let client = kube_tui::cluster::connect().await.expect("connect");
+    let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+    let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+
+    let handle = spawn_watch(
+        client.clone(),
+        ApiResource::erase::<Pod>(&()),
+        Some("demo".to_string()),
+        store.clone(),
+        tx.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(ev) = rx.recv().await {
+            if let AppEvent::WatchStatus {
+                status: WatchStatus::Synced,
+                ..
+            } = ev
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("initial sync timed out");
+
+    let mut before: Vec<String> = store
+        .read()
+        .await
+        .objects(&gvk)
+        .iter()
+        .filter_map(|o| o.metadata.name.clone())
+        .collect();
+    before.sort();
+    let victim = before.first().cloned().expect("at least one demo pod");
+
+    // Abort exactly the way a cluster switch does: register the watch's
+    // `JoinHandle` in the same `WatchHandles` registry `Session` uses, then
+    // call `abort_all()` — not `handle.abort()` directly — so this exercises
+    // the real teardown path rather than a stand-in for it.
+    let mut handles = WatchHandles::new();
+    handles.push(handle);
+    assert_eq!(
+        handles.abort_all(),
+        1,
+        "the watch must actually be registered and aborted"
+    );
+
+    // Mutate the cluster: delete the pod the watch would have reported, were
+    // it still alive. The `web` deployment immediately schedules a
+    // replacement, so a LIVE watch would both drop `victim` from the store
+    // and add the new pod within a few seconds — see
+    // `store_reflects_a_deletion_made_during_the_watch` above, which asserts
+    // exactly that disappearance, on a live watch, within 60s.
+    let pods: kube::Api<Pod> = kube::Api::namespaced(client, "demo");
+    use kube::api::DeleteParams;
+    let _ = pods.delete(&victim, &DeleteParams::default()).await;
+
+    // Give a live watch far more time than it would ever need to report this,
+    // then assert nothing changed. If `abort_all()` had failed to stop the
+    // task — the exact regression this test exists to catch — this would
+    // fail the same way the sibling deletion test's `gone` check would:
+    // `victim` would disappear and a replacement would appear in `after`.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let mut after: Vec<String> = store
+        .read()
+        .await
+        .objects(&gvk)
+        .iter()
+        .filter_map(|o| o.metadata.name.clone())
+        .collect();
+    after.sort();
+
+    assert_eq!(
+        before, after,
+        "the store changed after its watch was aborted — a delta reached it \
+         when abort_all() should have stopped delivery entirely"
+    );
+    assert!(
+        after.contains(&victim),
+        "the deleted pod must still be listed: an aborted watch cannot have \
+         reported its removal"
     );
 }

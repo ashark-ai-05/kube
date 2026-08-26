@@ -1,22 +1,324 @@
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{ApiResource, GroupVersionKind};
-use kube_tui::app::event::{AppEvent, WatchStatus, coalesce};
+use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube_tui::app::Overlay;
+use kube_tui::app::event::{AppEvent, Coalesced, WatchStatus, coalesce};
 use kube_tui::app::input::{Action, action_for, apply_selection};
+use kube_tui::app::session::{
+    Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
+};
 use kube_tui::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use kube_tui::cluster;
-use kube_tui::store::watch::{ResourceStore, SharedStore, spawn_watch};
+use kube_tui::cluster::{AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState};
+use kube_tui::store::watch::spawn_watch;
 use kube_tui::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use kube_tui::ui::hit::HitRegistry;
+use kube_tui::ui::ribbon::{render_ribbon, split_ribbon};
+use kube_tui::ui::theme;
+use kube_tui::ui::views::picker::{
+    Picker, PickerItem, centered, clamp_selection, filtered_indices, render_picker,
+};
 use kube_tui::ui::views::status::render_status;
 use kube_tui::ui::views::table::{TableView, render_table};
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+
+/// A namespace choice meaning "watch everything", not a literal namespace.
+/// Not a valid Kubernetes namespace name (it contains a space), so it can
+/// never collide with a real one.
+const ALL_NAMESPACES_LABEL: &str = "all namespaces";
+
+/// Build the cluster picker's item list fresh from the registry.
+///
+/// The registry is the only source of truth for connection state —
+/// `SessionEvent`s are emitted after the session lock is released, so
+/// concurrent switches can emit them in an order that disagrees with the
+/// registry. Reading state through events here instead would risk showing a
+/// cluster as connected when a later, still-in-flight attempt has already
+/// superseded it.
+fn cluster_picker_items(entries: &[ClusterEntry]) -> Vec<PickerItem> {
+    entries
+        .iter()
+        .map(|e| {
+            let detail = match &e.state {
+                ConnectionState::Disconnected => String::new(),
+                ConnectionState::Connecting => "connecting…".to_string(),
+                ConnectionState::Connected => "connected".to_string(),
+                ConnectionState::Failed { reason } => format!("failed: {reason}"),
+            };
+            PickerItem {
+                label: e.id.0.clone(),
+                detail,
+                accent: Some(theme::cluster_hue(&e.id.0)),
+            }
+        })
+        .collect()
+}
+
+/// Build the namespace picker's item list from the namespaces actually
+/// present in the objects currently loaded, plus an "all namespaces" entry.
+///
+/// There is no cluster-wide namespace listing wired up (that would be its
+/// own `Namespace` watch) — this reflects what the current watch has
+/// actually seen, which is complete whenever the default all-namespaces
+/// scope is active and partial otherwise.
+fn namespace_picker_items(objects: &[Arc<DynamicObject>]) -> Vec<PickerItem> {
+    let names: BTreeSet<String> = objects
+        .iter()
+        .filter_map(|o| o.metadata.namespace.clone())
+        .collect();
+    let mut items = Vec::with_capacity(names.len() + 1);
+    items.push(PickerItem {
+        label: ALL_NAMESPACES_LABEL.to_string(),
+        detail: "watch every namespace".to_string(),
+        accent: None,
+    });
+    items.extend(names.into_iter().map(|n| PickerItem {
+        label: n,
+        detail: String::new(),
+        accent: None,
+    }));
+    items
+}
+
+/// How a namespace scope reads in the status bar.
+///
+/// The inverse of `namespace_choice_from_label`: `None` is the all-namespaces
+/// scope, which has no namespace name to print. Derived from the session's
+/// scope on every frame rather than tracked alongside it, so the bar can
+/// never name a namespace no watch is actually watching.
+fn display_namespace(namespace: Option<&str>) -> &str {
+    namespace.unwrap_or(ALL_NAMESPACES_LABEL)
+}
+
+/// `None` means "all namespaces" — the sentinel label, not a real namespace.
+fn namespace_choice_from_label(label: &str) -> Option<String> {
+    if label == ALL_NAMESPACES_LABEL {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Name of the cluster a switch is connecting to, if any.
+///
+/// While a connect is in flight the active cluster is still the OLD one —
+/// `switch_cluster` only tears down and activates the new one on success —
+/// so a status bar that reads only `registry.active()` shows no sign of an
+/// attempt in progress. This must scan for a `ConnectionState::Connecting`
+/// entry instead; the registry is the only source of truth for connection
+/// state, since `SessionEvent`s are emitted after the session lock is
+/// released and can arrive out of order across concurrent switches.
+fn connecting_cluster_name(entries: &[ClusterEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| matches!(e.state, ConnectionState::Connecting))
+        .map(|e| e.id.0.clone())
+}
+
+/// The filtered-list index a confirmed picker choice refers to, whether it
+/// came from a click or from Enter.
+///
+/// `PickerSelect` already carries the index a click landed on. `PickerConfirm`
+/// (Enter) carries none — it confirms whatever the picker currently has
+/// highlighted, `Picker::selected`, itself a filtered-list index per
+/// `picker.rs`'s own contract (`render_picker` compares it against `row`,
+/// enumerated over the FILTERED matches). Any other action, or `PickerConfirm`
+/// with no picker open, resolves nothing.
+fn confirm_index_for(action: Action, overlay: &Overlay) -> Option<usize> {
+    match action {
+        Action::PickerSelect(i) => Some(i),
+        Action::PickerConfirm => overlay.picker().map(|p| p.selected),
+        _ => None,
+    }
+}
+
+/// Resolve a filtered-list index back to the item it actually refers to.
+///
+/// `HitTarget::PickerRow` and `Picker::selected` both carry an index into
+/// the FILTERED list, not the full item list — mapping through
+/// `filtered_indices` is what makes a filtered click (or Enter) act on the
+/// row actually shown rather than on whatever unfiltered index happens to
+/// share that number. Getting this wrong is how a filtered click selects
+/// the wrong cluster.
+fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<String> {
+    let matches = filtered_indices(&picker.items, &picker.filter);
+    matches
+        .get(filtered_index)
+        .and_then(|&real| picker.items.get(real))
+        .map(|item| item.label.clone())
+}
+
+/// Turn a failed connect into something the user can act on.
+///
+/// Connects made from inside the TUI forbid exec plugins from prompting (see
+/// `ConnectOptions::allow_interactive_auth`), so on a cluster behind SSO the
+/// usual failure is not "wrong password" but "this credential needed a login
+/// and we would not let it ask". The status bar has room for one line, and
+/// the plugin's own name is the difference between a mystery and an
+/// instruction — the fix is always to run it, or any `kubectl` command, in a
+/// real shell and come back.
+///
+/// A blank command (`exec:` with no `command:`) yields no hint: naming
+/// nothing helps nobody.
+fn connect_failure_hint(auth: &AuthMethod, error: &str) -> String {
+    match auth {
+        AuthMethod::Exec { command } if !command.is_empty() => {
+            format!("{error} — '{command}' needs to log in; run it in a shell first")
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// The longest error text that may reach the status bar.
+const MAX_ERROR_CHARS: usize = 200;
+
+/// Cap an error at something a one-line status bar can plausibly carry.
+///
+/// The bar is one row and already width-truncates, so length costs nothing
+/// visually — but it is also what bounds an error we do not control the
+/// contents of. `kube::client::auth::Error::AuthExecRun` formats
+/// `out: std::process::Output` with `{out:?}`, which includes the credential
+/// plugin's stdout — where a partial `ExecCredential` (token and all) sits if
+/// the plugin exits non-zero after printing one. It renders as a decimal byte
+/// array, and nothing in this app writes logs, so it never leaves the screen;
+/// capping it keeps it from being the whole line as well.
+///
+/// Truncates by CHARACTERS, not bytes: an error containing multi-byte text
+/// (a cluster name, a server-supplied message) would panic a byte slice on a
+/// character boundary.
+fn truncate_error(e: String) -> String {
+    if e.chars().count() <= MAX_ERROR_CHARS {
+        return e;
+    }
+    let mut out: String = e.chars().take(MAX_ERROR_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// The error the status bar should show after this batch of events.
+///
+/// Nothing used to clear `last_error`, so a single watch blip on prod pinned
+/// an error for the rest of the session: switch to dev, watch it connect and
+/// stream 250 pods, and the bar still reads `dev · … · 250 items · live`
+/// beside prod's dead error — permanently, and permanently suppressing the
+/// all-namespaces hint with it (`status.rs`).
+///
+/// Two things retire an error, both meaning "whatever went wrong is no
+/// longer what is happening": a switch that actually connected, and this
+/// kind's watch reporting itself synced. The kind is checked because
+/// `status_changes` carries every watched kind, and another kind's health
+/// says nothing about this one's error.
+///
+/// Clearing happens BEFORE new errors are applied, so an error arriving in
+/// the same batch as a sync still shows. `coalesce` keeps errors and status
+/// changes in separate lists and their relative order is lost, so this is a
+/// deliberate choice between two risks: showing a resolved error one batch
+/// too long, or hiding a live one. Only the first is recoverable.
+fn next_error(
+    previous: Option<String>,
+    batch: &Coalesced,
+    gvk: &GroupVersionKind,
+) -> Option<String> {
+    let mut error = previous;
+
+    let connected = batch
+        .session_events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Connected(_)));
+    let synced = batch
+        .status_changes
+        .iter()
+        .any(|(k, s)| k == gvk && *s == WatchStatus::Synced);
+    if connected || synced {
+        error = None;
+    }
+
+    // Everything that becomes a visible error passes through `truncate_error`
+    // here — one choke point, so no future error source can bypass the cap.
+    for e in &batch.session_events {
+        if let SessionEvent::ConnectFailed { id, reason } = e {
+            error = Some(truncate_error(format!("connecting to {}: {reason}", id.0)));
+        }
+    }
+    if let Some(e) = batch.errors.last() {
+        error = Some(truncate_error(e.clone()));
+    }
+    error
+}
+
+/// Everything one frame needs out of the store, read in a single lock
+/// acquisition.
+///
+/// Objects and watch health must come from the SAME store, because a cluster
+/// switch replaces the store wholesale (`switch_cluster` step 5). Keeping
+/// health in a separate local fed by `WatchStatus` events instead means a
+/// switch empties the table while the old cluster's "live" survives — an
+/// empty table presented as fresh, which `ui/views/status.rs` calls out as
+/// the worst failure mode for an ops tool. A replaced store reports
+/// `Initialising` by construction, so reading both here makes that state
+/// unrepresentable rather than something to remember to reset.
+async fn store_snapshot(
+    store: &kube_tui::store::watch::SharedStore,
+    gvk: &GroupVersionKind,
+) -> (Vec<Arc<DynamicObject>>, WatchStatus) {
+    let s = store.read().await;
+    (s.objects(gvk), s.status(gvk))
+}
+
+/// Draw one frame: the ribbon, then the table and status bar, then the
+/// overlay LAST — so its z=1 hit zones (registered by `render_picker`)
+/// resolve above the table's z=0 zones wherever the two overlap, and its
+/// own content (behind a `Clear`) paints over whatever the table left in
+/// that region.
+#[allow(clippy::too_many_arguments)]
+fn render_frame(
+    f: &mut Frame,
+    objects: &[Arc<DynamicObject>],
+    gvk: &GroupVersionKind,
+    view: &mut TableView,
+    context_name: &str,
+    display_namespace: &str,
+    status: WatchStatus,
+    last_error: Option<&str>,
+    show_hint: bool,
+    connecting: Option<&str>,
+    // Mutable because the picker owns its scroll offset and advances it
+    // during the draw, exactly as `TableView` does — see `render_picker`.
+    overlay: &mut Overlay,
+    hits: &mut HitRegistry,
+) {
+    let full = f.area();
+    let (ribbon_area, rest) = split_ribbon(full);
+    render_ribbon(f, ribbon_area, Some(context_name), hits);
+
+    let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(rest);
+    render_table(f, chunks[0], objects, gvk, view, hits);
+    render_status(
+        f,
+        chunks[1],
+        context_name,
+        display_namespace,
+        status,
+        objects.len(),
+        last_error,
+        show_hint,
+        connecting,
+        hits,
+    );
+
+    if let Some(picker) = overlay.picker_mut() {
+        let area = centered(f.area(), 60, 60);
+        render_picker(f, area, picker, hits);
+    }
+}
 
 /// Describe why a supervised task stopped, including the panic message.
 ///
@@ -37,21 +339,48 @@ fn join_failure_detail(task: &str, e: tokio::task::JoinError) -> String {
     }
 }
 
+/// Cancels the task it holds when dropped.
+///
+/// Dropping a `JoinHandle` *detaches* its task rather than cancelling it, so a
+/// supervisor that is aborted while awaiting one would leave the watch beneath
+/// it running — the exact leak `WatchHandles` exists to prevent.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Watch a background task and turn its death into a visible error plus a quit.
 ///
 /// Tokio swallows a panicking task at the `JoinHandle` boundary; without this
 /// the UI keeps drawing as if everything were still live.
+///
+/// Returns the supervisor's own handle. Only one owner can await a
+/// `JoinHandle`, and observing a panic requires owning it, so the supervisor
+/// takes the watch and this handle is what goes into `WatchHandles`; aborting
+/// it cancels the watch underneath through `AbortOnDrop`.
 fn supervise(
     task: &'static str,
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::UnboundedSender<AppEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
+    let abort_watch = handle.abort_handle();
     tokio::spawn(async move {
-        if let Err(e) = handle.await {
-            let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
-            let _ = tx.send(AppEvent::Quit);
+        let _cancel_on_abort = AbortOnDrop(abort_watch);
+        match handle.await {
+            Ok(()) => {}
+            // Switching clusters aborts the outgoing cluster's watches. That
+            // is a normal teardown, not a crash: quitting here would exit the
+            // application on the user's first cluster switch.
+            Err(e) if is_deliberate_abort(&e) => {}
+            Err(e) => {
+                let _ = tx.send(AppEvent::Error(join_failure_detail(task, e)));
+                let _ = tx.send(AppEvent::Quit);
+            }
         }
-    });
+    })
 }
 
 #[tokio::main]
@@ -103,8 +432,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     };
 
     // The terminal has not been touched yet, so on failure this prints
-    // straight to stderr rather than corrupting an alternate screen.
-    let client = match cluster::connect_with(&opts).await {
+    // straight to stderr rather than corrupting an alternate screen — and,
+    // for the same reason, this is the ONE connect where an exec credential
+    // plugin may legitimately take stdin and stderr and walk the user
+    // through an SSO login. `opts` itself keeps the safe default, so the
+    // clone every cluster switch takes cannot inherit this permission.
+    let startup_opts = cluster::ConnectOptions {
+        allow_interactive_auth: true,
+        ..opts.clone()
+    };
+    let client = match cluster::connect_with(&startup_opts).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("kube: could not connect to a cluster: {e:#}");
@@ -113,7 +450,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     };
 
     let contexts = cluster::load_contexts().unwrap_or_default();
-    let (context_name, context_namespace, namespace_from_context) = contexts
+    let (startup_context_name, context_namespace, namespace_from_context) = contexts
         .iter()
         .find(|c| c.is_current)
         .map(|c| {
@@ -126,39 +463,63 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| ("unknown".into(), "default".into(), false));
 
-    // Resolve the CLI scope to a namespace for the watch, display string for UI, and fallback flag.
-    // The fallback flag is true when we're watching the "default" namespace because the context
-    // didn't specify a namespace (not because the user chose it explicitly or via -n).
-    let (watch_namespace, display_namespace, is_fallback_namespace) = match cli_scope {
-        NamespaceScope::One(ns) => (Some(ns.clone()), ns, false),
-        NamespaceScope::All => (None, "all namespaces".into(), false),
+    // Resolve the CLI scope to the namespace the watch will use and whether
+    // that is a fallback. The fallback flag is true when we're watching the
+    // "default" namespace because the context didn't specify one (not because
+    // the user chose it explicitly or via -n); it is the only condition under
+    // which the "try -A" hint applies, and only until the user chooses a
+    // scope themselves. The DISPLAY string is not computed here — it is
+    // derived from the session on every frame, so it can never name a scope
+    // no watch is using.
+    let (watch_namespace, is_fallback_namespace) = match cli_scope {
+        NamespaceScope::One(ns) => (Some(ns), false),
+        NamespaceScope::All => (None, false),
         NamespaceScope::FromContext => {
             let is_fallback = !namespace_from_context && context_namespace == "default";
-            (
-                Some(context_namespace.clone()),
-                context_namespace,
-                is_fallback,
-            )
+            (Some(context_namespace), is_fallback)
         }
     };
 
-    let store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+    // Everything belonging to "the cluster on screen" lives behind one handle
+    // so that a switch can replace it wholesale — the store in particular is
+    // replaced rather than cleared. See `switch_cluster`. `Session` also
+    // owns the Client for whichever cluster is active: a namespace switch
+    // reads it from the SAME lock it uses to restart the watch (see
+    // `restart_watch`), rather than from a separate cell elsewhere that
+    // could go stale relative to a concurrent cluster switch. The namespace
+    // scope lives there for the same reason: it describes the watch that is
+    // actually running, so it is read back from the session each frame
+    // rather than tracked alongside it.
+    let session: SharedSession = Arc::new(Mutex::new(Session::new(
+        ClusterRegistry::from_contexts(contexts),
+        client.clone(),
+        watch_namespace.clone(),
+        is_fallback_namespace,
+    )));
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     let pod_ar = ApiResource::erase::<Pod>(&());
     let pod_gvk = GroupVersionKind::gvk("", "v1", "Pod");
     let watch_handle = spawn_watch(
         client.clone(),
-        pod_ar,
+        pod_ar.clone(),
         watch_namespace,
-        store.clone(),
+        session.lock().await.store.clone(),
         tx.clone(),
     );
 
     // Tokio swallows a panicking task at the JoinHandle boundary. Without this,
     // a dead watch leaves the UI drawing indefinitely against a store nothing
     // is updating any more, showing stale data as if it were live.
-    supervise("watch", watch_handle, tx.clone());
+    //
+    // The session tracks the SUPERVISOR's handle, not the watch's, so that the
+    // first cluster switch tears this watch down with all the others; aborting
+    // a supervisor cancels its watch. See `supervise`.
+    session
+        .lock()
+        .await
+        .handles
+        .push(supervise("watch", watch_handle, tx.clone()));
 
     // Feed terminal input into the same channel so there is one wake source.
     let input_handle = {
@@ -192,7 +553,10 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // Same reasoning as the watch task: a panicking input reader would
     // otherwise stop delivering keystrokes and mouse clicks with no visible
     // symptom beyond "the UI stopped responding".
-    supervise("input", input_handle, tx.clone());
+    //
+    // Deliberately not tracked in the session: the input reader outlives every
+    // cluster, so a switch must not abort it.
+    let _input_supervisor = supervise("input", input_handle, tx.clone());
 
     // `kill <pid>` skips every `Drop`, so without this the process dies holding
     // raw mode, mouse capture and the alternate screen — the dead shell this
@@ -237,9 +601,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 
     let mut view = TableView::new();
     let mut hits = HitRegistry::new();
-    let mut selected: usize = 0;
     let mut last_error: Option<String> = None;
-    let mut status = WatchStatus::Initialising;
+    // At most one picker is ever open; opening one replaces whatever was
+    // open before. Neither cluster nor namespace picking touched a network
+    // before this task — this is what makes them reachable.
+    let mut overlay = Overlay::None;
     // Nothing has been painted yet, so the first batch must draw whatever it is.
     let mut needs_redraw = true;
 
@@ -261,18 +627,78 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // With all-motion mouse reporting, a bare mouse move otherwise costs a
         // full repaint, and `columns_for` reformats every object each frame.
         needs_redraw |= batch.store_dirty;
-        if let Some(e) = batch.errors.last() {
-            last_error = Some(e.clone());
+        // Errors are raised AND retired here: see `next_error`. Without the
+        // retiring half a single blip pins an error across every subsequent
+        // switch.
+        let updated_error = next_error(last_error.clone(), &batch, &pod_gvk);
+        if updated_error != last_error {
+            last_error = updated_error;
             needs_redraw = true;
         }
-        if let Some((_, s)) = batch.status_changes.last() {
-            status = *s;
+        // The status itself is read back off the store below, not carried in a
+        // local — see `store_snapshot`. The event only says "something
+        // changed", which is all a redraw needs.
+        if !batch.status_changes.is_empty() {
+            needs_redraw = true;
+        }
+        // A switch changes the ribbon, the status bar and the whole table, and
+        // "connecting" must appear before the attempt that produced it
+        // finishes — which is the entire reason it is announced as an event.
+        if !batch.session_events.is_empty() {
             needs_redraw = true;
         }
 
-        // Read the store snapshot into a local Vec before drawing; the render
+        // A cluster switch REPLACES the store and changes which cluster is
+        // active, so both are re-read every pass rather than captured once: a
+        // clone taken before a switch would keep showing the previous
+        // cluster's objects under the previous cluster's name for ever.
+        //
+        // The session guard is released before the store is locked — holding
+        // it across an await would block `switch_cluster`, which needs it to
+        // announce "connecting" while this loop is still running.
+        // The namespace scope and its fallback flag come from the same guard:
+        // a switch replaces all of these together, so reading any of them
+        // from a local would show the previous cluster's scope over the new
+        // cluster's data.
+        let (store, active_cluster, entries, namespace, namespace_is_fallback) = {
+            let s = session.lock().await;
+            (
+                s.store.clone(),
+                s.registry.active().map(|e| e.id.0.clone()),
+                s.registry.entries().to_vec(),
+                s.namespace.clone(),
+                s.namespace_is_fallback,
+            )
+        };
+        let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
+        let scope = display_namespace(namespace.as_deref());
+        let connecting_name = connecting_cluster_name(&entries);
+        // Read the store snapshot into locals before drawing; the render
         // closure below must be synchronous and must not acquire any locks.
-        let objects = store.read().await.objects(&pod_gvk);
+        // Objects and watch health come from one acquisition of one store, so
+        // a switch cannot show the previous cluster's health over this
+        // cluster's (empty) object list.
+        let (objects, status) = store_snapshot(&store, &pod_gvk).await;
+
+        // Keep an open picker's items current: the registry (cluster
+        // states) and the object list (namespaces seen) can both change
+        // while it's on screen, and it must reflect that rather than a
+        // snapshot taken at open time. The filter is untouched; the
+        // selection is only clamped, never moved, because a shrinking list
+        // can otherwise leave it naming a row that no longer exists — a
+        // confirm on which resolves to nothing and closes the picker having
+        // silently done nothing at all.
+        match &mut overlay {
+            Overlay::ClusterPicker(p) => {
+                p.items = cluster_picker_items(&entries);
+                clamp_selection(p);
+            }
+            Overlay::NamespacePicker(p) => {
+                p.items = namespace_picker_items(&objects);
+                clamp_selection(p);
+            }
+            Overlay::None => {}
+        }
 
         let mut quit = false;
         for input in &batch.inputs {
@@ -285,17 +711,170 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             // arrives after the last draw, so on the very first iteration the
             // registry is empty and a click before the first paint is a
             // no-op. That is correct, not a bug to fix by drawing early.
-            match action_for(input, &hits) {
+            let action = action_for(input, &hits, overlay.is_open());
+            let confirm_index = confirm_index_for(action, &overlay);
+            match action {
                 Action::Quit => quit = true,
                 Action::SelectRow(i) => {
-                    selected = i.min(objects.len().saturating_sub(1));
+                    view.selected = i.min(objects.len().saturating_sub(1));
                     needs_redraw = true;
                 }
                 Action::ScrollBy(d) => {
-                    selected = apply_selection(selected, d, objects.len());
+                    match &mut overlay {
+                        Overlay::None => {
+                            view.selected = apply_selection(view.selected, d, objects.len());
+                        }
+                        Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => {
+                            let n = filtered_indices(&p.items, &p.filter).len();
+                            p.selected = apply_selection(p.selected, d, n);
+                        }
+                    }
                     needs_redraw = true;
                 }
                 Action::SortByColumn(_) => needs_redraw = true,
+                Action::OpenClusterPicker => {
+                    overlay = Overlay::ClusterPicker(Picker {
+                        title: "Clusters".into(),
+                        items: cluster_picker_items(&entries),
+                        filter: String::new(),
+                        selected: 0,
+                        scroll: 0,
+                    });
+                    needs_redraw = true;
+                }
+                Action::OpenNamespacePicker => {
+                    overlay = Overlay::NamespacePicker(Picker {
+                        title: "Namespaces".into(),
+                        items: namespace_picker_items(&objects),
+                        filter: String::new(),
+                        selected: 0,
+                        scroll: 0,
+                    });
+                    needs_redraw = true;
+                }
+                Action::ClosePicker => {
+                    overlay = Overlay::None;
+                    needs_redraw = true;
+                }
+                Action::PickerFilterChar(c) => {
+                    if let Some(p) = overlay.picker_mut() {
+                        p.filter.push(c);
+                        p.selected = 0;
+                        needs_redraw = true;
+                    }
+                }
+                Action::PickerBackspace => {
+                    if let Some(p) = overlay.picker_mut() {
+                        p.filter.pop();
+                        p.selected = 0;
+                        needs_redraw = true;
+                    }
+                }
+                Action::PickerSelect(_) | Action::PickerConfirm => {
+                    if let Some(i) = confirm_index {
+                        match std::mem::take(&mut overlay) {
+                            Overlay::ClusterPicker(p) => {
+                                if let Some(label) = resolve_picker_choice(&p, i) {
+                                    let target = ClusterId(label);
+                                    // Inherits `allow_interactive_auth: false`
+                                    // from `opts`: this connect runs with the
+                                    // alternate screen live, so no exec plugin
+                                    // may prompt into it. See
+                                    // `ConnectOptions::allow_interactive_auth`.
+                                    let mut switch_opts = opts.clone();
+                                    switch_opts.context = Some(target.0.clone());
+                                    // How the target authenticates, so a
+                                    // refusal to prompt can say which command
+                                    // to run instead of just failing.
+                                    let target_auth = entries
+                                        .iter()
+                                        .find(|e| e.id == target)
+                                        .map(|e| e.context.auth.clone())
+                                        .unwrap_or(AuthMethod::None);
+                                    let session2 = session.clone();
+                                    let tx2 = tx.clone();
+                                    let pod_ar2 = pod_ar.clone();
+                                    tokio::spawn(async move {
+                                        switch_cluster(
+                                            session2,
+                                            target,
+                                            // Contexts frequently set no namespace and
+                                            // `default` is empty on these clusters — so a
+                                            // switch overrides whatever `-A`/`-n` chose for
+                                            // the INITIAL connect with all-namespaces.
+                                            // `switch_cluster` records this scope on the
+                                            // session and hands the SAME value to the closure
+                                            // below, so what the status bar reports and what
+                                            // the watch actually watches cannot disagree.
+                                            None,
+                                            tx2.clone(),
+                                            move || async move {
+                                                cluster::connect_with(&switch_opts).await.map_err(
+                                                    |e| {
+                                                        anyhow::anyhow!(connect_failure_hint(
+                                                            &target_auth,
+                                                            &format!("{e:#}")
+                                                        ))
+                                                    },
+                                                )
+                                            },
+                                            move |client, store, ns| {
+                                                supervise(
+                                                    "watch",
+                                                    spawn_watch(
+                                                        client,
+                                                        pod_ar2,
+                                                        ns,
+                                                        store,
+                                                        tx2.clone(),
+                                                    ),
+                                                    tx2,
+                                                )
+                                            },
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                            Overlay::NamespacePicker(p) => {
+                                if let Some(label) = resolve_picker_choice(&p, i) {
+                                    let ns_choice = namespace_choice_from_label(&label);
+                                    let pod_ar2 = pod_ar.clone();
+                                    let tx2 = tx.clone();
+                                    // `restart_watch` reads the session's CURRENT client
+                                    // from the same lock it uses to tear down and replace
+                                    // the store — not a copy captured earlier, which could
+                                    // have gone stale if a cluster switch completed in the
+                                    // gap between capturing it and taking the lock. See
+                                    // `Session::client`'s doc comment for the interleaving
+                                    // this closes. It records the scope under that same
+                                    // guard and passes it on to the closure, so nothing
+                                    // here has to update a display copy afterwards.
+                                    restart_watch(
+                                        session.clone(),
+                                        ns_choice,
+                                        move |client, store, ns| {
+                                            supervise(
+                                                "watch",
+                                                spawn_watch(
+                                                    client,
+                                                    pod_ar2,
+                                                    ns,
+                                                    store,
+                                                    tx2.clone(),
+                                                ),
+                                                tx2,
+                                            )
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                            Overlay::None => {}
+                        }
+                        needs_redraw = true;
+                    }
+                }
                 Action::None => {}
             }
         }
@@ -307,27 +886,21 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
         needs_redraw = false;
 
-        view.state.select(if objects.is_empty() {
-            None
-        } else {
-            Some(selected)
-        });
-
         hits.clear();
+        let show_hint = should_hint_all_namespaces(namespace_is_fallback, objects.len());
         term.draw(|f| {
-            let chunks =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(f.area());
-            render_table(f, chunks[0], &objects, &pod_gvk, &mut view, &mut hits);
-            let show_hint = should_hint_all_namespaces(is_fallback_namespace, objects.len());
-            render_status(
+            render_frame(
                 f,
-                chunks[1],
+                &objects,
+                &pod_gvk,
+                &mut view,
                 &context_name,
-                &display_namespace,
+                scope,
                 status,
-                objects.len(),
                 last_error.as_deref(),
                 show_hint,
+                connecting_name.as_deref(),
+                &mut overlay,
                 &mut hits,
             );
         })?;
@@ -344,6 +917,17 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Increments a counter when dropped. Aborting a task drops its future, so
+    /// this fires on cancellation but not while the task is merely suspended.
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     async fn join_error_from(f: impl FnOnce() + Send + 'static) -> tokio::task::JoinError {
         let handle = tokio::task::spawn_blocking(f);
@@ -387,5 +971,825 @@ mod tests {
         handle.abort();
         let e = handle.await.expect_err("aborting must yield a JoinError");
         assert_eq!(join_failure_detail("watch", e), "watch task was cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_deliberately_aborted_watch_does_not_quit_the_app() {
+        // Every cluster switch aborts the outgoing cluster's watches. A
+        // supervisor that treats any Err as a death would send Quit, so the
+        // very first switch would exit the application.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let watch = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        watch.abort();
+        supervise("watch", watch, tx)
+            .await
+            .expect("the supervisor itself must not die");
+
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(format!("{e:?}"));
+        }
+        assert!(
+            got.is_empty(),
+            "a deliberate abort must produce no error and no quit, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_watch_still_quits_the_app() {
+        // The other half of the same decision: silencing cancellation must not
+        // silence a real crash, which would leave the UI drawing stale data.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let watch = tokio::spawn(async { panic!("watcher exploded") });
+        supervise("watch", watch, tx)
+            .await
+            .expect("the supervisor itself must not die");
+
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(e);
+        }
+        assert!(
+            matches!(got.first(), Some(AppEvent::Error(m)) if m.contains("watcher exploded")),
+            "the panic payload must reach the user, got {got:?}"
+        );
+        assert!(
+            matches!(got.get(1), Some(AppEvent::Quit)),
+            "a dead watch must end the app rather than draw stale data, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_the_supervisor_cancels_the_watch_beneath_it() {
+        // Only one owner can await a JoinHandle, and the supervisor needs it to
+        // observe a panic — so `WatchHandles` holds the SUPERVISOR's handle.
+        // Aborting that must cancel the watch underneath: dropping a JoinHandle
+        // DETACHES its task, which would leak exactly the watch a cluster
+        // switch is trying to tear down.
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let signal = DropSignal(cancelled.clone());
+        let watch = tokio::spawn(async move {
+            // Held across the await, so it drops only on cancellation.
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let supervisor = supervise("watch", watch, tx);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "nothing should be cancelled yet"
+        );
+
+        supervisor.abort();
+        for _ in 0..20 {
+            if cancelled.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            1,
+            "aborting the supervisor must cancel its watch, not detach it"
+        );
+    }
+
+    // --- Task 9: overlays, focus, and input ---
+
+    mod overlay_wiring {
+        use super::*;
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::api::{ApiResource, DynamicObject};
+        use kube_tui::app::Overlay;
+        use kube_tui::app::event::WatchStatus;
+        use kube_tui::cluster::{
+            AuthMethod, ClusterEntry, ClusterId, ConnectionState, ContextInfo,
+        };
+        use kube_tui::ui::hit::HitTarget;
+        use kube_tui::ui::theme;
+        use kube_tui::ui::views::picker::{Picker, PickerItem};
+        use ratatui::backend::TestBackend;
+
+        fn entry(name: &str, state: ConnectionState) -> ClusterEntry {
+            ClusterEntry {
+                id: ClusterId(name.to_string()),
+                context: ContextInfo {
+                    name: name.to_string(),
+                    cluster: format!("{name}-cluster"),
+                    namespace: None,
+                    is_current: false,
+                    auth: AuthMethod::None,
+                },
+                state,
+            }
+        }
+
+        fn pod_in(name: &str, ns: &str) -> Arc<DynamicObject> {
+            Arc::new(DynamicObject::new(name, &ApiResource::erase::<Pod>(&())).within(ns))
+        }
+
+        #[test]
+        fn cluster_picker_items_reflect_the_registry_not_a_guess() {
+            let entries = vec![
+                entry("prod", ConnectionState::Disconnected),
+                entry("dev", ConnectionState::Connecting),
+                entry(
+                    "staging",
+                    ConnectionState::Failed {
+                        reason: "no route to host".into(),
+                    },
+                ),
+            ];
+            let items = cluster_picker_items(&entries);
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0].label, "prod");
+            assert_eq!(items[0].detail, "");
+            assert_eq!(items[1].label, "dev");
+            assert!(
+                items[1].detail.contains("connecting"),
+                "got {:?}",
+                items[1].detail
+            );
+            assert_eq!(items[2].label, "staging");
+            assert!(
+                items[2].detail.contains("no route to host"),
+                "a failure reason must reach the picker, got {:?}",
+                items[2].detail
+            );
+            assert_eq!(items[0].accent, Some(theme::cluster_hue("prod")));
+        }
+
+        #[test]
+        fn namespace_picker_items_list_distinct_namespaces_plus_all_namespaces() {
+            // Namespaces out of alphabetical order and repeated across
+            // objects, so dedup and sort are both actually exercised.
+            let objects = vec![
+                pod_in("a", "zeta"),
+                pod_in("b", "alpha"),
+                pod_in("c", "zeta"),
+                pod_in("d", "prod"),
+            ];
+            let items = namespace_picker_items(&objects);
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec![ALL_NAMESPACES_LABEL, "alpha", "prod", "zeta"],
+                "all-namespaces sentinel first, then distinct namespaces sorted"
+            );
+        }
+
+        // --- A refused exec login must say what to run ---
+
+        #[test]
+        fn a_failed_connect_to_an_exec_cluster_names_the_plugin_to_run() {
+            // Switching to an SSO cluster with an expired token now fails
+            // cleanly rather than printing the plugin's login URL into our
+            // alternate screen. That is only an improvement if the user can
+            // tell what to do about it, and the command name is the whole
+            // instruction.
+            let hint = connect_failure_hint(
+                &AuthMethod::Exec {
+                    command: "kubelogin".to_string(),
+                },
+                "building config for context 'prod-eu': auth exec command failed",
+            );
+            assert!(
+                hint.contains("kubelogin"),
+                "the plugin to run must be named; got {hint}"
+            );
+            assert!(
+                hint.contains("auth exec command failed"),
+                "the underlying cause must survive; got {hint}"
+            );
+        }
+
+        #[test]
+        fn a_failed_connect_to_a_non_exec_cluster_is_left_exactly_as_it_was() {
+            // A cert or token cluster's failure has nothing to do with a
+            // credential plugin, and inventing advice about one would send
+            // someone chasing the wrong thing.
+            let original = "no route to host";
+            for auth in [
+                AuthMethod::ClientCert,
+                AuthMethod::Token,
+                AuthMethod::None,
+                AuthMethod::AuthProvider {
+                    name: "oidc".to_string(),
+                },
+            ] {
+                assert_eq!(
+                    connect_failure_hint(&auth, original),
+                    original,
+                    "{auth:?} must not gain an exec hint"
+                );
+            }
+        }
+
+        #[test]
+        fn an_exec_block_with_no_command_adds_no_empty_hint() {
+            // `exec.command` is optional in the schema and `auth_method_for`
+            // defaults it to "". Advising the user to run '' is worse than
+            // saying nothing.
+            let original = "no route to host";
+            assert_eq!(
+                connect_failure_hint(
+                    &AuthMethod::Exec {
+                        command: String::new()
+                    },
+                    original
+                ),
+                original
+            );
+        }
+
+        // --- Error text is bounded before it reaches the bar ---
+
+        #[test]
+        fn a_short_error_is_passed_through_untouched() {
+            let e = "forbidden: pods is denied".to_string();
+            assert_eq!(truncate_error(e.clone()), e);
+        }
+
+        #[test]
+        fn an_error_exactly_at_the_limit_is_not_marked_as_truncated() {
+            let e = "x".repeat(MAX_ERROR_CHARS);
+            assert_eq!(truncate_error(e.clone()), e, "the boundary is inclusive");
+        }
+
+        #[test]
+        fn an_exec_plugin_dumping_its_stdout_cannot_fill_the_status_bar() {
+            // `Error::AuthExecRun` formats `out: std::process::Output` with
+            // `{out:?}`, so a plugin that prints a partial ExecCredential and
+            // then exits non-zero puts its token into the error as a decimal
+            // byte array. Bound it.
+            let dump: String = (0..2000)
+                .map(|i| format!("{}, ", i % 256))
+                .collect::<String>();
+            let e = format!("auth exec command failed: Output {{ stdout: [{dump}] }}");
+            let out = truncate_error(e);
+            assert_eq!(
+                out.chars().count(),
+                MAX_ERROR_CHARS + 1,
+                "capped at the limit plus the ellipsis that marks it"
+            );
+            assert!(
+                out.ends_with('…'),
+                "a truncated error must show that it was truncated; got {out}"
+            );
+            assert!(
+                out.starts_with("auth exec command failed"),
+                "the useful part is the front, so that is the part kept; got {out}"
+            );
+        }
+
+        #[test]
+        fn truncating_multibyte_text_does_not_split_a_character() {
+            // Cluster names, server messages and a plugin's own output can
+            // all be non-ASCII. Slicing by BYTES at 200 lands mid-character
+            // in this string and panics; slicing by characters does not.
+            let e = "→".repeat(300);
+            let out = truncate_error(e);
+            assert_eq!(out.chars().count(), MAX_ERROR_CHARS + 1);
+            assert!(out.starts_with("→→→"));
+        }
+
+        // --- Errors are retired as well as raised ---
+
+        fn gvk() -> GroupVersionKind {
+            GroupVersionKind::gvk("", "v1", "Pod")
+        }
+
+        /// A stale error from a cluster the user has since left.
+        fn stale() -> Option<String> {
+            Some("watch Pod: connection reset by peer".to_string())
+        }
+
+        #[test]
+        fn a_successful_switch_retires_the_previous_clusters_error() {
+            // The reported failure: a blip on prod pins an error; switch to
+            // dev, which connects fine and streams 250 pods, and prod's error
+            // is still on the bar — for ever, since nothing ever cleared it.
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::Connected(ClusterId(
+                "dev".to_string(),
+            )))]);
+            assert_eq!(
+                next_error(stale(), &batch, &gvk()),
+                None,
+                "an error raised before a switch must not be visible after it"
+            );
+        }
+
+        #[test]
+        fn a_watch_reporting_itself_synced_retires_a_stale_error() {
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: gvk(),
+                status: WatchStatus::Synced,
+            }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), None);
+        }
+
+        #[test]
+        fn another_kinds_sync_does_not_retire_this_kinds_error() {
+            // `status_changes` carries every watched kind. A Deployment watch
+            // coming up says nothing about why the Pod watch failed, and
+            // clearing on it would hide a live error.
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: GroupVersionKind::gvk("apps", "v1", "Deployment"),
+                status: WatchStatus::Synced,
+            }]);
+            assert_eq!(
+                next_error(stale(), &batch, &gvk()),
+                stale(),
+                "only the displayed kind's own health may retire its error"
+            );
+        }
+
+        #[test]
+        fn a_watch_that_is_merely_reconnecting_does_not_retire_the_error() {
+            // Reconnecting is not recovery. Clearing here would blank the
+            // explanation at precisely the moment it is most wanted.
+            let batch = coalesce(vec![AppEvent::WatchStatus {
+                gvk: gvk(),
+                status: WatchStatus::Reconnecting,
+            }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
+        }
+
+        #[test]
+        fn an_error_arriving_with_a_sync_still_shows() {
+            // `coalesce` loses the relative order of errors and status
+            // changes, so this is the deliberate tie-break: never hide a live
+            // error, at the cost of possibly showing a resolved one one batch
+            // longer.
+            let batch = coalesce(vec![
+                AppEvent::WatchStatus {
+                    gvk: gvk(),
+                    status: WatchStatus::Synced,
+                },
+                AppEvent::Error("forbidden: pods is denied".to_string()),
+            ]);
+            assert_eq!(
+                next_error(None, &batch, &gvk()),
+                Some("forbidden: pods is denied".to_string())
+            );
+        }
+
+        #[test]
+        fn a_failed_connect_becomes_the_visible_error_naming_the_cluster() {
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::ConnectFailed {
+                id: ClusterId("dev".to_string()),
+                reason: "no route to host".to_string(),
+            })]);
+            let e = next_error(None, &batch, &gvk()).expect("a failed connect must be reported");
+            assert!(e.contains("dev"), "must name the cluster; got {e}");
+            assert!(e.contains("no route to host"), "got {e}");
+        }
+
+        #[test]
+        fn a_failed_connect_in_the_same_batch_as_a_sync_still_shows() {
+            // A switch that fails while the CURRENT cluster's watch is
+            // happily syncing: the sync is the old cluster's, and must not
+            // swallow the report that the new one is unreachable.
+            let batch = coalesce(vec![
+                AppEvent::WatchStatus {
+                    gvk: gvk(),
+                    status: WatchStatus::Synced,
+                },
+                AppEvent::Session(SessionEvent::ConnectFailed {
+                    id: ClusterId("dev".to_string()),
+                    reason: "no route to host".to_string(),
+                }),
+            ]);
+            let e = next_error(None, &batch, &gvk()).expect("a failed connect must be reported");
+            assert!(e.contains("no route to host"), "got {e}");
+        }
+
+        #[test]
+        fn a_batch_with_nothing_relevant_leaves_the_error_alone() {
+            // Mouse movement must not clear a real error off the bar.
+            let batch = coalesce(vec![AppEvent::StoreChanged { gvk: gvk() }]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
+        }
+
+        #[test]
+        fn a_connecting_announcement_does_not_retire_the_error() {
+            // Only a connect that SUCCEEDED means the problem is behind us.
+            let batch = coalesce(vec![AppEvent::Session(SessionEvent::Connecting(
+                ClusterId("dev".to_string()),
+            ))]);
+            assert_eq!(next_error(stale(), &batch, &gvk()), stale());
+        }
+
+        #[test]
+        fn the_displayed_scope_for_all_namespaces_is_the_sentinel_not_a_namespace() {
+            // `None` is the all-namespaces scope. Printing an empty string or
+            // "default" here would name a scope nothing is watching.
+            assert_eq!(display_namespace(None), ALL_NAMESPACES_LABEL);
+        }
+
+        #[test]
+        fn the_displayed_scope_for_a_real_namespace_is_that_namespace() {
+            assert_eq!(display_namespace(Some("payments")), "payments");
+            assert_eq!(display_namespace(Some("kube-system")), "kube-system");
+        }
+
+        #[test]
+        fn the_all_namespaces_label_maps_to_none() {
+            assert_eq!(namespace_choice_from_label(ALL_NAMESPACES_LABEL), None);
+        }
+
+        #[test]
+        fn a_real_namespace_label_maps_to_itself() {
+            assert_eq!(
+                namespace_choice_from_label("payments"),
+                Some("payments".to_string())
+            );
+        }
+
+        #[test]
+        fn connecting_cluster_name_finds_the_connecting_entry_even_though_a_different_one_is_active()
+         {
+            // The whole point: the entry actually being switched TO is
+            // "dev", not whatever the caller might assume is active. A
+            // status bar keyed off `registry.active()` alone would show no
+            // sign of this at all.
+            let entries = vec![
+                entry("prod", ConnectionState::Connected),
+                entry("dev", ConnectionState::Connecting),
+                entry("staging", ConnectionState::Disconnected),
+            ];
+            assert_eq!(connecting_cluster_name(&entries), Some("dev".to_string()));
+        }
+
+        #[test]
+        fn connecting_cluster_name_is_none_when_nothing_is_connecting() {
+            let entries = vec![
+                entry("prod", ConnectionState::Connected),
+                entry("staging", ConnectionState::Disconnected),
+            ];
+            assert_eq!(connecting_cluster_name(&entries), None);
+        }
+
+        #[test]
+        fn resolve_picker_choice_maps_the_filtered_index_not_the_raw_one() {
+            // Matches picker.rs's own non-vacuous fixture: "wsdc" matches only
+            // the item at unfiltered index 4, rendered at filtered position 0.
+            // A wrong implementation that skipped filtered_indices would
+            // return items[0] ("prod-eu") instead of items[4] ("tst-wsdc").
+            let picker = Picker {
+                title: "Clusters".into(),
+                items: ["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]
+                    .iter()
+                    .map(|n| PickerItem {
+                        label: n.to_string(),
+                        detail: String::new(),
+                        accent: None,
+                    })
+                    .collect(),
+                filter: "wsdc".into(),
+                selected: 0,
+                scroll: 0,
+            };
+            assert_eq!(
+                resolve_picker_choice(&picker, 0),
+                Some("tst-wsdc".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_picker_choice_out_of_range_is_none_not_a_panic() {
+            let picker = Picker {
+                title: "T".into(),
+                items: vec![PickerItem {
+                    label: "only".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 0,
+                scroll: 0,
+            };
+            assert_eq!(resolve_picker_choice(&picker, 5), None);
+        }
+
+        #[test]
+        fn confirm_index_for_picker_select_carries_its_own_index() {
+            // PickerSelect(i) already IS the answer, regardless of what the
+            // picker's own `selected` happens to be — a click at filtered
+            // row 7 confirms row 7, not whatever was last highlighted.
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "T".into(),
+                items: vec![PickerItem {
+                    label: "a".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 3,
+                scroll: 0,
+            });
+            assert_eq!(
+                confirm_index_for(Action::PickerSelect(7), &overlay),
+                Some(7)
+            );
+        }
+
+        #[test]
+        fn confirm_index_for_picker_confirm_uses_the_pickers_own_selection_not_a_hardcoded_zero() {
+            // selected=1 under filter "e": matches "prod-eu" (unfiltered
+            // index 0, filtered position 0) and "dev" (unfiltered index 3,
+            // filtered position 1). Picker::selected (1), the filtered
+            // position it names (1), and the real item it will resolve to
+            // (unfiltered index 3) are all different from 0 — a
+            // PickerConfirm branch hardcoded to 0 would silently confirm
+            // "prod-eu" (index 0) instead of "dev" (index 3), and this is
+            // the only kind of fixture that can catch that: with
+            // selected=0, or a filter that left filtered and unfiltered
+            // positions coincident, the mutation would be invisible.
+            let items: Vec<PickerItem> = ["prod-eu", "prod-us", "staging", "dev", "tst-wsdc"]
+                .iter()
+                .map(|n| PickerItem {
+                    label: n.to_string(),
+                    detail: String::new(),
+                    accent: None,
+                })
+                .collect();
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items,
+                filter: "e".into(),
+                selected: 1,
+                scroll: 0,
+            });
+            let index = confirm_index_for(Action::PickerConfirm, &overlay);
+            assert_eq!(index, Some(1), "must be the picker's own selection, not 0");
+
+            // Full pipeline, end to end: that index must resolve to "dev",
+            // not "prod-eu".
+            let picker = overlay.picker().expect("cluster picker is open");
+            assert_eq!(
+                resolve_picker_choice(picker, index.expect("checked above")),
+                Some("dev".to_string())
+            );
+        }
+
+        #[test]
+        fn confirm_index_for_picker_confirm_with_no_overlay_open_is_none() {
+            assert_eq!(
+                confirm_index_for(Action::PickerConfirm, &Overlay::None),
+                None
+            );
+        }
+
+        #[test]
+        fn confirm_index_for_unrelated_actions_is_none() {
+            let overlay = Overlay::ClusterPicker(Picker {
+                title: "T".into(),
+                items: vec![],
+                filter: String::new(),
+                selected: 0,
+                scroll: 0,
+            });
+            assert_eq!(confirm_index_for(Action::ClosePicker, &overlay), None);
+            assert_eq!(confirm_index_for(Action::Quit, &overlay), None);
+        }
+
+        #[tokio::test]
+        async fn the_status_shown_comes_from_the_store_the_objects_came_from() {
+            use kube::runtime::watcher;
+            use kube_tui::store::watch::ResourceStore;
+            use tokio::sync::RwLock;
+
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let ar = ApiResource::erase::<Pod>(&());
+
+            // The cluster the user is on: three pods, watch synced.
+            let live: kube_tui::store::watch::SharedStore =
+                Arc::new(RwLock::new(ResourceStore::new()));
+            {
+                let mut s = live.write().await;
+                s.set_status(gvk.clone(), WatchStatus::Synced);
+                for i in 0..3 {
+                    s.apply(
+                        &gvk,
+                        &ar,
+                        watcher::Event::Apply(
+                            DynamicObject::new(&format!("pod-{i}"), &ar).within("default"),
+                        ),
+                    );
+                }
+            }
+            let (objects, status) = store_snapshot(&live, &gvk).await;
+            assert_eq!(objects.len(), 3);
+            assert_eq!(
+                status,
+                WatchStatus::Synced,
+                "a live watch's own store must report live"
+            );
+
+            // What a cluster switch does: replace the store wholesale, so the
+            // new cluster starts empty with nothing yet synced. Health read
+            // from anywhere ELSE — a local carried across the switch, fed by
+            // the previous cluster's WatchStatus events — would still say
+            // "live" here, labelling an empty table as fresh data.
+            let fresh: kube_tui::store::watch::SharedStore =
+                Arc::new(RwLock::new(ResourceStore::new()));
+            let (objects, status) = store_snapshot(&fresh, &gvk).await;
+            assert!(objects.is_empty(), "the new cluster starts with no objects");
+            assert_eq!(
+                status,
+                WatchStatus::Initialising,
+                "zero items must never be labelled 'live': the status must come \
+                 from the same store the (empty) object list did"
+            );
+        }
+
+        #[test]
+        fn a_click_on_a_scrolled_picker_row_resolves_to_the_cluster_drawn_there() {
+            // End to end for the Critical: render a 20-cluster picker scrolled
+            // to the bottom, take the hit zone a click on the LAST visible row
+            // would resolve to, and push that index back through the same
+            // `resolve_picker_choice` the event loop uses. The whole chain —
+            // draw, register, hit-test, map filtered index to item — must name
+            // the cluster actually printed on that line.
+            //
+            // Before the fix nothing was registered below the first
+            // screenful at all, so `hits.hit` returned None here and the
+            // click did nothing.
+            let mut picker = Picker {
+                title: "Clusters".into(),
+                items: (0..20)
+                    .map(|i| PickerItem {
+                        label: format!("cluster-{i:02}"),
+                        detail: String::new(),
+                        accent: None,
+                    })
+                    .collect(),
+                filter: String::new(),
+                selected: 19,
+                scroll: 0,
+            };
+
+            let mut hits = HitRegistry::new();
+            let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+            term.draw(|f| {
+                kube_tui::ui::views::picker::render_picker(f, f.area(), &mut picker, &mut hits);
+            })
+            .unwrap();
+
+            // The last list row of a 14-line viewport (two borders, one
+            // filter line) is y=12 — verified against a real buffer dump.
+            let buf = term.backend().buffer();
+            let drawn: String = (0..60u16).map(|x| buf[(x, 12)].symbol()).collect();
+            assert!(
+                drawn.contains("cluster-19"),
+                "expected cluster-19 drawn on the last list row; got: {drawn}"
+            );
+
+            let Some(HitTarget::PickerRow(i)) = hits.hit(5, 12) else {
+                panic!("a click on the last visible row must land on a picker row");
+            };
+            assert_eq!(
+                resolve_picker_choice(&picker, *i),
+                Some("cluster-19".to_string()),
+                "clicking the row showing cluster-19 must connect to cluster-19, \
+                 not to whatever shares that screen position in the unscrolled list"
+            );
+        }
+
+        #[test]
+        fn render_frame_paints_the_ribbon_in_the_active_clusters_hue() {
+            let pods = vec![pod_in("a", "default")];
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let mut view = TableView::new();
+            let mut hits = HitRegistry::new();
+            let mut overlay = Overlay::None;
+
+            let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            term.draw(|f| {
+                render_frame(
+                    f,
+                    &pods,
+                    &gvk,
+                    &mut view,
+                    "prod-eu",
+                    "default",
+                    WatchStatus::Synced,
+                    None,
+                    false,
+                    None,
+                    &mut overlay,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+
+            let buf = term.backend().buffer();
+            assert_eq!(
+                buf[(0, 0)].style().fg,
+                Some(theme::cluster_hue("prod-eu")),
+                "the ribbon must be wired into the real draw sequence"
+            );
+        }
+
+        #[test]
+        fn the_overlay_paints_over_the_table_and_status_drawn_before_it() {
+            // Draw order is ribbon, table, status, THEN the overlay last.
+            //
+            // This must be a VISUAL check, not a hit-resolution one:
+            // HitRegistry resolves PickerRow over TableRow by Z-INDEX alone
+            // (z=1 beats z=0 regardless of registration order — see
+            // picker.rs's own adversarial test), so no hit-test can ever
+            // distinguish "overlay drawn last" from "overlay drawn first".
+            //
+            // It must also target a coordinate PROVEN to actually get
+            // overwritten by whichever widget draws second, not merely one
+            // that happens to sit inside the overlapping rect: `render_table`
+            // sets no background style on its own `Block`, and `Row`/`Cell`
+            // rendering writes only the cells its text glyphs occupy — a
+            // short label like the picker's own title can survive a wrong
+            // draw order purely by chance, landing in a gap between column
+            // glyphs, which is a vacuous fixture Task 9 was warned about
+            // ("would a wrong implementation give a different answer with
+            // this data?"). Empirically dumping the buffer under the
+            // reversed order confirmed exactly that for the title text, but
+            // also that a data row's STATUS cell ("Unknown", stub pods have
+            // no real status) DOES land on and overwrite the picker's own
+            // border dashes at (x=48, y=5) for this geometry — 30 pods so
+            // the table has enough rows to reach the picker's row, and pod-3
+            // (drawn at y=5, the picker's own top border row given
+            // `centered` on an 80x24 frame) puts its STATUS column
+            // (columns_for: NAME Fill(2), READY 7, STATUS 14 — starting at
+            // x=48 after NAME+READY+spacing) squarely inside it.
+            let pods: Vec<Arc<DynamicObject>> = (0..30)
+                .map(|i| pod_in(&format!("pod-{i}"), "default"))
+                .collect();
+            let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+            let mut view = TableView::new();
+            let mut hits = HitRegistry::new();
+            let mut overlay = Overlay::ClusterPicker(Picker {
+                title: "Clusters".into(),
+                items: vec![PickerItem {
+                    label: "prod".into(),
+                    detail: String::new(),
+                    accent: None,
+                }],
+                filter: String::new(),
+                selected: 0,
+                scroll: 0,
+            });
+
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| {
+                render_frame(
+                    f,
+                    &pods,
+                    &gvk,
+                    &mut view,
+                    "prod",
+                    "default",
+                    WatchStatus::Synced,
+                    None,
+                    false,
+                    None,
+                    &mut overlay,
+                    &mut hits,
+                );
+            })
+            .unwrap();
+
+            let buf = term.backend().buffer();
+            let row5: String = (0..80u16)
+                .map(|x| buf[(x, 5)].symbol().to_string())
+                .collect();
+            assert!(
+                !row5.contains("Unknown"),
+                "a data row's STATUS cell must not bleed through the picker's own \
+                 border row — the overlay was not drawn last:\n{row5}"
+            );
+            assert!(
+                row5.contains("Clusters"),
+                "the picker's title must still be present:\n{row5}"
+            );
+
+            let mut found_picker_row = false;
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    if matches!(hits.hit(x, y), Some(HitTarget::PickerRow(_))) {
+                        found_picker_row = true;
+                    }
+                }
+            }
+            assert!(
+                found_picker_row,
+                "the picker's hit zones must resolve over the table's"
+            );
+        }
     }
 }

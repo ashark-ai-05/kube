@@ -1434,17 +1434,64 @@ Update the supervisor in `main.rs` to send `Error` + `Quit` only when `!is_delib
 
 - [ ] **Step 3: Implement switching**
 
+**A race you must design around — found by the Task 3 review, not hypothetical.**
+
+`JoinHandle::abort()` does not stop a task synchronously; it takes effect at the task's next suspension point. A watch task that has already read an event off the stream can therefore complete `store.write().await.apply(...)` in `src/store/watch.rs` *after* `abort_all()` has returned. If the same store is reused across a switch, a stale object from the old cluster lands in the new cluster's cache — visible as a pod from cluster A appearing under cluster B.
+
+Awaiting the aborted handles would close it, but `abort_all` returns only a count. **The robust fix is to mint a fresh store per cluster** rather than clearing and reusing one: a stray write from a not-yet-cancelled task then lands in a store nobody reads, and the race stops mattering instead of needing to be timed around.
+
+So `switch_cluster` must replace the `SharedStore` rather than clear it, and every subsequent reader must use the new handle. Check `main.rs`: the store is currently constructed once and `.clone()`d into `spawn_watch`. Making it swappable is part of this task.
+
 The sequence, in this order:
 
-1. `handles.abort_all()` — stop every watch belonging to the old cluster **before** touching the store, so no in-flight delta can land in the new cluster's cache.
-2. Clear the store.
+1. `handles.abort_all()` — stop every watch belonging to the old cluster.
+2. **Replace** the shared store with a fresh, empty one (do not clear and reuse — see the race above).
 3. `registry.set_state(&id, ConnectionState::Connecting)`, emit `SessionEvent::Connecting`, and **redraw** — connecting a VPN-unreachable cluster can take tens of seconds and the UI must show that immediately rather than appearing frozen.
 4. `connect_with` on a spawned task, never inline — the event loop must stay responsive.
 5. On success: `set_state(Connected)`, `set_active`, spawn the watch, push its handle. On failure: `set_state(Failed { reason })` and leave the previous cluster active.
 
 **Default scope on connect is all namespaces** (`None` to `spawn_watch`), per the design decision: contexts frequently set no namespace and `default` is empty on these clusters.
 
-- [ ] **Step 4: Verify the leak is actually fixed**
+- [ ] **Step 4: Verify a stale write cannot reach the new cluster's store**
+
+```rust
+    #[tokio::test]
+    async fn a_write_from_an_aborted_watch_cannot_reach_the_new_store() {
+        // abort() takes effect at the task's next suspension point, so an
+        // in-flight apply can land after abort_all() returns. Replacing the
+        // store rather than clearing it makes that write harmless.
+        let old_store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        let ar = ApiResource::erase::<Pod>(&());
+
+        // A "watch" that writes after a delay, standing in for one mid-apply.
+        let writer = {
+            let store = old_store.clone();
+            let (gvk, ar) = (gvk.clone(), ar.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                store.write().await.apply(
+                    &gvk,
+                    &ar,
+                    kube::runtime::watcher::Event::Apply(
+                        DynamicObject::new("stale-from-old-cluster", &ar).within("default"),
+                    ),
+                );
+            })
+        };
+
+        // Switch: the new cluster gets a brand-new store.
+        let new_store: SharedStore = Arc::new(RwLock::new(ResourceStore::new()));
+
+        let _ = writer.await; // let the stale write land in the OLD store
+        assert!(
+            new_store.read().await.objects(&gvk).is_empty(),
+            "a write from the previous cluster must not appear in the new cluster's store"
+        );
+    }
+```
+
+- [ ] **Step 5: Verify the leak is actually fixed**
 
 ```rust
     #[tokio::test]
@@ -1460,11 +1507,11 @@ The sequence, in this order:
     }
 ```
 
-- [ ] **Step 5: Mutation check**
+- [ ] **Step 6: Mutation check**
 
 Make `is_deliberate_abort` always return `false`. Confirm `a_deliberately_aborted_watch_is_not_treated_as_a_failure` FAILS. Restore, confirm green.
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 cargo test && cargo fmt && cargo clippy --all-targets -- -D warnings

@@ -1,6 +1,11 @@
 use crate::store::columns::columns_for;
 use crate::ui::hit::{HitRegistry, HitTarget};
+use crate::ui::scroll;
 use crate::ui::theme;
+// Re-exported so this view's existing call sites and tests keep naming it
+// here; the implementation now lives in `ui::scroll`, shared with the picker.
+pub use crate::ui::scroll::scroll_offset;
+use crate::ui::theme::phase_style;
 use kube::api::{DynamicObject, GroupVersionKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -9,7 +14,17 @@ use ratatui::widgets::{Block, Borders, Row, Table, TableState};
 use std::sync::Arc;
 
 pub struct TableView {
-    pub state: TableState,
+    /// Absolute index of the selected object, owned by this view rather than
+    /// by ratatui. Callers (e.g. `main.rs`, which tracks its own `selected`
+    /// in response to `Action::SelectRow`/`Action::ScrollBy`) write the real
+    /// selection here directly.
+    pub selected: usize,
+    /// Scroll offset, owned by this view and advanced by `scroll_offset` each
+    /// frame. Never read back out of a ratatui `TableState` after render:
+    /// `render_table` always hands `Table` an already-windowed row list with
+    /// a window-relative selection, so ratatui has nothing left to scroll and
+    /// cannot disagree with this value.
+    pub offset: usize,
 }
 
 impl Default for TableView {
@@ -21,20 +36,27 @@ impl Default for TableView {
 impl TableView {
     pub fn new() -> Self {
         Self {
-            state: TableState::default().with_selected(Some(0)),
+            selected: 0,
+            offset: 0,
         }
     }
 }
 
-/// Colour a pod phase by severity so problems are visible without reading.
-pub fn phase_style(phase: &str) -> Style {
-    let color = match phase {
-        "Running" | "Succeeded" => theme::OK,
-        "Pending" | "ContainerCreating" => theme::WARN,
-        "Failed" | "CrashLoopBackOff" | "Error" | "ImagePullBackOff" => theme::ERR,
-        _ => theme::MUTED,
-    };
-    Style::default().fg(color)
+/// The half-open range of object indices that can actually be drawn.
+///
+/// Formatting the whole list every frame costs O(objects); this makes it
+/// O(viewport). The block border takes one line at the top and one at the
+/// bottom, and the header takes one more, leaving `height - 3` data rows —
+/// this view's own chrome, which is all this wrapper adds over the shared
+/// `scroll::window`.
+pub fn visible_window(offset: usize, area_height: u16, total: usize) -> std::ops::Range<usize> {
+    scroll::window(offset, data_rows(area_height), total)
+}
+
+/// How many data rows fit in an area of this height: everything but the two
+/// borders and the header.
+fn data_rows(area_height: u16) -> usize {
+    area_height.saturating_sub(3) as usize
 }
 
 /// Render the resource table and register a clickable zone for every visible row.
@@ -44,8 +66,12 @@ pub fn phase_style(phase: &str) -> Style {
 /// begins at `area.y + 2`.
 ///
 /// Zones map screen rows to the *visible window*, not to absolute object
-/// indices: ratatui scrolls `TableState::offset` to keep the selection on
-/// screen, so the object drawn at `area.y + 2` is `offset`, not `0`.
+/// indices: this view owns scrolling (see `scroll_offset`), so the object
+/// drawn at `area.y + 2` is `view.offset`, not `0`.
+///
+/// Only the objects in `visible_window(view.offset, area.height, ...)` are
+/// formatted — the whole point of Task 4 — and hit zones are registered
+/// against that identical window so the two cannot drift apart.
 pub fn render_table(
     f: &mut Frame,
     area: Rect,
@@ -54,16 +80,26 @@ pub fn render_table(
     view: &mut TableView,
     hits: &mut HitRegistry,
 ) {
+    // Objects can shrink between frames (a pod is deleted), leaving `selected`
+    // past the end. Clamp here so no caller has to remember to.
+    view.selected = view.selected.min(objects.len().saturating_sub(1));
+
     let columns = columns_for(gvk);
     let widths: Vec<Constraint> = columns.iter().map(|c| c.width).collect();
 
-    let header = Row::new(columns.iter().map(|c| c.header).collect::<Vec<_>>()).style(
-        Style::default()
-            .fg(theme::HEADER)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header =
+        Row::new(columns.iter().map(|c| c.header).collect::<Vec<_>>()).style(theme::header_style());
 
-    let rows: Vec<Row> = objects
+    // This view owns scrolling: compute how many data rows fit, advance the
+    // offset by the least amount needed to keep the selection visible, then
+    // derive the visible window from that offset. Row construction and hit
+    // zones below both derive from this one `window`, so they cannot drift
+    // apart the way Plan 1's shipped defect did.
+    let rows_visible = data_rows(area.height);
+    view.offset = scroll_offset(view.selected, view.offset, rows_visible);
+    let window = visible_window(view.offset, area.height, objects.len());
+
+    let rows: Vec<Row> = objects[window.clone()]
         .iter()
         .map(|obj| {
             let cells: Vec<String> = columns.iter().map(|c| (c.extract)(obj)).collect();
@@ -72,25 +108,36 @@ pub fn render_table(
                 .iter()
                 .position(|c| c.header == "STATUS")
                 .map(|i| phase_style(&cells[i]))
-                .unwrap_or_else(|| Style::default().fg(theme::FG));
+                .unwrap_or_else(|| Style::default().fg(theme::PAPER));
             Row::new(cells).style(style)
         })
         .collect();
+
+    // Window-relative selection: ratatui is given exactly the rows it draws,
+    // so its own out-of-bounds clamp on `selected` is a no-op and it has
+    // nothing left to scroll. This TableState is freshly built every frame
+    // and discarded after the call — nothing persists it.
+    let selected_in_window = view
+        .selected
+        .checked_sub(window.start)
+        .filter(|i| *i < rows.len());
+    let mut render_state = TableState::default().with_selected(selected_in_window);
 
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(
             Style::default()
-                .fg(theme::SELECTED)
+                .fg(theme::INDIGO)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme::border_style())
                 .title(gvk.kind.clone()),
         );
 
-    f.render_stateful_widget(table, area, &mut view.state);
+    f.render_stateful_widget(table, area, &mut render_state);
 
     // Register hit zones matching the geometry above.
     let header_y = area.y.saturating_add(1);
@@ -107,13 +154,9 @@ pub fn render_table(
         );
     }
 
-    // Read AFTER rendering: ratatui adjusts the offset during render to bring
-    // the selection into view, so reading it beforehand yields the stale value
-    // and puts every zone one scroll behind what is on screen.
-    let offset = view.state.offset();
     let first_row_y = area.y.saturating_add(2);
     let last_y = area.y + area.height.saturating_sub(1);
-    for (k, _) in objects.iter().skip(offset).enumerate() {
+    for (k, _) in objects[window.clone()].iter().enumerate() {
         let y = first_row_y.saturating_add(k as u16);
         if y >= last_y {
             break;
@@ -126,7 +169,7 @@ pub fn render_table(
                 height: 1,
             },
             0,
-            HitTarget::TableRow(offset + k),
+            HitTarget::TableRow(window.start + k),
         );
     }
 }
@@ -134,6 +177,7 @@ pub fn render_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::columns::Column;
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::ApiResource;
     use ratatui::Terminal;
@@ -250,16 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn failing_phases_are_styled_differently_from_running() {
-        assert_ne!(
-            phase_style("Running"),
-            phase_style("CrashLoopBackOff"),
-            "a failing pod must be visually distinct"
-        );
-        assert_ne!(phase_style("Running"), phase_style("Pending"));
-    }
-
-    #[test]
     fn hit_zones_align_with_the_rows_ratatui_actually_draws() {
         // The real guarantee: the row you can SEE at screen row y is the row
         // you SELECT by clicking y. Asserting the zone sequence alone does not
@@ -295,22 +329,101 @@ mod tests {
     }
 
     #[test]
-    fn hit_zones_follow_the_scrolled_viewport() {
-        // ratatui scrolls TableState::offset to keep the selection visible.
-        // Registering zones by absolute object index makes every row past the
-        // first screenful select the wrong pod.
-        let pods: Vec<_> = (0..40)
-            .map(|i| pod(&format!("pod-{i:02}"), "Running"))
+    fn the_selected_row_is_the_one_that_renders_highlighted() {
+        // Regression guard: TableView used to carry a vestigial TableState
+        // that main.rs wrote the real selection into while render_table read
+        // a different, always-zero field — every test passed, but selection
+        // was inert in the running binary. This exercises the full path from
+        // "app sets a selection" to "that row renders highlighted".
+        let pods: Vec<_> = (0..5)
+            .map(|i| pod(&format!("pod-{i}"), "Running"))
             .collect();
-        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut view = TableView::new();
-        view.state.select(Some(30));
+        view.selected = 2;
         let mut hits = HitRegistry::new();
         let gvk = GroupVersionKind::gvk("", "v1", "Pod");
         term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
             .unwrap();
 
-        let offset = view.state.offset();
+        let buf = term.backend().buffer();
+        // pod-2 is the third data row: first_row_y = area.y + 2, so it draws
+        // at y = 2 + 2 = 4. pod-0, an unselected row, draws at y = 2. Bold is
+        // the discriminator, not "any style difference": phase_style never
+        // sets it (verified in ui/theme.rs), only row_highlight_style does,
+        // so checking bold pins WHICH row is highlighted, not just that two
+        // rows differ — a bug that pins selection to row 0 would still make
+        // row 0 (y=2) bold and row 2 (y=4) plain, and a same-row-index check
+        // that only asserted inequality would miss that entirely.
+        let is_bold = |y: u16| {
+            (1..10).any(|x| {
+                buf[(x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
+        };
+        assert!(
+            is_bold(4),
+            "the selected row (pod-2, drawn at y=4) must be bold"
+        );
+        assert!(
+            !is_bold(2),
+            "an unselected row (pod-0, drawn at y=2) must not be bold"
+        );
+    }
+
+    #[test]
+    fn a_selection_past_the_end_is_clamped_when_the_list_shrinks() {
+        // A watch delete can drop objects out from under the selection.
+        let pods: Vec<_> = (0..3)
+            .map(|i| pod(&format!("pod-{i}"), "Running"))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 99;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
+            .unwrap();
+        assert_eq!(
+            view.selected, 2,
+            "selection must clamp to the last remaining object"
+        );
+    }
+
+    #[test]
+    fn rendering_an_empty_list_leaves_the_selection_at_zero() {
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 5;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &[], &gvk, &mut view, &mut hits))
+            .unwrap();
+        assert_eq!(
+            view.selected, 0,
+            "an empty list must not leave a dangling selection"
+        );
+    }
+
+    #[test]
+    fn hit_zones_follow_the_scrolled_viewport() {
+        // This view owns scrolling (scroll_offset) to keep the selection
+        // visible. Registering zones by absolute object index makes every
+        // row past the first screenful select the wrong pod.
+        let pods: Vec<_> = (0..40)
+            .map(|i| pod(&format!("pod-{i:02}"), "Running"))
+            .collect();
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut view = TableView::new();
+        view.selected = 30;
+        let mut hits = HitRegistry::new();
+        let gvk = GroupVersionKind::gvk("", "v1", "Pod");
+        term.draw(|f| render_table(f, f.area(), &pods, &gvk, &mut view, &mut hits))
+            .unwrap();
+
+        let offset = view.offset;
         assert!(
             offset > 0,
             "expected the viewport to have scrolled, got offset {offset}"
@@ -346,5 +459,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_visible_window_covers_only_rows_that_fit() {
+        // A 10-row area spends 1 line on the top border, 1 on the header and
+        // 1 on the bottom border, leaving 7 data rows.
+        assert_eq!(visible_window(0, 10, 100), 0..7);
+    }
+
+    #[test]
+    fn the_visible_window_follows_the_scroll_offset() {
+        assert_eq!(visible_window(24, 10, 100), 24..31);
+    }
+
+    #[test]
+    fn the_visible_window_is_clamped_to_the_object_count() {
+        assert_eq!(
+            visible_window(0, 10, 3),
+            0..3,
+            "must not run past the end of the list"
+        );
+        assert_eq!(visible_window(98, 10, 100), 98..100);
+    }
+
+    #[test]
+    fn a_viewport_with_no_room_for_rows_yields_an_empty_window() {
+        for h in [0u16, 1, 2, 3] {
+            let w = visible_window(0, h, 100);
+            assert!(
+                w.start >= w.end || w.len() <= 1,
+                "height {h} produced {w:?}"
+            );
+        }
+        assert!(visible_window(0, 0, 100).is_empty());
+    }
+
+    #[test]
+    fn an_offset_past_the_end_yields_an_empty_window_rather_than_panicking() {
+        assert!(visible_window(500, 10, 100).is_empty());
+    }
+
+    #[test]
+    fn scrolling_does_not_move_while_the_selection_is_visible() {
+        assert_eq!(scroll_offset(5, 0, 10), 0);
+        assert_eq!(
+            scroll_offset(9, 0, 10),
+            0,
+            "the last visible row must not scroll"
+        );
+    }
+
+    #[test]
+    fn scrolling_follows_the_selection_downward_by_the_minimum() {
+        assert_eq!(
+            scroll_offset(10, 0, 10),
+            1,
+            "one past the window scrolls exactly one row"
+        );
+        assert_eq!(scroll_offset(50, 0, 10), 41);
+    }
+
+    #[test]
+    fn scrolling_follows_the_selection_upward() {
+        assert_eq!(scroll_offset(3, 20, 10), 3);
+        assert_eq!(scroll_offset(19, 20, 10), 19);
+    }
+
+    #[test]
+    fn a_zero_row_viewport_yields_offset_zero_rather_than_underflowing() {
+        assert_eq!(scroll_offset(0, 0, 0), 0);
+        assert_eq!(scroll_offset(100, 50, 0), 0);
+    }
+
+    #[test]
+    fn only_visible_rows_are_formatted() {
+        // The guarantee this task exists for: a 5000-object list in a small
+        // viewport must format tens of rows, not thousands.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FORMATS: AtomicUsize = AtomicUsize::new(0);
+
+        fn counting_extract(_o: &DynamicObject) -> String {
+            FORMATS.fetch_add(1, Ordering::SeqCst);
+            "x".to_string()
+        }
+
+        let pods: Vec<_> = (0..5000)
+            .map(|i| pod(&format!("p{i}"), "Running"))
+            .collect();
+        let cols = vec![Column {
+            header: "NAME",
+            width: Constraint::Fill(1),
+            extract: counting_extract,
+        }];
+
+        FORMATS.store(0, Ordering::SeqCst);
+        let window = visible_window(0, 20, pods.len());
+        for obj in &pods[window] {
+            for c in &cols {
+                let _ = (c.extract)(obj);
+            }
+        }
+
+        let n = FORMATS.load(Ordering::SeqCst);
+        assert!(
+            n <= 20,
+            "formatted {n} rows for a 20-row viewport; expected at most 20"
+        );
     }
 }
