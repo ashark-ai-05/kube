@@ -1,5 +1,6 @@
 use crate::app::event::{AppEvent, WatchStatus};
 use crate::store::cache::KindCache;
+use crate::store::multi::{KindAvailability, availability_of};
 use crate::store::rbac::{WatchFailure, classify};
 use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
@@ -15,6 +16,11 @@ use tokio::task::JoinHandle;
 pub struct ResourceStore {
     kinds: HashMap<GroupVersionKind, KindCache>,
     statuses: HashMap<GroupVersionKind, WatchStatus>,
+    /// Per-kind sidebar availability, alongside `statuses` rather than behind
+    /// a second channel: the sidebar reads counts and availability from one
+    /// store snapshot under one lock, so the two can never disagree about a
+    /// kind the way a status string and a separately-derived guess could.
+    availability: HashMap<GroupVersionKind, KindAvailability>,
 }
 
 impl Default for ResourceStore {
@@ -28,6 +34,7 @@ impl ResourceStore {
         Self {
             kinds: HashMap::new(),
             statuses: HashMap::new(),
+            availability: HashMap::new(),
         }
     }
 
@@ -56,6 +63,20 @@ impl ResourceStore {
             .get(gvk)
             .copied()
             .unwrap_or(WatchStatus::Initialising)
+    }
+
+    pub fn set_availability(&mut self, gvk: GroupVersionKind, availability: KindAvailability) {
+        self.availability.insert(gvk, availability);
+    }
+
+    /// Defaults to `Watching` for a kind with no recorded entry, matching how
+    /// `status` defaults to `Initialising`: absence means "nothing permanent
+    /// has been observed yet", not "broken".
+    pub fn availability(&self, gvk: &GroupVersionKind) -> KindAvailability {
+        self.availability
+            .get(gvk)
+            .cloned()
+            .unwrap_or(KindAvailability::Watching)
     }
 }
 
@@ -159,12 +180,18 @@ async fn drive_watch<S>(
                 let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
             }
             Err(e) => match classify(&e) {
-                WatchFailure::Forbidden { detail } => {
-                    let msg = forbidden_message(&ar.plural, namespace.as_deref(), &detail);
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Failed);
+                ref failure @ WatchFailure::Forbidden { ref detail } => {
+                    let msg = forbidden_message(&ar.plural, namespace.as_deref(), detail);
+                    {
+                        // One critical section for both: the sidebar reads
+                        // status and availability from the same store
+                        // snapshot, so they must never be set as two
+                        // separately-locked writes that a reader could
+                        // observe half-applied.
+                        let mut s = store.write().await;
+                        s.set_status(gvk.clone(), WatchStatus::Failed);
+                        s.set_availability(gvk.clone(), availability_of(failure));
+                    }
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
                         status: WatchStatus::Failed,
@@ -177,12 +204,13 @@ async fn drive_watch<S>(
                     // on purpose, and it would bury the actionable one.
                     return;
                 }
-                WatchFailure::NotFound { detail } => {
-                    let msg = not_found_message(&ar.plural, &detail);
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Failed);
+                ref failure @ WatchFailure::NotFound { ref detail } => {
+                    let msg = not_found_message(&ar.plural, detail);
+                    {
+                        let mut s = store.write().await;
+                        s.set_status(gvk.clone(), WatchStatus::Failed);
+                        s.set_availability(gvk.clone(), availability_of(failure));
+                    }
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
                         status: WatchStatus::Failed,
@@ -430,6 +458,95 @@ mod tests {
         assert!(
             store.read().await.objects(&gvk).is_empty(),
             "the event after a permanent failure must never reach the store"
+        );
+    }
+
+    // --- per-kind availability lives in the store, alongside status ---
+
+    #[test]
+    fn availability_defaults_to_watching_for_an_unknown_kind() {
+        let store = ResourceStore::new();
+        assert_eq!(
+            store.availability(&pod_gvk()),
+            KindAvailability::Watching,
+            "absence means nothing permanent has been observed yet, not broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_watch_records_availability_in_the_store_not_just_a_message() {
+        // The sidebar renders availability as a state read from the store
+        // snapshot. Deriving it by matching on the AppEvent::Error string
+        // would break the first time kube-rs rewords that message, silently,
+        // with no test able to catch it — this asserts the structured state
+        // exists instead.
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let events = vec![Err(forbidden_error("pods is forbidden"))];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk.clone(), ar, None, store.clone(), tx).await;
+
+        assert!(matches!(
+            store.read().await.availability(&gvk),
+            KindAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_kinds_unavailability_does_not_affect_another() {
+        // On a corporate cluster the user lacks RBAC on some kinds and not
+        // others — this is the normal case, not an edge case. One forbidden
+        // kind must not make every other kind read as broken too.
+        let forbidden_gvk = pod_gvk();
+        let healthy_gvk = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let forbidden_ar = ApiResource::erase::<Pod>(&());
+        let healthy_ar = ApiResource::from_gvk(&healthy_gvk);
+        let store = test_store();
+
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let forbidden_events = vec![Err(forbidden_error("pods is forbidden"))];
+        let s1 = futures::stream::iter(forbidden_events);
+        futures::pin_mut!(s1);
+        drive_watch(
+            s1,
+            forbidden_gvk.clone(),
+            forbidden_ar,
+            None,
+            store.clone(),
+            tx1,
+        )
+        .await;
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let healthy_events = vec![Ok(watcher::Event::InitDone)];
+        let s2 = futures::stream::iter(healthy_events);
+        futures::pin_mut!(s2);
+        drive_watch(
+            s2,
+            healthy_gvk.clone(),
+            healthy_ar,
+            None,
+            store.clone(),
+            tx2,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                store.read().await.availability(&forbidden_gvk),
+                KindAvailability::Unavailable { .. }
+            ),
+            "the forbidden kind must be marked unavailable"
+        );
+        assert_eq!(
+            store.read().await.availability(&healthy_gvk),
+            KindAvailability::Watching,
+            "a different kind's forbidden watch must not leak into this one's availability"
         );
     }
 
