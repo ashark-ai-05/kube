@@ -14,8 +14,8 @@
 //! computed with `geometry::tab_spans`, exactly as that module's own doc
 //! comment prescribes, instead of a second, locally-invented layout loop.
 //!
-//! YAML and Events tab *content* are out of scope for this task (Task 8 and
-//! Task 9 respectively) — both render a clearly-marked placeholder here.
+//! YAML tab renders serialized kubectl-style YAML via `serde_norway` (Task 8).
+//! Events tab *content* is out of scope for Task 9 and renders a placeholder.
 
 use crate::store::columns::format_age;
 use crate::ui::geometry::tab_spans;
@@ -66,10 +66,17 @@ impl DetailTab {
 /// content — but they live on this shared struct rather than two separate
 /// ones so switching tabs and reopening the pane does not lose either
 /// position.
+///
+/// The YAML cache stores the serialized YAML string keyed by `resourceVersion`
+/// (from the object's metadata). When the object changes, the resourceVersion
+/// changes, so the cache never goes stale. Serialization (especially in debug
+/// builds with managedFields) is expensive; caching it prevents re-serializing
+/// an unchanged object on every frame.
 pub struct DetailPane {
     pub tab: DetailTab,
     pub yaml_scroll: u16,
     pub events_scroll: u16,
+    yaml_cache: Option<(String, String)>, // (resourceVersion, serialized YAML)
 }
 
 impl Default for DetailPane {
@@ -84,6 +91,7 @@ impl DetailPane {
             tab: DetailTab::Overview,
             yaml_scroll: 0,
             events_scroll: 0,
+            yaml_cache: None,
         }
     }
 }
@@ -190,9 +198,7 @@ pub fn render_detail(
 
     match pane.tab {
         DetailTab::Overview => render_overview(f, content_area, obj),
-        DetailTab::Yaml => {
-            render_yaml(f, content_area, obj, &mut pane.yaml_scroll)
-        }
+        DetailTab::Yaml => render_yaml(f, content_area, obj, pane),
         DetailTab::Events => render_placeholder(f, content_area, "Events — implemented in Task 9."),
     }
 }
@@ -271,20 +277,40 @@ fn render_overview(f: &mut Frame, area: Rect, obj: &DynamicObject) {
 
 /// Render the YAML tab content: a scrollable view of the object serialized to YAML.
 /// The scroll position is clamped to valid bounds to prevent scrolling past the end.
-fn render_yaml(f: &mut Frame, area: Rect, obj: &DynamicObject, scroll: &mut u16) {
+fn render_yaml(f: &mut Frame, area: Rect, obj: &DynamicObject, pane: &mut DetailPane) {
     use ratatui::widgets::Wrap;
 
-    let yaml = object_to_yaml(obj);
+    let yaml = get_or_cache_yaml(obj, pane);
     let total_lines = yaml_line_count(&yaml);
 
     // Clamp scroll to valid bounds: the viewport height is the render area height
-    *scroll = clamp_scroll(*scroll, total_lines, area.height);
+    pane.yaml_scroll = clamp_scroll(pane.yaml_scroll, total_lines, area.height);
 
-    let paragraph = Paragraph::new(yaml)
+    let paragraph = Paragraph::new(yaml.clone())
         .wrap(Wrap { trim: false })
-        .scroll((*scroll, 0));
+        .scroll((pane.yaml_scroll, 0));
 
     f.render_widget(paragraph, area);
+}
+
+/// Get cached YAML for an object, or compute and cache it if the object changed.
+/// The cache is keyed on `resourceVersion` — if it changes, the object changed,
+/// so the cache is invalid. This prevents re-serializing an unchanged object on
+/// every frame.
+fn get_or_cache_yaml(obj: &DynamicObject, pane: &mut DetailPane) -> String {
+    let resource_version = obj.metadata.resource_version.as_deref().unwrap_or("");
+
+    // Check cache: if resourceVersion matches, reuse it
+    if let Some((cached_rv, cached_yaml)) = &pane.yaml_cache
+        && cached_rv == resource_version
+    {
+        return cached_yaml.clone();
+    }
+
+    // Cache miss or stale: serialize and update cache
+    let yaml = object_to_yaml(obj);
+    pane.yaml_cache = Some((resource_version.to_string(), yaml.clone()));
+    yaml
 }
 
 /// A clearly-marked stand-in for tab content this task does not own.
@@ -357,6 +383,7 @@ mod tests {
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
+            yaml_cache: None,
         };
         term.draw(|f| {
             let area = f.area();
@@ -388,6 +415,7 @@ mod tests {
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
+            yaml_cache: None,
         };
         term.draw(|f| {
             let area = f.area();
@@ -643,27 +671,60 @@ mod tests {
 
     /// Build an object with a custom annotation. Used to test multi-line
     /// annotation rendering.
+    /// Sets annotations on the typed metadata, leaving only spec/status in data
+    /// to match the shape of real apiserver responses (no duplicate metadata keys).
     fn object_with_annotation(key: &str, value: &str) -> DynamicObject {
-        let mut o = DynamicObject::new("test-obj", &ApiResource::erase::<Pod>(&())).within("default");
+        let mut o =
+            DynamicObject::new("test-obj", &ApiResource::erase::<Pod>(&())).within("default");
+        // Add annotation to the typed ObjectMeta field (BTreeMap)
+        let mut annotations = std::collections::BTreeMap::new();
+        annotations.insert(key.to_string(), value.to_string());
+        o.metadata.annotations = Some(annotations);
+        // Keep only spec/status in data to avoid duplicate metadata key in YAML
         o.data = serde_json::json!({
-            "metadata": {
-                "annotations": {
-                    key: value
-                }
-            }
+            "spec": {},
+            "status": {}
         });
         o
     }
 
     #[test]
     fn yaml_leads_with_apiversion_kind_and_metadata() {
-        // kubectl's own convention. A serialiser that alphabetised the top
-        // level would put `apiVersion` after nothing but still bury `kind`.
+        // kubectl's own convention: apiVersion, kind, metadata lead.
+        // This test uses a realistic Pod which happens to have alphabetically-ordered
+        // top-level keys (apiVersion, kind, metadata, spec, status), so it cannot
+        // distinguish "declaration order" from "full alphabetisation". See the separate
+        // key-order test below for the discriminating case.
         let y = object_to_yaml(&pod_with_status());
         let lines: Vec<&str> = y.lines().collect();
-        assert!(lines[0].starts_with("apiVersion:"), "first line was {:?}", lines[0]);
+        assert!(
+            lines[0].starts_with("apiVersion:"),
+            "first line was {:?}",
+            lines[0]
+        );
         assert!(lines.iter().any(|l| l.starts_with("kind:")));
         assert!(lines.iter().any(|l| l.starts_with("metadata:")));
+    }
+
+    #[test]
+    fn the_document_leads_with_apiversion_rather_than_sorting_it_among_the_rest() {
+        // Deliberately artificial: real Kubernetes objects happen to have
+        // top-level keys that are already alphabetical (apiVersion, kind,
+        // metadata, spec, status), so no realistic fixture can distinguish
+        // "apiVersion first" from "everything alphabetised". The `aaa` key
+        // sorts before `apiVersion` and makes the difference observable, so a
+        // future serde_norway change that started sorting the top level would
+        // fail here rather than silently reordering every object we display.
+        let mut obj = DynamicObject::new("x", &ApiResource::erase::<Pod>(&())).within("default");
+        obj.data = serde_json::json!({ "aaa": 1, "spec": { "nodeName": "n1" } });
+        let y = object_to_yaml(&obj);
+        let lines: Vec<&str> = y.lines().collect();
+        assert!(lines[0].starts_with("apiVersion:"), "got: {:?}", lines[0]);
+        assert!(
+            lines.iter().position(|l| l.starts_with("aaa:"))
+                > lines.iter().position(|l| l.starts_with("kind:")),
+            "`aaa` sorted ahead of the leading keys, so the top level is being alphabetised:\n{y}"
+        );
     }
 
     #[test]
@@ -672,14 +733,92 @@ mod tests {
         let y = object_to_yaml(&obj);
         assert!(y.contains("line one"));
         assert!(y.contains("line three"));
-        assert!(!y.contains("\\n"), "multi-line value was escaped rather than blocked:\n{y}");
+        assert!(
+            !y.contains("\\n"),
+            "multi-line value was escaped rather than blocked:\n{y}"
+        );
+        // Catch invalid YAML: duplicate top-level metadata key would indicate
+        // the fixture is not shaped like a real object (apiserver never does this).
+        assert_eq!(
+            y.lines().filter(|l| l.starts_with("metadata:")).count(),
+            1,
+            "duplicate top-level metadata key — the fixture is not shaped like a real object:\n{y}"
+        );
     }
 
     #[test]
     fn scroll_clamps_to_the_document_and_never_underflows() {
         assert_eq!(clamp_scroll(0, 100, 20), 0);
         assert_eq!(clamp_scroll(50, 100, 20), 50);
-        assert_eq!(clamp_scroll(200, 100, 20), 80, "cannot scroll past the last screenful");
-        assert_eq!(clamp_scroll(10, 5, 20), 0, "a document shorter than the viewport does not scroll");
+        assert_eq!(
+            clamp_scroll(200, 100, 20),
+            80,
+            "cannot scroll past the last screenful"
+        );
+        assert_eq!(
+            clamp_scroll(10, 5, 20),
+            0,
+            "a document shorter than the viewport does not scroll"
+        );
+    }
+
+    #[test]
+    fn yaml_cache_is_reused_for_unchanged_objects() {
+        // Verify that the YAML cache prevents re-serialization for unchanged objects.
+        // We create an object, serialize it once (populating the cache), then
+        // verify that a second call reuses the cached value. The cache is keyed
+        // on resourceVersion, so an unchanged object with the same resourceVersion
+        // must return the same YAML without re-serializing.
+        let mut pane = DetailPane::new();
+        let obj = pod_with_status();
+
+        // First call: populates cache
+        let yaml1 = get_or_cache_yaml(&obj, &mut pane);
+        let cache_after_first = pane.yaml_cache.clone();
+
+        // Second call with identical object: should reuse cache
+        let yaml2 = get_or_cache_yaml(&obj, &mut pane);
+
+        // Verify: same YAML, and cache was not recomputed
+        assert_eq!(yaml1, yaml2, "YAML must be identical for unchanged object");
+        assert_eq!(
+            pane.yaml_cache, cache_after_first,
+            "cache must not be recomputed for unchanged object"
+        );
+    }
+
+    #[test]
+    fn yaml_cache_invalidates_when_resourceversion_changes() {
+        // Verify that the YAML cache invalidates when the object's resourceVersion changes.
+        let mut pane = DetailPane::new();
+        let mut obj1 = pod_with_status();
+        obj1.metadata.resource_version = Some("rv1".to_string());
+
+        // Populate cache with first object
+        let yaml1 = get_or_cache_yaml(&obj1, &mut pane);
+        let cache_after_first = pane.yaml_cache.clone();
+
+        // Create a new object with different resourceVersion
+        let mut obj2 = pod_with_status();
+        obj2.metadata.resource_version = Some("rv2".to_string());
+
+        // Get YAML for second object: should recompute, not use stale cache
+        let yaml2 = get_or_cache_yaml(&obj2, &mut pane);
+
+        // Verify: YAML differs (because resourceVersion is serialized),
+        // and cache was updated to reflect the new resourceVersion
+        assert_ne!(
+            yaml1, yaml2,
+            "YAML must differ when resourceVersion changes"
+        );
+        assert_ne!(
+            pane.yaml_cache, cache_after_first,
+            "cache must be recomputed for changed object"
+        );
+        assert_eq!(
+            pane.yaml_cache.as_ref().map(|(rv, _)| rv.as_str()),
+            Some("rv2"),
+            "cache must be updated to new resourceVersion"
+        );
     }
 }
