@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn table_data_is_recorded_and_isolated_per_kind() {
-        use crate::store::table::TableColumn;
+        use crate::store::table::{TableColumn, TableRow};
         let mut store = ResourceStore::new();
         let other = GroupVersionKind::gvk("apps", "v1", "Deployment");
         let table = TableData {
@@ -671,7 +671,10 @@ mod tests {
                 name: "Name".to_string(),
                 priority: 0,
             }],
-            rows: vec![vec!["a".to_string()]],
+            rows: vec![TableRow {
+                cells: vec!["a".to_string()],
+                identity: None,
+            }],
         };
         store.set_table_data(pod_gvk(), table.clone());
         assert_eq!(

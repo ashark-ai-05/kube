@@ -190,11 +190,26 @@ async fn fetch_table_returns_kubectl_equivalent_columns() {
     // synthetic fixtures.
     for row in &table.rows {
         assert_eq!(
-            row.len(),
+            row.cells.len(),
             table.columns.len(),
             "a real row's width must match the declared column count, got {row:?}"
         );
     }
+
+    // fetch_table also requests includeObject=Metadata (appended to the URI
+    // by hand — kube-core 4.2's ListParams has no field for it) so each row
+    // carries the identity of the object it displays, rather than leaving
+    // row selection to positionally match a separately-refreshed watch list.
+    // This is the first time that parameter leaves the process too; no unit
+    // test can confirm a real apiserver actually honours it.
+    assert!(
+        table.rows.iter().all(|r| r.identity.is_some()),
+        "expected every row to carry an identity once includeObject=Metadata \
+         was requested — if this fails, either the apiserver ignored the \
+         parameter or decode_table's PartialObjectMetadata parsing drifted \
+         from what it actually sent back, got {:?}",
+        table.rows
+    );
 }
 
 #[tokio::test]

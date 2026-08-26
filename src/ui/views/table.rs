@@ -1,5 +1,5 @@
 use crate::store::columns::{ColumnSource, column_source};
-use crate::store::table::{SortState, TableData, sort_rows};
+use crate::store::table::{SortState, TableData, sort_rows, sort_table_rows};
 use crate::ui::geometry::column_offsets;
 use crate::ui::hit::{HitRegistry, HitTarget};
 use crate::ui::scroll;
@@ -181,33 +181,45 @@ pub fn render_table_with_data(
     // guarantee, which only ever covered the unsorted path (still exercised
     // by `render_table`/`only_visible_rows_are_formatted` below, where
     // `view.sort` stays `None`).
-    let rows: Vec<Row> = if let Some(sort) = &view.sort {
-        let mut all_rows: Vec<Vec<String>> = match &source {
-            ColumnSource::Builtin(cols) => objects
+    //
+    // `Server` rows sort through `sort_table_rows`, not `sort_rows`: a
+    // `TableRow` bundles its cells with the identity of the object it
+    // displays (`store::table::TableRow`), and `sort_table_rows` reorders
+    // that whole bundle so identity always moves with its cells. `Builtin`
+    // rows have no separate identity to carry — the cells ARE extracted
+    // from `objects` in this exact call, in this exact order — so they stay
+    // on the plain `sort_rows`/`Vec<Vec<String>>` path.
+    let rows: Vec<Row> = match (&source, &view.sort) {
+        (ColumnSource::Builtin(cols), Some(sort)) => {
+            let mut all_rows: Vec<Vec<String>> = objects
                 .iter()
                 .map(|obj| cols.iter().map(|c| (c.extract)(obj)).collect())
-                .collect(),
-            ColumnSource::Server(t) => t.rows.clone(),
-        };
-        sort_rows(&mut all_rows, sort);
-        all_rows[window.clone()]
-            .iter()
-            .map(|cells| styled_row(cells, status_idx))
-            .collect()
-    } else {
-        match &source {
-            ColumnSource::Builtin(cols) => objects[window.clone()]
-                .iter()
-                .map(|obj| {
-                    let cells: Vec<String> = cols.iter().map(|c| (c.extract)(obj)).collect();
-                    styled_row(&cells, status_idx)
-                })
-                .collect(),
-            ColumnSource::Server(t) => t.rows[window.clone()]
+                .collect();
+            sort_rows(&mut all_rows, sort);
+            all_rows[window.clone()]
                 .iter()
                 .map(|cells| styled_row(cells, status_idx))
-                .collect(),
+                .collect()
         }
+        (ColumnSource::Builtin(cols), None) => objects[window.clone()]
+            .iter()
+            .map(|obj| {
+                let cells: Vec<String> = cols.iter().map(|c| (c.extract)(obj)).collect();
+                styled_row(&cells, status_idx)
+            })
+            .collect(),
+        (ColumnSource::Server(t), Some(sort)) => {
+            let mut all_rows = t.rows.clone();
+            sort_table_rows(&mut all_rows, sort);
+            all_rows[window.clone()]
+                .iter()
+                .map(|row| styled_row(&row.cells, status_idx))
+                .collect()
+        }
+        (ColumnSource::Server(t), None) => t.rows[window.clone()]
+            .iter()
+            .map(|row| styled_row(&row.cells, status_idx))
+            .collect(),
     };
     let row_count = rows.len();
 
@@ -731,7 +743,7 @@ mod tests {
     // --- render_table_with_data: ColumnSource preference and sort wiring ---
 
     fn sample_table_data() -> TableData {
-        use crate::store::table::TableColumn;
+        use crate::store::table::{TableColumn, TableRow};
         TableData {
             columns: vec![
                 TableColumn {
@@ -744,8 +756,14 @@ mod tests {
                 },
             ],
             rows: vec![
-                vec!["b-thing".to_string(), "Ready".to_string()],
-                vec!["a-thing".to_string(), "NotReady".to_string()],
+                TableRow {
+                    cells: vec!["b-thing".to_string(), "Ready".to_string()],
+                    identity: None,
+                },
+                TableRow {
+                    cells: vec!["a-thing".to_string(), "NotReady".to_string()],
+                    identity: None,
+                },
             ],
         }
     }
