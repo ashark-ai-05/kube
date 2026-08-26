@@ -171,6 +171,19 @@ fn key_action(code: KeyCode, focus: Focus) -> Action {
             KeyCode::BackTab | KeyCode::Left => Action::CycleDetailTab(-1),
             KeyCode::Down | KeyCode::Char('j') => Action::ScrollDetail(1),
             KeyCode::Up | KeyCode::Char('k') => Action::ScrollDetail(-1),
+            // The sidebar stays reachable by mouse while the pane is open
+            // (`mouse_action`'s `TreeRow` arm is unconditional on
+            // `detail_open`) but had no keyboard equivalent at all: `j`/`k`
+            // and `Tab` are already claimed above for the pane's own
+            // scrolling and tab-cycling, and `focus` resolves to `Detail`
+            // unconditionally whenever the pane is open (see `main.rs`), so
+            // binding plain `ToggleFocus` here would never actually reach
+            // the sidebar. Uppercase `J`/`K` move the tree selection
+            // directly, and Space activates it (mirroring `Focus::Sidebar`'s
+            // own binding), without touching either claimed key.
+            KeyCode::Char('J') => Action::ScrollTree(1),
+            KeyCode::Char('K') => Action::ScrollTree(-1),
+            KeyCode::Char(' ') => Action::ActivateTreeRow,
             KeyCode::Char('c') => Action::OpenClusterPicker,
             KeyCode::Char('n') => Action::OpenNamespacePicker,
             KeyCode::Char('q') => Action::Quit,
@@ -193,6 +206,16 @@ fn key_action(code: KeyCode, focus: Focus) -> Action {
             KeyCode::Up | KeyCode::Char('k') => Action::ScrollBy(-1),
             KeyCode::Enter => Action::OpenDetail,
             KeyCode::Tab => Action::ToggleFocus,
+            // Mouse-only until now: `mouse_action` maps a `ColumnHeader`
+            // click to `SortByColumn(i)`, but nothing reached it from the
+            // keyboard. Digits are the natural keyboard analogue of
+            // clicking a header — 1-9 pick columns 1-9 (0-indexed as 0-8),
+            // matching kubectl's own column order left to right, which
+            // covers every builtin table (none exceeds 9 columns) and all
+            // but the widest CRD printer-column sets.
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                Action::SortByColumn(c.to_digit(10).unwrap() as usize - 1)
+            }
             KeyCode::Char('c') => Action::OpenClusterPicker,
             KeyCode::Char('n') => Action::OpenNamespacePicker,
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -799,6 +822,75 @@ mod tests {
             action_for(&key(KeyCode::Down), &r, Focus::Detail),
             Action::ScrollDetail(1),
             "Down must scroll the open tab's content, not a table row"
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('k')), &r, Focus::Detail),
+            Action::ScrollDetail(-1)
+        );
+    }
+
+    #[test]
+    fn sort_by_column_is_reachable_from_the_keyboard() {
+        // Mouse-only until now (`clicking_a_header_sorts_by_that_column`):
+        // digits 1-9 pick columns 1-9, 0-indexed, matching a header click's
+        // own indexing and kubectl's left-to-right column order.
+        let r = full_registry();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('1')), &r, Focus::Table),
+            Action::SortByColumn(0)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('3')), &r, Focus::Table),
+            Action::SortByColumn(2)
+        );
+    }
+
+    #[test]
+    fn zero_and_non_digit_characters_do_not_sort() {
+        let r = full_registry();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('0')), &r, Focus::Table),
+            Action::None,
+            "0 has no column to its left to index"
+        );
+        assert_ne!(
+            action_for(&key(KeyCode::Char('j')), &r, Focus::Table),
+            Action::SortByColumn(9),
+            "an existing binding (j) must not be reinterpreted as a sort"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_is_reachable_from_the_keyboard_even_with_the_detail_pane_open() {
+        // `mouse_action`'s `TreeRow` arm is unconditional on `detail_open` —
+        // a sidebar click always works, pane open or not. Before this, the
+        // keyboard had no equivalent at all while `Focus::Detail`: `j`/`k`
+        // and `Tab` are claimed by the pane's own scrolling and tab-cycling,
+        // and `focus` resolves to `Detail` unconditionally whenever the pane
+        // is open, so a plain `ToggleFocus` binding could never actually
+        // reach the sidebar.
+        let r = full_registry();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('J')), &r, Focus::Detail),
+            Action::ScrollTree(1)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char('K')), &r, Focus::Detail),
+            Action::ScrollTree(-1)
+        );
+        assert_eq!(
+            action_for(&key(KeyCode::Char(' ')), &r, Focus::Detail),
+            Action::ActivateTreeRow
+        );
+    }
+
+    #[test]
+    fn lowercase_jk_still_scroll_the_pane_not_the_sidebar_with_the_pane_open() {
+        // The new uppercase bindings must not shadow the pane's own j/k.
+        let r = full_registry();
+        assert_eq!(
+            action_for(&key(KeyCode::Char('j')), &r, Focus::Detail),
+            Action::ScrollDetail(1)
         );
         assert_eq!(
             action_for(&key(KeyCode::Char('k')), &r, Focus::Detail),
