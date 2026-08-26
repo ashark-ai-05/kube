@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod discovery;
 pub mod namespaces;
 pub mod registry;
 pub use auth::{
