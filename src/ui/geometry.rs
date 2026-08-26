@@ -1,0 +1,90 @@
+//! Shared measurement helpers for compound widgets that ratatui does not
+//! expose post-layout geometry for.
+//!
+//! `Table` column offsets (Plan 2) and now `Tabs` tab boundaries: neither
+//! widget's public API returns where it actually drew its sub-regions, so
+//! any caller that needs to hit-test them has to replicate the widget's own
+//! layout loop. Centralising that replication here means it happens once,
+//! not once per view that grows tabs.
+
+use ratatui::layout::Rect;
+
+/// Per-tab clickable rects for a manually hit-tested `Tabs`-like row.
+///
+/// Ratatui's `Tabs` widget (`ratatui-widgets-0.3.2/src/tabs.rs`) exposes no
+/// way to ask "where did tab N end up" — its public surface is `new`,
+/// `titles`, `select`, `style`, `divider`, and padding, nothing that returns
+/// geometry. This replicates its left-to-right layout loop measuring each
+/// label with `unicode_width::UnicodeWidthStr` (not byte length or
+/// `.chars().count()`, both of which under-measure wide characters and would
+/// make every tab after one mis-place its hit zone).
+///
+/// Tabs that do not fit within `area` are dropped rather than returned with
+/// a `Rect` extending past it: `x` only ever increases as tabs are laid out,
+/// so once one tab overflows, every tab after it would too.
+pub fn tab_spans(labels: &[&str], area: Rect, divider_width: u16) -> Vec<Rect> {
+    // TODO: implement
+    let _ = (labels, area, divider_width);
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn tab_rects_tile_left_to_right_without_overlap() {
+        let rects = tab_spans(&["Overview", "YAML", "Events"], rect(0, 0, 60, 1), 3);
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert!(
+                pair[0].x + pair[0].width <= pair[1].x,
+                "tabs overlap: {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_widths_account_for_wide_characters() {
+        // A CJK label is two cells per character; measuring in chars would
+        // make every tab after it clickable at the wrong offset.
+        let narrow = tab_spans(&["ab", "cd"], rect(0, 0, 40, 1), 1);
+        let wide = tab_spans(&["日本", "cd"], rect(0, 0, 40, 1), 1);
+        assert!(wide[1].x > narrow[1].x, "wide label did not widen its tab");
+    }
+
+    #[test]
+    fn tabs_that_do_not_fit_are_dropped_rather_than_drawn_off_screen() {
+        let rects = tab_spans(&["Overview", "YAML", "Events"], rect(0, 0, 10, 1), 3);
+        for r in &rects {
+            assert!(r.x + r.width <= 10, "tab {r:?} extends past the area");
+        }
+    }
+
+    #[test]
+    fn a_zero_width_area_yields_no_tabs_rather_than_panicking() {
+        let rects = tab_spans(&["Overview", "YAML"], rect(0, 0, 0, 1), 1);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn a_zero_height_area_yields_no_tabs_rather_than_panicking() {
+        let rects = tab_spans(&["Overview", "YAML"], rect(0, 0, 40, 0), 1);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn an_empty_label_list_yields_no_tabs() {
+        let rects: Vec<Rect> = tab_spans(&[], rect(0, 0, 40, 1), 1);
+        assert!(rects.is_empty());
+    }
+}

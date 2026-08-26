@@ -28,6 +28,13 @@ pub struct TreeGroup {
 pub struct KindTree {
     pub groups: Vec<TreeGroup>,
     pub selected: usize,
+    /// Scroll offset into the flattened rows, owned here rather than by a
+    /// separate view struct — `render_sidebar` takes `&mut KindTree` with no
+    /// companion state, the same arrangement `TableView` and `Picker` use to
+    /// keep an offset alive across frames rather than recomputing it from
+    /// scratch (see `ui::scroll::scroll_offset`'s doc comment for why a fresh
+    /// per-frame computation is not equivalent).
+    pub scroll: usize,
 }
 
 /// A row in the flattened tree — either a group header or a kind.
@@ -149,6 +156,7 @@ mod tests {
         KindTree {
             groups,
             selected: 0,
+            scroll: 0,
         }
     }
 
