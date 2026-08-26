@@ -1,6 +1,6 @@
 use crate::app::event::{AppEvent, WatchStatus};
 use crate::store::cache::KindCache;
-use crate::store::rbac::classify;
+use crate::store::rbac::{WatchFailure, classify};
 use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher;
@@ -87,17 +87,21 @@ pub fn status_for_failure_count(consecutive_errors: u32) -> WatchStatus {
 /// (`-n <namespace>` or the `n` picker); a watch that was already
 /// namespace-scoped and still got denied has no such escape hatch — the
 /// user lacks access to that namespace, full stop.
-pub fn forbidden_message(kind_plural: &str, _namespace: Option<&str>, detail: &str) -> String {
-    // STUB: does not yet distinguish cluster-scope from namespace-scope, and
-    // carries no remedy. Fixed in the next commit.
-    format!("watch {kind_plural}: {detail}")
+pub fn forbidden_message(kind_plural: &str, namespace: Option<&str>, detail: &str) -> String {
+    match namespace {
+        None => format!(
+            "{kind_plural} forbidden at cluster scope — try -n <namespace>, or press n to pick one: {detail}"
+        ),
+        Some(ns) => format!(
+            "{kind_plural} forbidden in namespace {ns} — you don't have access to this namespace either: {detail}"
+        ),
+    }
 }
 
 /// Build the status-bar message for a kind that no longer exists on the
 /// cluster (most commonly: its CRD was uninstalled mid-session).
 pub fn not_found_message(kind_plural: &str, detail: &str) -> String {
-    // STUB: same as `forbidden_message` above — fixed in the next commit.
-    format!("watch {kind_plural}: {detail}")
+    format!("{kind_plural} not found — it may have been removed from the cluster: {detail}")
 }
 
 /// Drive one watch stream into the store, emitting an event after each delta.
@@ -115,7 +119,7 @@ async fn drive_watch<S>(
     mut stream: S,
     gvk: GroupVersionKind,
     ar: ApiResource,
-    _namespace: Option<String>,
+    namespace: Option<String>,
     store: SharedStore,
     tx: UnboundedSender<AppEvent>,
 ) where
@@ -144,21 +148,49 @@ async fn drive_watch<S>(
                 }
                 let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
             }
-            Err(e) => {
-                // STUB: not yet branching on `classify(&e)` — every error is
-                // treated as retryable, which is the bug being fixed. Kept
-                // here (rather than left uncalled) so the next commit's diff
-                // is a behavior change, not a fresh wiring-up of `classify`.
-                let _ = classify(&e);
-                consecutive_errors += 1;
-                let status = status_for_failure_count(consecutive_errors);
-                store.write().await.set_status(gvk.clone(), status);
-                let _ = tx.send(AppEvent::WatchStatus {
-                    gvk: gvk.clone(),
-                    status,
-                });
-                let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
-            }
+            Err(e) => match classify(&e) {
+                WatchFailure::Forbidden { detail } => {
+                    let msg = forbidden_message(&ar.plural, namespace.as_deref(), &detail);
+                    store
+                        .write()
+                        .await
+                        .set_status(gvk.clone(), WatchStatus::Failed);
+                    let _ = tx.send(AppEvent::WatchStatus {
+                        gvk: gvk.clone(),
+                        status: WatchStatus::Failed,
+                    });
+                    let _ = tx.send(AppEvent::Error(msg));
+                    // Permanent: no retry will ever succeed for this
+                    // identity. Return rather than `break`, so we skip the
+                    // "stream ended unexpectedly" epilogue below — that
+                    // message is for a watch that died, not one we stopped
+                    // on purpose, and it would bury the actionable one.
+                    return;
+                }
+                WatchFailure::NotFound { detail } => {
+                    let msg = not_found_message(&ar.plural, &detail);
+                    store
+                        .write()
+                        .await
+                        .set_status(gvk.clone(), WatchStatus::Failed);
+                    let _ = tx.send(AppEvent::WatchStatus {
+                        gvk: gvk.clone(),
+                        status: WatchStatus::Failed,
+                    });
+                    let _ = tx.send(AppEvent::Error(msg));
+                    return;
+                }
+                WatchFailure::Retryable => {
+                    consecutive_errors += 1;
+                    let status = status_for_failure_count(consecutive_errors);
+                    store.write().await.set_status(gvk.clone(), status);
+                    let _ = tx.send(AppEvent::WatchStatus {
+                        gvk: gvk.clone(),
+                        status,
+                    });
+                    let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
+                }
+            },
         }
     }
 

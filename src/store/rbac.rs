@@ -9,6 +9,7 @@
 //! to tell the two apart. See `docs/superpowers/plan3-api-reference.md`
 //! section B6 for the verified error shape this is built against.
 
+use kube::core::Status;
 use kube::runtime::watcher;
 
 /// What a failed watch means for the caller: keep retrying, or give up.
@@ -28,18 +29,36 @@ pub enum WatchFailure {
 /// `Status` from the apiserver: wrongly retrying a permanent failure only
 /// wastes requests, while wrongly giving up on a transient one hides data
 /// the user actually has access to. The former is the safer direction.
-pub fn classify(_err: &watcher::Error) -> WatchFailure {
-    // STUB (failing-tests commit): does not yet unwrap into `kube::Error::Api`
-    // at all — every error is Retryable. This is the exact bug being fixed:
-    // a 403 retried forever, indistinguishable from a flaky cluster. Real
-    // implementation lands in the next commit.
-    WatchFailure::Retryable
+pub fn classify(err: &watcher::Error) -> WatchFailure {
+    match err {
+        watcher::Error::InitialListFailed(kube::Error::Api(status))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(status))
+        | watcher::Error::WatchFailed(kube::Error::Api(status)) => classify_status(status),
+        watcher::Error::WatchError(status) => classify_status(status),
+        watcher::Error::InitialListFailed(_)
+        | watcher::Error::WatchStartFailed(_)
+        | watcher::Error::WatchFailed(_)
+        | watcher::Error::NoResourceVersion => WatchFailure::Retryable,
+    }
+}
+
+fn classify_status(status: &Status) -> WatchFailure {
+    if status.is_forbidden() {
+        WatchFailure::Forbidden {
+            detail: status.message.clone(),
+        }
+    } else if status.is_not_found() {
+        WatchFailure::NotFound {
+            detail: status.message.clone(),
+        }
+    } else {
+        WatchFailure::Retryable
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kube::core::Status;
 
     /// Build a `kube::Error::Api` carrying a `Status` with the given code
     /// and reason, matching what a real apiserver response looks like.
