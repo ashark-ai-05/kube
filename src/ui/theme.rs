@@ -85,12 +85,39 @@ pub fn count_style() -> Style {
     Style::default().fg(VIOLET)
 }
 
+/// The kind the table is currently showing.
+///
+/// Distinct from the sidebar's own selection highlight (`DUSK` background,
+/// painted by `render_sidebar` itself): `tree.selected` is the cursor, this
+/// is the subject, and after a cluster switch (`active_kind` resets to Pod
+/// while `restore_selection` anchors the highlight by GVK) the two land on
+/// DIFFERENT rows every time, with nothing else on screen saying so. A
+/// distinct foreground colour, independent of whatever background the
+/// selection paints underneath it, so the two facts stay legible whether or
+/// not they land on the same row.
+pub fn active_kind_style() -> Style {
+    Style::default().fg(PERIWINKLE).add_modifier(Modifier::BOLD)
+}
+
 pub fn text_style() -> Style {
     Style::default().fg(PAPER)
 }
 
 pub fn muted_style() -> Style {
     Style::default().fg(MIST)
+}
+
+/// Colour an Events-tab row by its type ("Normal"/"Warning" — `Event.type_`
+/// is a plain `String`, not an enum; see
+/// `docs/superpowers/plan3-api-reference.md` C8). Warning is a signal, the
+/// whole reason anyone opens the Events tab, so it takes a signal-family
+/// colour (matching `phase_style`'s treatment of failing pod phases) rather
+/// than a chrome token — chrome and signal must never cross.
+pub fn event_kind_style(kind: &str) -> Style {
+    match kind {
+        "Warning" => Style::default().fg(CORAL),
+        _ => text_style(),
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +186,70 @@ mod tests {
                 .expect("phase styles must set a foreground");
             assert!(!chrome.contains(&fg), "{phase} rendered in a chrome colour");
         }
+    }
+
+    #[test]
+    fn event_kind_style_marks_warnings_distinctly_from_normal() {
+        assert_ne!(
+            event_kind_style("Warning"),
+            event_kind_style("Normal"),
+            "the whole reason someone opens the Events tab is to spot warnings"
+        );
+    }
+
+    #[test]
+    fn warning_events_use_a_signal_family_colour() {
+        let fg = event_kind_style("Warning")
+            .fg
+            .expect("event styles must set a foreground");
+        assert!(
+            fg == CORAL || fg == AMBER,
+            "warnings must use a signal-family colour, got {fg:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_event_type_styles_as_normal_not_as_a_warning() {
+        // `Event.type_` (C8) is an unconstrained `String`; a CRD controller
+        // or `events.k8s.io` producer can send a value that is neither
+        // "Normal" nor "Warning" (e.g. "Progressing"). `event_kind_style`'s
+        // `_ => text_style()` fallback already makes this choice — this test
+        // pins it explicitly so a future edit can't silently flip the
+        // default to the Warning/signal colour. Under-styling an unfamiliar
+        // event (it just looks like any other row) is the safer failure
+        // mode: inventing an alarm for a type this code doesn't understand
+        // would be worse than staying quiet about it.
+        assert_eq!(
+            event_kind_style("Progressing"),
+            event_kind_style("Normal"),
+            "an unrecognised type must render like Normal, not invent an alarm"
+        );
+        assert_ne!(
+            event_kind_style("Progressing"),
+            event_kind_style("Warning"),
+            "an unrecognised type must not be styled as a Warning"
+        );
+    }
+
+    #[test]
+    fn event_kind_style_never_reuses_a_chrome_token() {
+        let chrome = [INK, ABYSS, DUSK, INDIGO, PERIWINKLE, TEAL, VIOLET];
+        for kind in ["Normal", "Warning", "Unknown"] {
+            let fg = event_kind_style(kind)
+                .fg
+                .expect("event styles must set a foreground");
+            assert!(!chrome.contains(&fg), "{kind} rendered in a chrome colour");
+        }
+    }
+
+    #[test]
+    fn the_active_kind_is_styled_distinctly_from_plain_text() {
+        assert_ne!(
+            active_kind_style(),
+            text_style(),
+            "an ordinary sidebar row and the one the table is actually \
+             showing must not render identically"
+        );
     }
 
     #[test]

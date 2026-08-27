@@ -70,7 +70,14 @@ fn classify_list_result(
         }
         Err(e) => match classify_kube_error(&e) {
             WatchFailure::Forbidden { detail } => Err(NamespaceListError::Forbidden(detail)),
-            _ => Err(NamespaceListError::Other(e.to_string())),
+            // `safe_source_text`, not `e.to_string()`: this text is stored on
+            // the session and drawn in the namespace picker, and a lazy exec
+            // credential refresh failing mid-list arrives here as
+            // `kube::Error::Service(Box<AuthError>)` whose `Display` is the
+            // plugin's raw stdout. See `crate::cluster::redact`.
+            _ => Err(NamespaceListError::Other(crate::cluster::safe_source_text(
+                &e,
+            ))),
         },
     }
 }
@@ -200,5 +207,39 @@ mod tests {
     fn a_slash_or_space_is_invalid() {
         assert!(!is_valid_namespace_name("kube/system"));
         assert!(!is_valid_namespace_name("kube system"));
+    }
+
+    #[test]
+    fn a_credential_failure_mid_listing_never_reaches_the_picker_verbatim() {
+        // `NamespaceListError::Other` is stored on the session and drawn by
+        // the picker via `explanation()`. Exec credentials refresh per
+        // request, so a plugin failing during THIS list arrives as
+        // `kube::Error::Service(Box<AuthError>)` — whose `Display` is the
+        // plugin's stdout. See `crate::cluster::redact`.
+        use std::os::unix::process::ExitStatusExt;
+        const TOKEN: &str = "SUPER-SECRET-TOKEN-abc123";
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: format!(r#"{{"status":{{"token":"{TOKEN}"}}}}"#).into_bytes(),
+            stderr: Vec::new(),
+        };
+        let raw = kube::Error::Service(Box::new(kube::client::AuthError::AuthExecRun {
+            cmd: "kubelogin".to_string(),
+            status: out.status,
+            out,
+        }));
+        assert!(
+            raw.to_string().contains(TOKEN),
+            "the fixture must actually leak, or this test guards nothing: {raw}"
+        );
+
+        let Err(e) = classify_list_result(Err(raw)) else {
+            panic!("an auth failure must not classify as a successful listing");
+        };
+        assert!(
+            !e.explanation().contains(TOKEN),
+            "a bearer token reached the namespace picker: {}",
+            e.explanation()
+        );
     }
 }

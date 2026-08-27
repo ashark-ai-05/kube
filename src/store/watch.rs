@@ -1,12 +1,15 @@
 use crate::app::event::{AppEvent, WatchStatus};
 use crate::store::cache::KindCache;
+use crate::store::multi::{KindAvailability, availability_of};
 use crate::store::rbac::{WatchFailure, classify};
+use crate::store::table::TableData;
 use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher;
 use kube::{Api, Client};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -15,6 +18,44 @@ use tokio::task::JoinHandle;
 pub struct ResourceStore {
     kinds: HashMap<GroupVersionKind, KindCache>,
     statuses: HashMap<GroupVersionKind, WatchStatus>,
+    /// Per-kind sidebar availability, alongside `statuses` rather than behind
+    /// a second channel: the sidebar reads counts and availability from one
+    /// store snapshot under one lock, so the two can never disagree about a
+    /// kind the way a status string and a separately-derived guess could.
+    availability: HashMap<GroupVersionKind, KindAvailability>,
+    /// Server-rendered columns and rows for a kind, once a `fetch_table`
+    /// (`store::table::fetch_table`) has completed for it.
+    ///
+    /// Lives here, beside `statuses`/`availability`, under the SAME lock and
+    /// keyed by the SAME `GroupVersionKind`, for the reason documented on
+    /// `availability` above: the render path reads objects, status,
+    /// availability AND now table columns from one store snapshot under one
+    /// lock acquisition, so none of them can ever be read for a DIFFERENT
+    /// kind than the others. A side cell holding only "the current table",
+    /// keyed by nothing but "whatever is active right now", would go stale
+    /// the instant the user switches kinds faster than an in-flight fetch
+    /// returns — the returning fetch would land tagged as belonging to
+    /// whichever kind is active BY THEN, not the one it was actually
+    /// requested for. Keying by `GroupVersionKind`, the same key every other
+    /// per-kind fact in this store uses, makes that misattribution
+    /// unrepresentable: a stale fetch for a kind the user has since left
+    /// simply updates that kind's (unread) entry.
+    tables: HashMap<GroupVersionKind, TableData>,
+    /// When this kind's watch last changed anything, and when a Table fetch
+    /// was last issued for it — the two inputs `store::table::refetch_is_due`
+    /// needs.
+    ///
+    /// Here rather than in the event loop for a reason the loop could not
+    /// enforce itself: both are only meaningful relative to the data in THIS
+    /// store, and a cluster switch or a namespace change replaces the store
+    /// wholesale (`switch_cluster` step 5, `restart_watch`). Kept in the loop
+    /// they would have to be cleared by hand at both of those points, and a
+    /// carried-over `last_fetch` would suppress the very first refetch on the
+    /// new cluster — a table showing the old cluster's columns until
+    /// something happens to change. Living in the store makes them start
+    /// empty by construction, the same reasoning `tables` itself documents.
+    last_change: HashMap<GroupVersionKind, Instant>,
+    last_table_fetch: HashMap<GroupVersionKind, Instant>,
 }
 
 impl Default for ResourceStore {
@@ -28,6 +69,10 @@ impl ResourceStore {
         Self {
             kinds: HashMap::new(),
             statuses: HashMap::new(),
+            availability: HashMap::new(),
+            tables: HashMap::new(),
+            last_change: HashMap::new(),
+            last_table_fetch: HashMap::new(),
         }
     }
 
@@ -41,10 +86,52 @@ impl ResourceStore {
             .entry(gvk.clone())
             .or_insert_with(|| KindCache::new(resource.clone()))
             .apply(event);
+        // Recorded here, at the single point every delta for every kind
+        // passes through, rather than at the watch loop's call sites: a
+        // second place to remember to stamp this is a second place to forget
+        // to, and a missed stamp shows up as a Table that quietly stops
+        // refreshing for one kind.
+        self.last_change.insert(gvk.clone(), Instant::now());
     }
 
     pub fn objects(&self, gvk: &GroupVersionKind) -> Vec<Arc<DynamicObject>> {
         self.kinds.get(gvk).map(|c| c.objects()).unwrap_or_default()
+    }
+
+    /// How many objects of this kind are cached.
+    ///
+    /// Not `objects(gvk).len()`: the sidebar needs a count for EVERY
+    /// discovered kind on every frame, and `objects` clones a `Vec` of `Arc`s
+    /// to produce one. Forty kinds over a few hundred objects each would be
+    /// tens of thousands of refcount bumps per repaint, for a number the
+    /// cache already knows — and would break the O(viewport) render budget on
+    /// exactly the clusters where it matters.
+    pub fn count(&self, gvk: &GroupVersionKind) -> usize {
+        self.kinds.get(gvk).map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// When this kind's watch last delivered anything into the store, or
+    /// `None` if it never has. One of the two inputs to
+    /// `store::table::refetch_is_due`.
+    pub fn last_change(&self, gvk: &GroupVersionKind) -> Option<Instant> {
+        self.last_change.get(gvk).copied()
+    }
+
+    /// Record that a Table fetch was ISSUED for this kind.
+    ///
+    /// Issue time, not completion time: recorded on completion, every wake
+    /// arriving while a fetch is in flight would see a stale `last_fetch` and
+    /// issue another, so one slow request on a busy namespace becomes a pile
+    /// of concurrent identical GETs. Recording at issue is conservative in
+    /// the safe direction — anything that changes while the request is in
+    /// flight updates `last_change` past this value and re-arms the refetch
+    /// normally.
+    pub fn note_table_fetch(&mut self, gvk: GroupVersionKind, at: Instant) {
+        self.last_table_fetch.insert(gvk, at);
+    }
+
+    pub fn last_table_fetch(&self, gvk: &GroupVersionKind) -> Option<Instant> {
+        self.last_table_fetch.get(gvk).copied()
     }
 
     pub fn set_status(&mut self, gvk: GroupVersionKind, status: WatchStatus) {
@@ -57,9 +144,82 @@ impl ResourceStore {
             .copied()
             .unwrap_or(WatchStatus::Initialising)
     }
+
+    pub fn set_availability(&mut self, gvk: GroupVersionKind, availability: KindAvailability) {
+        self.availability.insert(gvk, availability);
+    }
+
+    /// Defaults to `Watching` for a kind with no recorded entry, matching how
+    /// `status` defaults to `Initialising`: absence means "nothing permanent
+    /// has been observed yet", not "broken".
+    pub fn availability(&self, gvk: &GroupVersionKind) -> KindAvailability {
+        self.availability
+            .get(gvk)
+            .cloned()
+            .unwrap_or(KindAvailability::Watching)
+    }
+
+    pub fn set_table_data(&mut self, gvk: GroupVersionKind, table: TableData) {
+        self.tables.insert(gvk, table);
+    }
+
+    /// `None` until a fetch for this kind has completed. The render path
+    /// must treat that exactly like any other kind with no data yet —
+    /// falling back to the builtin column registry (`store::columns::
+    /// column_source`) rather than blocking or showing nothing.
+    pub fn table_data(&self, gvk: &GroupVersionKind) -> Option<TableData> {
+        self.tables.get(gvk).cloned()
+    }
 }
 
 pub type SharedStore = Arc<RwLock<ResourceStore>>;
+
+/// Identifies a particular `SharedStore` instance, comparable and
+/// clonable — unlike a `SharedStore` itself, which cannot implement `Debug`
+/// (`ResourceStore` implements neither) and so cannot travel through
+/// `AppEvent` directly.
+///
+/// Wraps a CLONE of the `SharedStore` `Arc` rather than a bare pointer
+/// address taken with `Arc::as_ptr`. A bare address is not a safe identity
+/// here: `switch_cluster`/`restart_watch` drop the outgoing store, and once
+/// nothing else references that allocation the global allocator is free to
+/// hand its exact address to the very next `Arc::new` of the same
+/// layout — which `ResourceStore::new()` (called by both of them, on every
+/// switch) is. Confirmed empirically: two back-to-back `Arc::new(RwLock::
+/// new(ResourceStore::new()))` calls with nothing else keeping the first
+/// alive produced the SAME address, so two `StoreId`s built that way
+/// compared equal despite naming different clusters. Holding a clone keeps
+/// each allocation alive for as long as any `StoreId` referencing it
+/// survives, which is what makes two `StoreId`s that were ever unequal
+/// GUARANTEED to stay unequal — the property `Arc::ptr_eq` gives
+/// `spawn_discovery_and_watches`'s own staleness check, which compares two
+/// live `Arc`s directly rather than a value that outlives one of them.
+#[derive(Clone)]
+pub struct StoreId(SharedStore);
+
+impl StoreId {
+    pub fn of(store: &SharedStore) -> Self {
+        StoreId(store.clone())
+    }
+}
+
+impl PartialEq for StoreId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoreId {}
+
+impl std::fmt::Debug for StoreId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ResourceStore` implements neither `Debug` nor anything else safe
+        // to print without an async lock acquisition, which `Debug::fmt`
+        // cannot perform. The address is enough to tell two `StoreId`s
+        // apart in a log without touching the guarded store.
+        write!(f, "StoreId({:p})", Arc::as_ptr(&self.0))
+    }
+}
 
 /// Threshold: a watch that fails this many times in a row is likely RBAC denial,
 /// not a transient network blip. Escalate to Failed so the UI can show "unavailable"
@@ -159,12 +319,18 @@ async fn drive_watch<S>(
                 let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
             }
             Err(e) => match classify(&e) {
-                WatchFailure::Forbidden { detail } => {
-                    let msg = forbidden_message(&ar.plural, namespace.as_deref(), &detail);
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Failed);
+                ref failure @ WatchFailure::Forbidden { ref detail } => {
+                    let msg = forbidden_message(&ar.plural, namespace.as_deref(), detail);
+                    {
+                        // One critical section for both: the sidebar reads
+                        // status and availability from the same store
+                        // snapshot, so they must never be set as two
+                        // separately-locked writes that a reader could
+                        // observe half-applied.
+                        let mut s = store.write().await;
+                        s.set_status(gvk.clone(), WatchStatus::Failed);
+                        s.set_availability(gvk.clone(), availability_of(failure));
+                    }
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
                         status: WatchStatus::Failed,
@@ -177,12 +343,13 @@ async fn drive_watch<S>(
                     // on purpose, and it would bury the actionable one.
                     return;
                 }
-                WatchFailure::NotFound { detail } => {
-                    let msg = not_found_message(&ar.plural, &detail);
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Failed);
+                ref failure @ WatchFailure::NotFound { ref detail } => {
+                    let msg = not_found_message(&ar.plural, detail);
+                    {
+                        let mut s = store.write().await;
+                        s.set_status(gvk.clone(), WatchStatus::Failed);
+                        s.set_availability(gvk.clone(), availability_of(failure));
+                    }
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
                         status: WatchStatus::Failed,
@@ -198,7 +365,19 @@ async fn drive_watch<S>(
                         gvk: gvk.clone(),
                         status,
                     });
-                    let _ = tx.send(AppEvent::Error(format!("watch {}: {e}", ar.kind)));
+                    // `safe_source_text`, not `{e}`. A retryable watch failure
+                    // is the one error path that fires repeatedly, and exec
+                    // credentials refresh lazily per request — so a plugin
+                    // that prints an `ExecCredential` and then exits non-zero
+                    // surfaces here as `watcher::Error::WatchStartFailed(
+                    // kube::Error::Service(Box<AuthError>))`, whose `Display`
+                    // is the plugin's stdout in plaintext. See
+                    // `cluster::redact`.
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "watch {}: {}",
+                        ar.kind,
+                        crate::cluster::safe_source_text(&e)
+                    )));
                 }
             },
         }
@@ -267,6 +446,28 @@ mod tests {
         })))
     }
 
+    /// A retryable watch failure whose cause is a credential plugin that
+    /// printed an `ExecCredential` and then exited non-zero — the shape a
+    /// lazy per-request exec refresh produces. Classified `Retryable` (it is
+    /// not a 403/404 `Status`), so it takes the `format!` path that used to
+    /// print the error verbatim.
+    fn credential_leak_error(token: &str) -> watcher::Error {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: format!(r#"{{"kind":"ExecCredential","status":{{"token":"{token}"}}}}"#)
+                .into_bytes(),
+            stderr: Vec::new(),
+        };
+        watcher::Error::WatchStartFailed(kube::Error::Service(Box::new(
+            kube::client::AuthError::AuthExecRun {
+                cmd: "\"kubelogin\" \"get-token\"".to_string(),
+                status: out.status,
+                out,
+            },
+        )))
+    }
+
     fn not_found_error(message: &str) -> watcher::Error {
         watcher::Error::InitialListFailed(kube::Error::Api(Box::new(Status {
             code: 404,
@@ -289,6 +490,96 @@ mod tests {
         let store = ResourceStore::new();
         let unknown = GroupVersionKind::gvk("apps", "v1", "Deployment");
         assert!(store.objects(&unknown).is_empty());
+    }
+
+    // --- Task 10: counts and refetch bookkeeping ---
+
+    #[test]
+    fn counting_a_kind_agrees_with_listing_it_without_cloning_the_list() {
+        // The sidebar needs a count per kind per frame; `objects().len()`
+        // would clone a Vec of Arcs for every one of them.
+        let mut store = ResourceStore::new();
+        let ar = ApiResource::erase::<Pod>(&());
+        for n in ["a", "b", "c"] {
+            store.apply(&pod_gvk(), &ar, watcher::Event::Apply(pod(n)));
+        }
+        store.apply(&pod_gvk(), &ar, watcher::Event::Delete(pod("b")));
+        assert_eq!(
+            store.count(&pod_gvk()),
+            store.objects(&pod_gvk()).len(),
+            "the cheap count must agree with the expensive one"
+        );
+        assert_eq!(store.count(&pod_gvk()), 2);
+        assert_eq!(
+            store.count(&GroupVersionKind::gvk("apps", "v1", "Deployment")),
+            0,
+            "a kind nothing has been applied for counts zero, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_watch_delta_records_when_this_kind_last_changed() {
+        // `refetch_is_due` needs this instant; without it, a Table fetch has
+        // nothing to debounce against and either never fires or fires on
+        // every delta.
+        let mut store = ResourceStore::new();
+        let ar = ApiResource::erase::<Pod>(&());
+        assert_eq!(
+            store.last_change(&pod_gvk()),
+            None,
+            "nothing has happened for this kind yet"
+        );
+
+        let before = Instant::now();
+        store.apply(&pod_gvk(), &ar, watcher::Event::Apply(pod("a")));
+        let after = Instant::now();
+
+        let at = store
+            .last_change(&pod_gvk())
+            .expect("a delta must record when it landed");
+        assert!(
+            at >= before && at <= after,
+            "the recorded instant must be the one the delta actually landed at"
+        );
+        assert_eq!(
+            store.last_change(&GroupVersionKind::gvk("apps", "v1", "Deployment")),
+            None,
+            "one kind's delta says nothing about another's"
+        );
+    }
+
+    #[test]
+    fn a_table_fetch_is_recorded_per_kind() {
+        let mut store = ResourceStore::new();
+        let deploy = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let at = Instant::now();
+        assert_eq!(store.last_table_fetch(&pod_gvk()), None);
+        store.note_table_fetch(pod_gvk(), at);
+        assert_eq!(store.last_table_fetch(&pod_gvk()), Some(at));
+        assert_eq!(
+            store.last_table_fetch(&deploy),
+            None,
+            "fetching one kind's table must not suppress another's first fetch"
+        );
+    }
+
+    #[test]
+    fn a_fresh_store_carries_no_fetch_or_change_history() {
+        // What makes a cluster switch safe: `switch_cluster` replaces the
+        // store, so the new cluster starts with nothing suppressing its very
+        // first Table fetch.
+        let mut old = ResourceStore::new();
+        old.apply(
+            &pod_gvk(),
+            &ApiResource::erase::<Pod>(&()),
+            watcher::Event::Apply(pod("a")),
+        );
+        old.note_table_fetch(pod_gvk(), Instant::now());
+        assert!(old.last_table_fetch(&pod_gvk()).is_some());
+
+        let fresh = ResourceStore::new();
+        assert_eq!(fresh.last_table_fetch(&pod_gvk()), None);
+        assert_eq!(fresh.last_change(&pod_gvk()), None);
     }
 
     #[test]
@@ -433,6 +724,95 @@ mod tests {
         );
     }
 
+    // --- per-kind availability lives in the store, alongside status ---
+
+    #[test]
+    fn availability_defaults_to_watching_for_an_unknown_kind() {
+        let store = ResourceStore::new();
+        assert_eq!(
+            store.availability(&pod_gvk()),
+            KindAvailability::Watching,
+            "absence means nothing permanent has been observed yet, not broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_watch_records_availability_in_the_store_not_just_a_message() {
+        // The sidebar renders availability as a state read from the store
+        // snapshot. Deriving it by matching on the AppEvent::Error string
+        // would break the first time kube-rs rewords that message, silently,
+        // with no test able to catch it — this asserts the structured state
+        // exists instead.
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let events = vec![Err(forbidden_error("pods is forbidden"))];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+
+        drive_watch(s, gvk.clone(), ar, None, store.clone(), tx).await;
+
+        assert!(matches!(
+            store.read().await.availability(&gvk),
+            KindAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_kinds_unavailability_does_not_affect_another() {
+        // On a corporate cluster the user lacks RBAC on some kinds and not
+        // others — this is the normal case, not an edge case. One forbidden
+        // kind must not make every other kind read as broken too.
+        let forbidden_gvk = pod_gvk();
+        let healthy_gvk = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let forbidden_ar = ApiResource::erase::<Pod>(&());
+        let healthy_ar = ApiResource::from_gvk(&healthy_gvk);
+        let store = test_store();
+
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let forbidden_events = vec![Err(forbidden_error("pods is forbidden"))];
+        let s1 = futures::stream::iter(forbidden_events);
+        futures::pin_mut!(s1);
+        drive_watch(
+            s1,
+            forbidden_gvk.clone(),
+            forbidden_ar,
+            None,
+            store.clone(),
+            tx1,
+        )
+        .await;
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let healthy_events = vec![Ok(watcher::Event::InitDone)];
+        let s2 = futures::stream::iter(healthy_events);
+        futures::pin_mut!(s2);
+        drive_watch(
+            s2,
+            healthy_gvk.clone(),
+            healthy_ar,
+            None,
+            store.clone(),
+            tx2,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                store.read().await.availability(&forbidden_gvk),
+                KindAvailability::Unavailable { .. }
+            ),
+            "the forbidden kind must be marked unavailable"
+        );
+        assert_eq!(
+            store.read().await.availability(&healthy_gvk),
+            KindAvailability::Watching,
+            "a different kind's forbidden watch must not leak into this one's availability"
+        );
+    }
+
     #[tokio::test]
     async fn a_not_found_error_stops_the_watch_and_marks_it_failed() {
         let gvk = pod_gvk();
@@ -501,6 +881,43 @@ mod tests {
         );
     }
 
+    // --- per-kind fetched table data lives in the store, keyed by gvk ---
+
+    #[test]
+    fn table_data_defaults_to_none_before_any_fetch_completes() {
+        let store = ResourceStore::new();
+        assert!(
+            store.table_data(&pod_gvk()).is_none(),
+            "absence means no fetch has completed yet, not an error"
+        );
+    }
+
+    #[test]
+    fn table_data_is_recorded_and_isolated_per_kind() {
+        use crate::store::table::{TableColumn, TableRow};
+        let mut store = ResourceStore::new();
+        let other = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let table = TableData {
+            columns: vec![TableColumn {
+                name: "Name".to_string(),
+                priority: 0,
+            }],
+            rows: vec![TableRow {
+                cells: vec!["a".to_string()],
+                identity: None,
+            }],
+        };
+        store.set_table_data(pod_gvk(), table.clone());
+        assert_eq!(
+            store.table_data(&pod_gvk()).expect("just set").rows,
+            table.rows
+        );
+        assert!(
+            store.table_data(&other).is_none(),
+            "one kind's fetched table must not leak into another's"
+        );
+    }
+
     #[tokio::test]
     async fn a_forbidden_error_emits_the_actionable_message_not_the_raw_one() {
         let gvk = pod_gvk();
@@ -527,6 +944,45 @@ mod tests {
         assert!(
             saw_remedy,
             "a forbidden watch must emit the actionable -n remedy, not just the raw apiserver text"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_failing_on_a_credential_plugin_never_emits_the_token() {
+        // Exec credentials refresh lazily, per request — so this fires long
+        // after startup, repeatedly, straight into the status bar. The error's
+        // own `Display` is the plugin's stdout in plaintext (proved below), so
+        // formatting it verbatim is a live bearer token on screen.
+        const TOKEN: &str = "SUPER-SECRET-TOKEN-abc123";
+        let raw = credential_leak_error(TOKEN);
+        assert!(
+            raw.to_string().contains(TOKEN),
+            "the fixture must actually leak, or this test guards nothing: {raw}"
+        );
+
+        let gvk = pod_gvk();
+        let ar = ApiResource::erase::<Pod>(&());
+        let store = test_store();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let events = vec![Err(credential_leak_error(TOKEN))];
+        let s = futures::stream::iter(events);
+        futures::pin_mut!(s);
+        drive_watch(s, gvk, ar, None, store, tx).await;
+
+        let mut saw_error = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::Error(msg) = ev {
+                assert!(
+                    !msg.contains(TOKEN),
+                    "a bearer token reached the status bar: {msg}"
+                );
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "the watch must still report the failure — silence would be a worse fix than the leak"
         );
     }
 }

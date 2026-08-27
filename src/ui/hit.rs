@@ -9,6 +9,18 @@ pub enum HitTarget {
     Background,
     Ribbon,
     PickerRow(usize),
+    /// A row in the sidebar's flattened kind tree — see `ui::tree::flatten`.
+    /// The index is into that flattened list, exactly like `TableRow` is an
+    /// index into the object list: absolute, not screen-relative, so a
+    /// scrolled sidebar still resolves clicks to the right row.
+    TreeRow(usize),
+    /// One of the detail pane's tabs (Overview/YAML/Events), in the fixed
+    /// left-to-right order they are drawn in — see
+    /// `ui::views::detail::render_detail`.
+    DetailTab(usize),
+    /// The detail pane's close affordance — the pane must be closeable by
+    /// mouse, not only by `Esc`.
+    DetailClose,
 }
 
 /// Maps screen coordinates back to meaning.

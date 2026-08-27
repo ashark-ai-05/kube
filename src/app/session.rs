@@ -1,8 +1,10 @@
 use crate::app::event::AppEvent;
+use crate::cluster::discovery::KindInfo;
 use crate::cluster::{ClusterId, ClusterRegistry, ConnectionState, NamespaceListError};
 use crate::store::handles::WatchHandles;
 use crate::store::watch::{ResourceStore, SharedStore};
 use kube::Client;
+use kube::api::GroupVersionKind;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -78,6 +80,32 @@ pub struct Session {
     /// the two-sources-of-truth shape earlier reviews of this project
     /// flagged for `client` and `namespace` themselves.
     pub namespaces_from_api: Option<Result<Vec<String>, NamespaceListError>>,
+    /// Every browsable kind discovery found on the cluster currently on
+    /// screen, in `cluster::discovery::sort_kinds`' stable group-then-kind
+    /// order — which is the order the sidebar draws. Empty until the first
+    /// discovery for this cluster completes.
+    ///
+    /// Lives here, under the same lock as `client`/`namespace`/`store`, for
+    /// the reason every other per-cluster fact does: a switch replaces the
+    /// cluster's kinds along with its client, its scope and its store, and a
+    /// copy kept anywhere else would have to be invalidated in lockstep with
+    /// all four. This project has produced five review findings from exactly
+    /// that shape. The `prioritise`d ordering used to decide which kinds fit
+    /// under the watch cap is deliberately NOT stored: it is computed from
+    /// this list when the watches are started, so the display order and the
+    /// cap decision cannot drift into two different answers about "the kinds"
+    /// (see `store::multi`, whose two functions are separate for this reason).
+    pub kinds: Vec<KindInfo>,
+    /// The kind the table is showing. `default_kind()` until the user picks
+    /// another in the sidebar.
+    ///
+    /// Here rather than in the event loop for the same reason as `kinds`:
+    /// a cluster switch must reset it (the new cluster may not have the old
+    /// kind at all), and it is read on every frame beside the store the
+    /// objects come from. Reading it from a local would let the table draw
+    /// one kind's objects under another kind's columns for a frame after a
+    /// switch.
+    pub active_kind: GroupVersionKind,
     /// Bumped by every switch so a slow connect that has been superseded can
     /// tell it is stale and stand down.
     pub generation: u64,
@@ -109,10 +137,23 @@ impl Session {
             namespace,
             namespace_is_fallback,
             namespaces_from_api: None,
+            kinds: Vec::new(),
+            active_kind: default_kind(),
             generation: 0,
             pending: HashMap::new(),
         }
     }
+}
+
+/// The kind the table opens on, and the one a cluster switch resets to.
+///
+/// `core/v1 Pod` is the only kind guaranteed to exist on every Kubernetes
+/// cluster and the one an operator opens the tool to look at. Carrying the
+/// previous cluster's active kind across a switch would point the table at a
+/// kind the new cluster may not have at all — a CRD from the old cluster —
+/// which renders as a permanently empty table with no explanation.
+pub fn default_kind() -> GroupVersionKind {
+    GroupVersionKind::gvk("", "v1", "Pod")
 }
 
 pub type SharedSession = Arc<Mutex<Session>>;
@@ -256,6 +297,18 @@ pub async fn switch_cluster<C, F, W>(
             // the same reasoning `client` and `namespace` are replaced
             // wholesale for above rather than patched in place.
             s.namespaces_from_api = None;
+
+            // The same reasoning, one layer up: the kinds discovered on the
+            // OUTGOING cluster describe an API surface this one may not
+            // share at all — a CRD installed there and not here — and the
+            // active kind may be one of them. Cleared and reset here rather
+            // than patched when the new cluster's discovery eventually
+            // lands, so there is no window in which the sidebar lists the
+            // previous cluster's kinds over this one's (empty) store, and no
+            // window in which the table is pointed at a kind this cluster
+            // has never heard of.
+            s.kinds.clear();
+            s.active_kind = default_kind();
 
             // 6. Watch the store minted just above — never the one the previous
             //    cluster's watches were writing into.
@@ -1210,6 +1263,147 @@ mod tests {
         assert!(
             !session.lock().await.namespace_is_fallback,
             "a deliberate switch must retire the startup fallback hint"
+        );
+    }
+
+    // --- Task 10: per-cluster kinds and the active kind ---
+
+    /// A `KindInfo` for a kind that exists only on one cluster — a CRD, the
+    /// case that makes carrying `active_kind` across a switch visibly wrong.
+    fn kind_info(group: &str, kind: &str) -> KindInfo {
+        KindInfo {
+            gvk: GroupVersionKind::gvk(group, "v1", kind),
+            resource: ApiResource {
+                group: group.to_string(),
+                api_version: if group.is_empty() {
+                    "v1".to_string()
+                } else {
+                    format!("{group}/v1")
+                },
+                kind: kind.to_string(),
+                version: "v1".to_string(),
+                plural: format!("{}s", kind.to_lowercase()),
+            },
+            namespaced: true,
+            group_label: if group.is_empty() {
+                "core".to_string()
+            } else {
+                group.to_string()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_starts_on_the_kind_every_cluster_has_with_nothing_discovered_yet() {
+        let session = session_over(&["prod"]);
+        let s = session.lock().await;
+        assert_eq!(
+            s.active_kind,
+            GroupVersionKind::gvk("", "v1", "Pod"),
+            "the table must open on a kind that exists everywhere"
+        );
+        assert!(
+            s.kinds.is_empty(),
+            "nothing has been discovered before the first discovery completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_discards_the_previous_clusters_kinds_and_active_kind() {
+        // prod has an operator installed and the user is browsing its CRD.
+        // dev does not have that operator. Carrying either the kind list or
+        // the active kind across the switch points the sidebar and the table
+        // at resources dev has never heard of — a table that is permanently
+        // empty with no explanation, under a sidebar listing kinds that are
+        // not there.
+        let session = session_over(&["prod", "dev"]);
+        {
+            let mut s = session.lock().await;
+            s.kinds = vec![kind_info("", "Pod"), kind_info("acme.io", "Widget")];
+            s.active_kind = GroupVersionKind::gvk("acme.io", "v1", "Widget");
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None,
+            tx,
+            || async { Ok(offline_client()) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+
+        let s = session.lock().await;
+        assert!(
+            s.kinds.is_empty(),
+            "the new cluster's kinds are not known until its own discovery \
+             completes; showing the old cluster's is a lie, got {:?}",
+            s.kinds.iter().map(|k| &k.gvk.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            s.active_kind,
+            default_kind(),
+            "the active kind must fall back to one every cluster has"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_leaves_the_kinds_and_active_kind_exactly_as_they_were() {
+        // Same rule as the store, the watches, the scope and the client: a
+        // connect that failed changes nothing. Resetting here would empty the
+        // sidebar of the cluster the user is still on and working with.
+        let session = session_over(&["prod", "dev"]);
+        {
+            let mut s = session.lock().await;
+            s.kinds = vec![kind_info("", "Pod"), kind_info("acme.io", "Widget")];
+            s.active_kind = GroupVersionKind::gvk("acme.io", "v1", "Widget");
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        switch_cluster(
+            session.clone(),
+            id("dev"),
+            None,
+            tx,
+            || async { Err(anyhow::anyhow!("no route to host")) },
+            |_, _, _| live_watch(),
+        )
+        .await;
+
+        let s = session.lock().await;
+        assert_eq!(s.kinds.len(), 2, "prod's sidebar must survive intact");
+        assert_eq!(
+            s.active_kind,
+            GroupVersionKind::gvk("acme.io", "v1", "Widget"),
+            "prod is still on screen, so prod's active kind must still be active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_change_keeps_the_kinds_and_the_active_kind() {
+        // Re-scoping is the same cluster: its kinds have not changed, and
+        // throwing the user back to Pods every time they change namespace
+        // would be gratuitous.
+        let session = session_over(&["prod"]);
+        {
+            let mut s = session.lock().await;
+            s.kinds = vec![kind_info("", "Pod"), kind_info("apps", "Deployment")];
+            s.active_kind = GroupVersionKind::gvk("apps", "v1", "Deployment");
+        }
+
+        restart_watch(
+            session.clone(),
+            Some("payments".to_string()),
+            |_client, _store, _ns| live_watch(),
+        )
+        .await;
+
+        let s = session.lock().await;
+        assert_eq!(s.kinds.len(), 2);
+        assert_eq!(
+            s.active_kind,
+            GroupVersionKind::gvk("apps", "v1", "Deployment")
         );
     }
 
