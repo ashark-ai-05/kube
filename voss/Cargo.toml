@@ -1,0 +1,28 @@
+[package]
+name = "voss"
+version = "0.1.0"
+edition = "2021"
+description = "Voss — a native Kubernetes inspector (not affiliated with Lens, OpenLens, or k9s)"
+license = "MIT"
+rust-version = "1.85"
+
+[lib]
+name = "voss"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voss"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5"
+iced = { version = "0.13.1", default-features = true, features = ["tokio"] }
+k8s-openapi = { version = "0.24", default-features = false, features = ["v1_31"] }
+kube = { version = "0.98", default-features = false, features = ["client", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
