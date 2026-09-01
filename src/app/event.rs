@@ -2,7 +2,6 @@ use crate::app::session::SessionEvent;
 use crate::cluster::NamespaceListError;
 use crate::store::events::EventRow;
 use crate::store::watch::StoreId;
-use crossterm::event::Event as CtEvent;
 use indexmap::IndexMap;
 use kube::api::GroupVersionKind;
 use std::collections::HashSet;
@@ -20,7 +19,6 @@ pub enum WatchStatus {
 /// Everything that can wake the event loop.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    Input(CtEvent),
     StoreChanged {
         gvk: GroupVersionKind,
     },
@@ -101,7 +99,6 @@ pub struct FetchedEvents {
 /// The result of collapsing a batch of events into a single render's worth of work.
 #[derive(Debug, Default)]
 pub struct Coalesced {
-    pub inputs: Vec<CtEvent>,
     /// Every kind a `StoreChanged` named in this batch, deduplicated.
     ///
     /// A flat `store_dirty: bool` (what this replaced) cannot distinguish a
@@ -155,7 +152,6 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
 
     for event in events {
         match event {
-            AppEvent::Input(e) => out.inputs.push(e),
             AppEvent::StoreChanged { gvk } => {
                 out.changed_kinds.insert(gvk);
             }
@@ -182,9 +178,6 @@ pub fn coalesce(events: Vec<AppEvent>) -> Coalesced {
 mod tests {
     use super::*;
     use crate::store::watch::ResourceStore;
-    use crossterm::event::{
-        Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
-    };
     use kube::api::GroupVersionKind;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -200,15 +193,6 @@ mod tests {
         Arc::new(RwLock::new(ResourceStore::new()))
     }
 
-    fn key(c: char) -> CtEvent {
-        CtEvent::Key(KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        })
-    }
-
     #[test]
     fn many_store_changes_collapse_to_one_changed_kind() {
         let events: Vec<AppEvent> = (0..10_000)
@@ -220,22 +204,7 @@ mod tests {
             [pod_gvk()].into_iter().collect(),
             "10,000 deltas on one kind must collapse to one entry"
         );
-        assert!(out.inputs.is_empty());
         assert!(!out.quit);
-    }
-
-    #[test]
-    fn input_events_are_preserved_in_order_and_never_dropped() {
-        let events = vec![
-            AppEvent::Input(key('a')),
-            AppEvent::StoreChanged { gvk: pod_gvk() },
-            AppEvent::Input(key('b')),
-        ];
-        let out = coalesce(events);
-        assert_eq!(out.inputs.len(), 2, "input must never be coalesced away");
-        assert_eq!(out.inputs[0], key('a'));
-        assert_eq!(out.inputs[1], key('b'));
-        assert!(out.changed_kinds.contains(&pod_gvk()));
     }
 
     #[test]
