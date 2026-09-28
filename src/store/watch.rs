@@ -8,7 +8,7 @@ use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher;
 use kube::{Api, Client};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -17,6 +17,8 @@ use tokio::task::JoinHandle;
 
 /// All cached kinds plus their watch health.
 pub struct ResourceStore {
+    pub requested: tokio::sync::watch::Sender<Option<GroupVersionKind>>,
+    pending: HashSet<GroupVersionKind>,
     kinds: HashMap<GroupVersionKind, KindCache>,
     statuses: HashMap<GroupVersionKind, WatchStatus>,
     /// Per-kind sidebar availability, alongside `statuses` rather than behind
@@ -68,6 +70,8 @@ impl Default for ResourceStore {
 impl ResourceStore {
     pub fn new() -> Self {
         Self {
+            requested: tokio::sync::watch::channel(None).0,
+            pending: HashSet::new(),
             kinds: HashMap::new(),
             statuses: HashMap::new(),
             availability: HashMap::new(),
@@ -75,6 +79,33 @@ impl ResourceStore {
             last_change: HashMap::new(),
             last_table_fetch: HashMap::new(),
         }
+    }
+
+    pub fn request_kind(&self, gvk: &GroupVersionKind) {
+        self.requested.send_if_modified(|current| {
+            if current.as_ref() == Some(gvk) {
+                return false;
+            }
+            *current = Some(gvk.clone());
+            true
+        });
+    }
+
+    pub fn evict(&mut self, gvk: &GroupVersionKind) {
+        self.kinds.remove(gvk);
+        self.tables.remove(gvk);
+        self.statuses.remove(gvk);
+        self.last_change.remove(gvk);
+        self.last_table_fetch.remove(gvk);
+        self.pending.remove(gvk);
+        self.set_availability(gvk.clone(), KindAvailability::NotWatched);
+    }
+
+    pub fn acknowledge(&mut self, gvk: &GroupVersionKind) {
+        self.pending.remove(gvk);
+    }
+    pub fn notify_once(&mut self, gvk: &GroupVersionKind) -> bool {
+        self.pending.insert(gvk.clone())
     }
 
     pub fn apply(
@@ -306,18 +337,18 @@ async fn drive_watch<S>(
             Ok(event) => {
                 consecutive_errors = 0;
                 let synced = matches!(event, watcher::Event::InitDone | watcher::Event::Apply(_));
-                store.write().await.apply(&gvk, &ar, event);
-                if synced {
-                    store
-                        .write()
-                        .await
-                        .set_status(gvk.clone(), WatchStatus::Synced);
+                let mut cache = store.write().await;
+                cache.apply(&gvk, &ar, event);
+                if synced && cache.status(&gvk) != WatchStatus::Synced {
+                    cache.set_status(gvk.clone(), WatchStatus::Synced);
                     let _ = tx.send(AppEvent::WatchStatus {
                         gvk: gvk.clone(),
                         status: WatchStatus::Synced,
                     });
                 }
-                let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
+                if cache.notify_once(&gvk) {
+                    let _ = tx.send(AppEvent::StoreChanged { gvk: gvk.clone() });
+                }
             }
             Err(e) => match classify(&e) {
                 ref failure @ WatchFailure::Forbidden { ref detail } => {
@@ -476,6 +507,20 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         })))
+    }
+
+    #[test]
+    fn notification_memory_is_constant_during_a_watch_storm() {
+        let mut store = ResourceStore::new();
+        let mut queued = 0;
+        for _ in 0..100_000 {
+            if store.notify_once(&pod_gvk()) {
+                queued += 1;
+            }
+        }
+        assert_eq!(queued, 1);
+        store.acknowledge(&pod_gvk());
+        assert!(store.notify_once(&pod_gvk()));
     }
 
     #[test]

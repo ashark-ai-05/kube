@@ -6,21 +6,19 @@ use crate::app::session::{
 };
 use crate::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
 use crate::cluster;
-use crate::cluster::discovery::{KindInfo, discover_kinds, group_label_for};
+use crate::cluster::discovery::{KindInfo, group_label_for};
 use crate::cluster::{
     AuthMethod, ClusterEntry, ClusterId, ClusterRegistry, ConnectionState, NamespaceListError,
     is_valid_namespace_name, list_namespaces,
 };
 use crate::store::columns::columns_for;
 use crate::store::events::{EventRow, fetch_events};
-use crate::store::multi::{
-    DEFAULT_MAX_EAGER_WATCHES, KindAvailability, kinds_to_watch, prioritise,
-};
+use crate::store::multi::KindAvailability;
 use crate::store::table::{
     SortState, TABLE_REFETCH_DEBOUNCE, TableData, fetch_table, refetch_is_due, row_identity,
     sort_table_rows, sorted_indices,
 };
-use crate::store::watch::{StoreId, spawn_watch};
+use crate::store::watch::StoreId;
 use crate::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use crate::ui::hit::HitRegistry;
 use crate::ui::ribbon::{render_ribbon, split_ribbon};
@@ -978,6 +976,7 @@ fn supervise(
 /// visible immediately whatever its siblings are doing. It does not change
 /// cancellation: the caller holds the `AbortOnDrop` guards, and dropping this
 /// future drops them with it.
+#[cfg(test)]
 async fn supervise_children(
     children: Vec<tokio::task::JoinHandle<()>>,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -1038,83 +1037,7 @@ fn spawn_discovery_and_watches(
     namespace: Option<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let kinds: Vec<KindInfo> = match discover_kinds(&client).await {
-            Ok(kinds) if !kinds.is_empty() => kinds,
-            Ok(_) => vec![pod_kind()],
-            Err(e) => {
-                let _ = tx.send(AppEvent::Error(truncate_error(format!(
-                    "discovering kinds: {} — showing pods only",
-                    cluster::safe_error_text(&e)
-                ))));
-                vec![pod_kind()]
-            }
-        };
-
-        // Which kinds survive the cap is a question of importance; which
-        // order they are DRAWN in is a question of stability. `prioritise`
-        // answers the first, on a copy, so `kinds` keeps `sort_kinds`' stable
-        // group-then-kind order for the second. Ranking the list the sidebar
-        // draws would reorder it by importance and scatter each group's kinds
-        // across the tree.
-        let mut ranked = kinds.clone();
-        prioritise(&mut ranked);
-        let (watched, skipped) = kinds_to_watch(&ranked, DEFAULT_MAX_EAGER_WATCHES);
-        let watched_gvks: HashSet<GroupVersionKind> =
-            watched.iter().map(|k| k.gvk.clone()).collect();
-        let resources: Vec<ApiResource> = watched.iter().map(|k| k.resource.clone()).collect();
-
-        {
-            let mut s = session.lock().await;
-            if !Arc::ptr_eq(&s.store, &store) {
-                // Superseded: this answer describes a cluster (or a scope)
-                // that is no longer on screen.
-                return;
-            }
-            s.kinds = kinds.clone();
-        }
-
-        // A kind the cap left out is not an empty kind, and the sidebar must
-        // not draw it as one. Recorded as availability in the store — the one
-        // place the sidebar reads per-kind facts from — rather than as a
-        // second list that only the sidebar knows about and only a cluster
-        // switch would clear.
-        {
-            let mut s = store.write().await;
-            for kind in &kinds {
-                if !watched_gvks.contains(&kind.gvk) {
-                    s.set_availability(kind.gvk.clone(), KindAvailability::NotWatched);
-                }
-            }
-        }
-        if skipped > 0 {
-            let _ = tx.send(AppEvent::Error(format!(
-                "{skipped} of {} kinds are not being watched (cap {DEFAULT_MAX_EAGER_WATCHES}) \
-                 — they show as 'not watched' in the sidebar",
-                kinds.len()
-            )));
-        }
-        let _ = tx.send(AppEvent::KindsDiscovered);
-
-        let mut children = Vec::with_capacity(resources.len());
-        let mut cancel_children = Vec::with_capacity(resources.len());
-        for resource in resources {
-            let handle = spawn_watch(
-                client.clone(),
-                resource,
-                namespace.clone(),
-                store.clone(),
-                tx.clone(),
-            );
-            cancel_children.push(AbortOnDrop(handle.abort_handle()));
-            children.push(handle);
-        }
-
-        supervise_children(children, tx).await;
-        // Held until here so that cancelling THIS task drops them and cancels
-        // the children with it. Dropping a `JoinHandle` only detaches.
-        drop(cancel_children);
-    })
+    crate::store::subscriptions::spawn(session, client, store, namespace, tx, pod_kind())
 }
 
 /// Ask the API server for the active kind's own columns, kubectl-style.
@@ -1667,6 +1590,13 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 s.active_kind.clone(),
             )
         };
+        {
+            let mut cache = store.write().await;
+            for gvk in &batch.changed_kinds {
+                cache.acknowledge(gvk);
+            }
+            cache.request_kind(&active_kind);
+        }
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
@@ -1772,7 +1702,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 spawn_table_fetch(
                     client.clone(),
                     kind.resource.clone(),
-                    namespace.clone(),
+                    crate::store::subscriptions::scope_for(kind, &namespace),
                     active_kind.clone(),
                     store.clone(),
                     tx.clone(),

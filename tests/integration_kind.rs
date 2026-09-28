@@ -670,3 +670,65 @@ async fn a_forbidden_kind_is_marked_unavailable_not_retried_forever() {
     );
     pod_handles.abort_all();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated kind cluster"]
+async fn on_demand_watches_reach_cluster_resources_in_namespace_mode() {
+    use kube_tui::app::session::Session;
+    use kube_tui::cluster::{ClusterRegistry, discovery::KindInfo};
+    use kube_tui::store::subscriptions;
+    let _serial = cluster_lock().await;
+    let client = kube_tui::cluster::connect().await.unwrap();
+    let session = Arc::new(Mutex::new(Session::new(
+        ClusterRegistry::from_contexts(vec![]),
+        client.clone(),
+        Some("demo".into()),
+        false,
+    )));
+    let store = session.lock().await.store.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let initial = KindInfo {
+        gvk: GroupVersionKind::gvk("", "v1", "Pod"),
+        resource: ApiResource::erase::<Pod>(&()),
+        namespaced: true,
+        group_label: "core".into(),
+    };
+    let handle = subscriptions::spawn(
+        session.clone(),
+        client,
+        store.clone(),
+        Some("demo".into()),
+        tx,
+        initial,
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AppEvent::KindsDiscovered) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let node = GroupVersionKind::gvk("", "v1", "Node");
+    assert_eq!(
+        store.read().await.availability(&node),
+        KindAvailability::NotWatched
+    );
+    store.read().await.request_kind(&node);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if store.read().await.status(&node) == WatchStatus::Synced {
+                break;
+            }
+            rx.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        store.read().await.count(&node) > 0,
+        "nodes use the cluster endpoint even in namespace mode"
+    );
+    handle.abort();
+}

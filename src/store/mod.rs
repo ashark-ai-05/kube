@@ -4,6 +4,7 @@ pub mod events;
 pub mod handles;
 pub mod multi;
 pub mod rbac;
+pub mod subscriptions;
 pub mod table;
 pub mod watch;
 pub use cache::{KindCache, ObjKey, key_of};
