@@ -49,6 +49,7 @@ fn stack_frame(text: &str) -> bool {
             .is_some_and(|count| count.parse::<u32>().is_ok())
 }
 pub struct LogBuffer {
+    sources: std::collections::HashMap<String, usize>,
     folds: VecDeque<FoldGroup>,
     lines: VecDeque<LogLine>,
     matches: VecDeque<u64>,
@@ -69,6 +70,7 @@ impl Default for LogBuffer {
 impl LogBuffer {
     pub fn new(max_lines: usize, max_bytes: usize) -> Self {
         Self {
+            sources: std::collections::HashMap::new(),
             lines: VecDeque::new(),
             folds: VecDeque::new(),
             matches: VecDeque::new(),
@@ -114,9 +116,16 @@ impl LogBuffer {
         }
         self.next += 1;
         self.bytes += line.bytes();
+        *self.sources.entry(line.source.clone()).or_default() += 1;
         self.lines.push_back(line);
         while self.lines.len() > self.max_lines || self.bytes > self.max_bytes {
             if let Some(old) = self.lines.pop_front() {
+                if let Some(count) = self.sources.get_mut(&old.source) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.sources.remove(&old.source);
+                    }
+                }
                 self.bytes -= old.bytes();
                 self.first += 1;
                 self.dropped += 1;
@@ -156,6 +165,9 @@ impl LogBuffer {
     }
     pub fn folded_len(&self) -> usize {
         self.folds.len()
+    }
+    pub fn single_source(&self) -> Option<&str> {
+        (self.sources.len() == 1).then(|| self.sources.keys().next().unwrap().as_str())
     }
     pub fn folded_sequence(&self, index: usize) -> Option<u64> {
         self.folds.get(index).map(|g| g.first)

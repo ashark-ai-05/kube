@@ -25,6 +25,8 @@ Fleet radar opens with readiness counts, a pod attention queue and namespace sig
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
 
+Structured JSON logs open in a message view with explicit severity badges and compact timestamps. Click a record or press Enter to expand its JSON details; J toggles formatted JSON and o toggles the original record. Search automatically reveals full records so hidden metadata stays searchable; exports preserve the originals. Repeated single-container source labels move to the toolbar.
+
 Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Consecutive repeated messages and Java-style stack frames collapse into expandable groups (`v` toggles folding). Search automatically expands groups, and copy/export retain every raw record. Copy/export retain full metadata.
 
 Logs aggregate up to 16 pod/container streams, include source labels and timestamps, and follow replacement pods. Choose a container, inspect previous-container logs, search literal text or `re:patterns`, pause/follow, choose a time window, and export the filtered buffer. Kubernetes only exposes retained container logs; this is not a historical logging backend. Reconnect deduplication is best effort for identical timestamps.
@@ -37,6 +39,7 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | `Ctrl-R` / All resources | Toggle the complete API resource catalog |
 | `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |
+| `s` / `:sort` | Choose a sort column and direction; click a column header to toggle |
 | `/` | Fuzzy resource filter; combine with `label:app=api` or `label:tier!=batch` |
 | `Tab` / `Shift-Tab`, arrows, `j`/`k` | Switch pane and navigate |
 | `Enter`, double-click | Inspect selection |
@@ -52,6 +55,8 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | `Esc` | Close or go back; does nothing at the root |
 | `q` | Close inspector; quit from the resource browser |
 | `Ctrl-C` | Quit |
+
+Sorting uses elapsed time for age (including compound values such as 2d3h), numerical restart counts (including last-restart annotations), and alphabetical names. The active header shows ↑ or ↓.
 
 Inspector actions are clickable. Logs: `v` fold/expand repeated messages and stack frames; `w` wrap on/off; `←`/`→` pan unwrapped lines; `/` or `Ctrl-F` search; `n`/`N` next/previous matching line; `F` matching lines/context; `Ctrl-U` clear an editing query; `Esc` cancel editing or clear a committed search; `Home` oldest retained line; `End` live tail; `f` pause/follow; `c` cycle containers; `p` previous instance; `s` time window; `J` pretty JSON; `e` export; `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).
 

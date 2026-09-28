@@ -146,6 +146,123 @@ fn identity_from_object(object: &serde_json::Value) -> Option<RowIdentity> {
 pub struct SortState {
     pub column: usize,
     pub descending: bool,
+    pub kind: SortKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKind {
+    #[default]
+    Auto,
+    Text,
+    Number,
+    Age,
+}
+impl SortKind {
+    pub fn for_header(header: &str) -> Self {
+        match header.to_ascii_lowercase().as_str() {
+            "age" | "duration" => Self::Age,
+            "restarts" => Self::Number,
+            "name" | "namespace" | "status" | "node" => Self::Text,
+            _ => Self::Auto,
+        }
+    }
+}
+impl SortState {
+    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let numeric = |s: &str| match self.kind {
+            SortKind::Age => age_seconds(s),
+            SortKind::Number => s
+                .split_whitespace()
+                .next()?
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite()),
+            SortKind::Auto => s.parse::<f64>().ok().filter(|n| n.is_finite()),
+            SortKind::Text => None,
+        };
+        let order = match (numeric(a), numeric(b)) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            // Keep missing or invalid numerical values last in either direction.
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            _ => a.cmp(b),
+        };
+        if self.descending {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+}
+fn age_seconds(value: &str) -> Option<f64> {
+    let mut total = 0f64;
+    let mut start = 0;
+    for (i, c) in value.char_indices() {
+        if c.is_ascii_digit() || c == '.' {
+            continue;
+        }
+        let amount: f64 = value.get(start..i)?.parse().ok()?;
+        let multiplier = match c {
+            's' => 1.,
+            'm' => 60.,
+            'h' => 3600.,
+            'd' => 86400.,
+            'w' => 604800.,
+            'y' => 31536000.,
+            _ => return None,
+        };
+        total += amount * multiplier;
+        start = i + c.len_utf8();
+    }
+    (start > 0 && start == value.len() && total.is_finite()).then_some(total)
+}
+
+#[cfg(test)]
+mod semantic_sort_tests {
+    use super::*;
+    fn sorted(values: &[&str], kind: SortKind, descending: bool) -> Vec<String> {
+        let mut rows: Vec<Vec<String>> = values.iter().map(|v| vec![v.to_string()]).collect();
+        sort_rows(
+            &mut rows,
+            &SortState {
+                column: 0,
+                descending,
+                kind,
+            },
+        );
+        rows.into_iter().map(|mut r| r.remove(0)).collect()
+    }
+    #[test]
+    fn ages_compare_elapsed_time_including_compound_units() {
+        assert_eq!(
+            sorted(
+                &["2d3h", "10m", "9s", "1d", "?", "3h40m"],
+                SortKind::Age,
+                false
+            ),
+            ["9s", "10m", "3h40m", "1d", "2d3h", "?"]
+        );
+        assert_eq!(
+            sorted(&["10m", "9s", "?"], SortKind::Age, true),
+            ["10m", "9s", "?"]
+        );
+    }
+    #[test]
+    fn restart_counts_ignore_last_restart_age_and_names_remain_text() {
+        assert_eq!(
+            sorted(
+                &["9 (2h ago)", "12 (1m ago)", "2", "<none>"],
+                SortKind::Number,
+                true
+            ),
+            ["12 (1m ago)", "9 (2h ago)", "2", "<none>"]
+        );
+        assert_eq!(
+            sorted(&["pod-9", "pod-12", "pod-2"], SortKind::Text, false),
+            ["pod-12", "pod-2", "pod-9"]
+        );
+    }
 }
 
 /// Sort table rows by one column, in place.
@@ -175,14 +292,7 @@ pub fn sort_rows(rows: &mut [Vec<String>], sort: &SortState) {
     if rows.iter().any(|row| sort.column >= row.len()) {
         return;
     }
-    rows.sort_by(|a, b| {
-        let ordering = compare_cells(&a[sort.column], &b[sort.column]);
-        if sort.descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
+    rows.sort_by(|a, b| sort.compare(&a[sort.column], &b[sort.column]));
 }
 
 /// The order `sort_rows` puts rows in, expressed as indices into the
@@ -209,26 +319,12 @@ pub fn sorted_indices(rows: &[Vec<String>], sort: &SortState) -> Vec<usize> {
     // `sort_by`, not `sort_unstable_by`, matching `sort_rows` — equal keys
     // must keep input order, or the mapping this returns disagrees with the
     // one the view drew for exactly the rows that tie.
-    order.sort_by(|&a, &b| {
-        let ordering = compare_cells(&rows[a][sort.column], &rows[b][sort.column]);
-        if sort.descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
+    order.sort_by(|&a, &b| sort.compare(&rows[a][sort.column], &rows[b][sort.column]));
     order
 }
 
 /// Compare two cell values numerically if both parse as `f64`, lexically
 /// otherwise.
-fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
-    match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.cmp(b),
-    }
-}
-
 /// As `sort_rows`, but for `TableData`'s own row type: sorts the whole
 /// `TableRow` (cells AND identity together) by one column of `cells`, so a
 /// row's identity always moves with its cells — see `TableRow`'s doc
@@ -242,14 +338,7 @@ pub fn sort_table_rows(rows: &mut [TableRow], sort: &SortState) {
     if rows.iter().any(|row| sort.column >= row.cells.len()) {
         return;
     }
-    rows.sort_by(|a, b| {
-        let ordering = compare_cells(&a.cells[sort.column], &b.cells[sort.column]);
-        if sort.descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
+    rows.sort_by(|a, b| sort.compare(&a.cells[sort.column], &b.cells[sort.column]));
 }
 
 /// Ask the API server to render a resource the way kubectl does.
@@ -436,7 +525,11 @@ mod tests {
         // both change the answer.
         for descending in [false, true] {
             for column in 0..3 {
-                let sort = SortState { column, descending };
+                let sort = SortState {
+                    kind: crate::store::table::SortKind::Auto,
+                    column,
+                    descending,
+                };
                 let mut expected = permuting_rows();
                 sort_rows(&mut expected, &sort);
 
@@ -461,6 +554,7 @@ mod tests {
         let order = sorted_indices(
             &permuting_rows(),
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 1,
                 descending: false,
             },
@@ -481,6 +575,7 @@ mod tests {
         let order = sorted_indices(
             &rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 9,
                 descending: false,
             },
@@ -722,6 +817,7 @@ mod tests {
         sort_table_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 0,
                 descending: false,
             },
@@ -744,6 +840,7 @@ mod tests {
         sort_table_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 9,
                 descending: false,
             },
@@ -928,6 +1025,7 @@ mod tests {
         sort_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 1,
                 descending: false,
             },
@@ -968,6 +1066,7 @@ mod tests {
         sort_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 1,
                 descending: false,
             },
@@ -990,6 +1089,7 @@ mod tests {
         sort_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 0,
                 descending: true,
             },
@@ -1007,6 +1107,7 @@ mod tests {
         sort_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 9,
                 descending: false,
             },
@@ -1025,6 +1126,7 @@ mod tests {
         sort_rows(
             &mut rows,
             &SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 0,
                 descending: false,
             },

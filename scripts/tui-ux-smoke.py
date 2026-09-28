@@ -30,8 +30,8 @@ fixture = {
     'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': 'demo'},
     'spec': {'restartPolicy': 'Never', 'containers': [{
         'name': 'payments', 'image': 'nginx:alpine',
-        'command': ['sh', '-c', 'printf "%s\\n" "$MESSAGE" "context-before" "error: timeout?" "context-after" "error: retry?" " at first.fn(Main.java:1)" " at hidden.fn(Main.java:2)" " at last.fn(Main.java:3)" "retrying request" "retrying request"; sleep 3600'],
-        'env': [{'name': 'MESSAGE', 'value': message}],
+        'command': ['sh', '-c', 'printf "%s\\n" "$MESSAGE" "context-before" "error: timeout?" "context-after" "error: retry?" " at first.fn(Main.java:1)" " at hidden.fn(Main.java:2)" " at last.fn(Main.java:3)" "retrying request" "retrying request" "$JSON_LOG" "$JSON_WARN"; sleep 3600'],
+        'env': [{'name': 'MESSAGE', 'value': message}, {'name': 'JSON_LOG', 'value': json.dumps({'level': 'INFO', 'message': 'Connected to node 2', 'logger_name': 'example.network.client', 'request_id': 'trace-details-42'})}, {'name': 'JSON_WARN', 'value': json.dumps({'level': 'WARN', 'message': 'Fetch session expired; retrying request', 'logger_name': 'example.consumer.Fetcher', 'thread_name': 'consumer-1', 'duration_ms': 42})}],
     }]},
 }
 subprocess.run(['kubectl', 'create', '-f', '-'], input=json.dumps(fixture), text=True, check=True, stdout=subprocess.DEVNULL)
@@ -111,6 +111,15 @@ try:
         expect('web-', 30)
         expect('WORKSPACE')
         capture('resources')
+        send('s')
+        expect('Sort resources')
+        send('age')
+        expect('Newest first')
+        send('\r')
+        expect('Age ↑')
+        send('srestarts\x1b[B\r')
+        expect('Restarts ↓')
+        capture('resources-sorted')
         click(screen.display[0].index('ns:') + 2, 0)
         expect('Namespaces')
         expect('kube-system')
@@ -143,7 +152,24 @@ try:
         send('v')
         expect('hidden.fn')
         send('v')
+        expect('Connected to node 2')
+        expect('INF')
+        expect('WRN')
+        assert 'logger_name' not in text(), 'Message view must hide JSON metadata'
         capture('logs-wrapped')
+        row = next(i for i, line in enumerate(screen.display) if 'Connected to node 2' in line)
+        click(75, row)
+        expect('logger_name')
+        expect('trace-details-42')
+        send('\r')
+        send('o')
+        expect('RAW')
+        expect('logger_name')
+        send('o')
+        send('/trace-details-42\r')
+        expect('1 matches')
+        expect('trace-details-42')
+        send('\x1b')
         send('\x1b[H')
         expect('BEGIN-LONG')
         expect('TAIL-VISIBLE')
@@ -191,6 +217,9 @@ try:
         click(5, pod_row)
         expect('Enter inspect')
         assert 'Search logs' not in text(), 'Sidebar activation did not return to resources'
+        for _ in range(4):
+            send('\x1b')
+            assert process.poll() is None, 'Esc at root unexpectedly quit'
         send('\x03')
         process.wait(timeout=5)
         assert process.returncode == 0

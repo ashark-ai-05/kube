@@ -23,6 +23,7 @@ struct Record {
     gutter: usize,
     rows: Vec<Range<usize>>,
     style: Style,
+    severity: crate::ui::log_format::Severity,
 }
 
 pub struct LogView {
@@ -30,6 +31,9 @@ pub struct LogView {
     pub fold: bool,
     pub filter_matches: bool,
     pub pretty: bool,
+    pub raw: bool,
+    expanded: Option<u64>,
+    visible_sequences: Vec<u64>,
     pub horizontal: usize,
     pub selected_match: Option<u64>,
     anchor: Option<Anchor>,
@@ -37,7 +41,7 @@ pub struct LogView {
     width: u16,
     height: usize,
     single_pod: bool,
-    cache_key: (u16, bool, bool, bool),
+    cache_key: (u16, bool, bool, bool, bool, bool, Option<u64>),
     cache: VecDeque<(u64, Arc<Record>)>,
 }
 impl Default for LogView {
@@ -47,6 +51,9 @@ impl Default for LogView {
             fold: true,
             filter_matches: false,
             pretty: false,
+            raw: false,
+            expanded: None,
+            visible_sequences: vec![],
             horizontal: 0,
             selected_match: None,
             anchor: None,
@@ -54,7 +61,7 @@ impl Default for LogView {
             width: 100,
             height: 20,
             single_pod: true,
-            cache_key: (0, false, false, false),
+            cache_key: (0, false, false, false, false, false, None),
             cache: VecDeque::new(),
         }
     }
@@ -65,6 +72,27 @@ impl LogView {
         self.anchor = None;
         self.start = Anchor::default();
         self.selected_match = None;
+        self.expanded = None;
+        self.visible_sequences.clear();
+    }
+    pub fn format_label(&self, searching: bool) -> &'static str {
+        if self.pretty {
+            "JSON"
+        } else if self.raw || searching {
+            "RAW"
+        } else {
+            "MESSAGE"
+        }
+    }
+    pub fn toggle_details(&mut self, row: usize) {
+        if let Some(sequence) = self.visible_sequences.get(row).copied() {
+            self.expanded = if self.expanded == Some(sequence) {
+                None
+            } else {
+                Some(sequence)
+            };
+            self.anchor = Some(Anchor { sequence, row: 0 });
+        }
     }
     pub fn following(&self) -> bool {
         self.anchor.is_none()
@@ -121,7 +149,17 @@ impl LogView {
         }
     }
     fn record(&mut self, logs: &LogBuffer, sequence: u64) -> Arc<Record> {
-        let key = (self.width, self.wrap, self.pretty, self.single_pod);
+        let raw = self.raw || logs.search_regex().is_some();
+        let single_source = logs.single_source().is_some() && !raw;
+        let key = (
+            self.width,
+            self.wrap,
+            self.pretty,
+            self.single_pod,
+            raw,
+            single_source,
+            self.expanded,
+        );
         if self.cache_key != key {
             self.cache.clear();
             self.cache_key = key;
@@ -134,8 +172,10 @@ impl LogView {
             logs.line(sequence).expect("visible sequence exists"),
             self.width,
             self.wrap,
-            self.pretty,
+            self.pretty || self.expanded == Some(sequence),
             self.single_pod,
+            !raw,
+            single_source,
         ));
         if self.cache.len() >= 128 {
             self.cache.pop_front();
@@ -247,6 +287,7 @@ impl LogView {
         self.width = width.max(1);
         self.height = height as usize;
         self.single_pod = single_pod;
+        self.visible_sequences.clear();
         if height == 0 || width == 0 {
             return vec![];
         }
@@ -281,7 +322,18 @@ impl LogView {
                 } else {
                     format!("{}│ ", " ".repeat(record.gutter.saturating_sub(2)))
                 };
-                let mut spans = vec![Span::styled(prefix, theme::muted_style())];
+                let mut spans = if first_row {
+                    vec![
+                        Span::styled(prefix, theme::muted_style()),
+                        Span::styled(
+                            format!(" {} ", record.severity.label()),
+                            record.severity.style().bg(theme::SURFACE),
+                        ),
+                        Span::styled(" │ ", theme::muted_style()),
+                    ]
+                } else {
+                    vec![Span::styled(prefix, theme::muted_style())]
+                };
                 let range = if self.wrap {
                     range.clone()
                 } else {
@@ -294,6 +346,7 @@ impl LogView {
                 };
                 spans.extend(highlight(&record.text, range, &matches, record.style));
                 result.push(Line::from(spans));
+                self.visible_sequences.push(sequence);
             }
             if result.len() < self.height
                 && let Some(summary) = self.summary(logs, sequence)
@@ -302,6 +355,7 @@ impl LogView {
                     format!("{}{}", " ".repeat(record.gutter), summary),
                     theme::muted_style(),
                 ));
+                self.visible_sequences.push(sequence);
             }
             row = 0;
             index += 1;
@@ -310,7 +364,15 @@ impl LogView {
     }
 }
 
-fn layout(line: &LogLine, width: u16, wrap: bool, pretty: bool, single_pod: bool) -> Record {
+fn layout(
+    line: &LogLine,
+    width: u16,
+    wrap: bool,
+    pretty: bool,
+    single_pod: bool,
+    message: bool,
+    single_source: bool,
+) -> Record {
     let (time, body) = line
         .text
         .split_once(' ')
@@ -327,7 +389,9 @@ fn layout(line: &LogLine, width: u16, wrap: bool, pretty: bool, single_pod: bool
             .map(|(_, rest)| rest)
             .unwrap_or(&line.source)
     };
-    let source_width = if single_pod && width >= 70 {
+    let source_width = if single_source {
+        0
+    } else if single_pod && width >= 70 {
         10
     } else if width >= 100 {
         22
@@ -338,36 +402,23 @@ fn layout(line: &LogLine, width: u16, wrap: bool, pretty: bool, single_pod: bool
     };
     let source = ellipsis(source, source_width);
     let prefix = if width < 30 {
-        "│ ".to_string()
+        String::new()
     } else if source_width == 0 {
-        format!("{time} │ ")
+        format!("{time} ")
     } else {
-        format!("{time} {source:source_width$} │ ")
+        format!("{time} {source:source_width$} ")
     };
-    let gutter = UnicodeWidthStr::width(prefix.as_str());
-    let text = if pretty {
-        serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| body.into())
-    } else {
-        body.replace('\t', "    ")
-    };
+    let gutter = UnicodeWidthStr::width(prefix.as_str()) + 8;
+    let (text, severity) = crate::ui::log_format::present(body, pretty, message);
     let rows = wrapped_ranges(&text, (width as usize).saturating_sub(gutter).max(1), wrap);
-    let lower = text.to_ascii_lowercase();
-    let style = if lower.contains("error") || lower.contains("fatal") {
-        Style::default().fg(theme::CORAL)
-    } else if lower.contains("warn") {
-        Style::default().fg(theme::AMBER)
-    } else {
-        theme::text_style()
-    };
+    let style = theme::text_style();
     Record {
         text,
         prefix,
         gutter,
         rows,
         style,
+        severity,
     }
 }
 pub fn ellipsis(value: &str, width: usize) -> String {
@@ -503,6 +554,52 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn structured_messages_expand_on_demand_and_search_reveals_hidden_fields() {
+        let raw = r#"2026-09-28T12:34:56Z {"level":"INFO","message":"Connected successfully","logger_name":"client.network","request_id":"trace-secret-42"}"#;
+        let mut logs = LogBuffer::default();
+        logs.push(line(raw));
+        let mut view = LogView::default();
+        let rendered = plain(&view.rows(&logs, 100, 20, true));
+        assert!(rendered.contains("INF"));
+        assert!(rendered.contains("Connected successfully"));
+        assert!(!rendered.contains("logger_name"));
+        view.toggle_details(0);
+        let rendered = plain(&view.rows(&logs, 100, 20, true));
+        assert!(rendered.contains("logger_name"));
+        assert!(rendered.contains("trace-secret-42"));
+        view.toggle_details(0);
+        logs.filter("trace-secret-42").unwrap();
+        let rows = view.rows(&logs, 100, 20, true);
+        let highlighted: String = rows
+            .iter()
+            .flat_map(|r| &r.spans)
+            .filter(|s| s.style.bg == Some(theme::AMBER))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, "trace-secret-42");
+        assert_eq!(logs.matching().next().unwrap().text, raw);
+        logs.filter("").unwrap();
+        assert!(!plain(&view.rows(&logs, 100, 20, true)).contains("logger_name"));
+    }
+    #[test]
+    fn source_labels_return_for_mixed_containers_and_eviction_drops_old_sources() {
+        let mut logs = LogBuffer::new(2, 1024);
+        logs.push(line("first"));
+        assert!(logs.single_source().is_some());
+        logs.push(LogLine {
+            source: "demo/pod/sidecar".into(),
+            text: "second".into(),
+        });
+        assert!(logs.single_source().is_none());
+        let mut view = LogView::default();
+        assert!(plain(&view.rows(&logs, 100, 20, true)).contains("sidecar"));
+        logs.push(LogLine {
+            source: "demo/pod/sidecar".into(),
+            text: "third".into(),
+        });
+        assert_eq!(logs.single_source(), Some("demo/pod/sidecar"));
     }
     #[test]
     fn wrapping_preserves_unicode_words_and_long_unbroken_messages() {

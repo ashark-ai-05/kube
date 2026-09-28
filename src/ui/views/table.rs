@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Row, Table, TableState}
 use std::sync::Arc;
 
 pub struct TableView {
+    pub headers: Vec<String>,
     /// Absolute index of the selected object, owned by this view rather than
     /// by ratatui. Callers (e.g. `main.rs`, which tracks its own `selected`
     /// in response to `Action::SelectRow`/`Action::ScrollBy`) write the real
@@ -44,6 +45,7 @@ impl Default for TableView {
 impl TableView {
     pub fn new() -> Self {
         Self {
+            headers: Vec::new(),
             selected: 0,
             offset: 0,
             sort: None,
@@ -58,15 +60,81 @@ impl TableView {
     pub fn toggle_sort(&mut self, column: usize) {
         self.sort = Some(match self.sort {
             Some(s) if s.column == column => SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column,
                 descending: !s.descending,
             },
             _ => SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column,
                 descending: false,
             },
         });
+        if let Some(sort) = &mut self.sort {
+            sort.kind = self
+                .headers
+                .get(column)
+                .map(|h| crate::store::table::SortKind::for_header(h))
+                .unwrap_or_default();
+        }
     }
+}
+
+pub fn column_names(gvk: &GroupVersionKind, table: Option<&TableData>) -> Vec<String> {
+    table
+        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_else(|| {
+            crate::store::columns::columns_for(gvk)
+                .iter()
+                .map(|c| c.header.into())
+                .collect()
+        })
+}
+
+pub fn sort_picker(headers: &[String]) -> crate::ui::views::picker::Picker {
+    use crate::ui::views::picker::{Picker, PickerItem};
+    let mut items = vec![PickerItem {
+        label: "Unsorted".into(),
+        detail: "Source order".into(),
+        accent: None,
+    }];
+    for header in headers {
+        for descending in [false, true] {
+            let detail = match (
+                crate::store::table::SortKind::for_header(header),
+                descending,
+            ) {
+                (crate::store::table::SortKind::Age, false) => "Newest first",
+                (crate::store::table::SortKind::Age, true) => "Oldest first",
+                (crate::store::table::SortKind::Number, false) => "Lowest first",
+                (crate::store::table::SortKind::Number, true) => "Highest first",
+                (_, false) => "Ascending",
+                (_, true) => "Descending",
+            };
+            items.push(PickerItem {
+                label: format!("{header} {}", if descending { "↓" } else { "↑" }),
+                detail: detail.into(),
+                accent: Some(theme::TEAL),
+            });
+        }
+    }
+    Picker {
+        title: "Sort resources".into(),
+        items,
+        filter: String::new(),
+        selected: 0,
+        scroll: 0,
+    }
+}
+
+pub fn sort_choice(label: &str, headers: &[String]) -> Option<SortState> {
+    let (name, direction) = label.rsplit_once(' ')?;
+    let column = headers.iter().position(|h| h == name)?;
+    Some(SortState {
+        column,
+        descending: direction == "↓",
+        kind: crate::store::table::SortKind::for_header(name),
+    })
 }
 
 /// The half-open range of object indices that can actually be drawn.
@@ -141,6 +209,7 @@ pub fn render_table_with_data(
         ColumnSource::Builtin(cols) => cols.iter().map(|c| c.header.to_string()).collect(),
         ColumnSource::Server(t) => t.columns.iter().map(|c| c.name.clone()).collect(),
     };
+    view.headers.clone_from(&headers);
     let mut widths: Vec<Constraint> = match &source {
         ColumnSource::Builtin(cols) => cols.iter().map(|c| c.width).collect(),
         ColumnSource::Server(t) => t
@@ -229,7 +298,14 @@ pub fn render_table_with_data(
     let header = Row::new(
         displayed
             .iter()
-            .map(|i| headers[*i].clone())
+            .map(|i| match view.sort.filter(|sort| sort.column == *i) {
+                Some(sort) => format!(
+                    "{} {}",
+                    headers[*i],
+                    if sort.descending { "↓" } else { "↑" }
+                ),
+                None => headers[*i].clone(),
+            })
             .collect::<Vec<_>>(),
     )
     .style(theme::header_style());
@@ -784,6 +860,7 @@ mod tests {
         assert_eq!(
             view.sort,
             Some(SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 2,
                 descending: false
             })
@@ -798,6 +875,7 @@ mod tests {
         assert_eq!(
             view.sort,
             Some(SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 1,
                 descending: true
             })
@@ -813,6 +891,7 @@ mod tests {
         assert_eq!(
             view.sort,
             Some(SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 3,
                 descending: false
             })
@@ -928,6 +1007,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
         let mut view = TableView::new();
         view.sort = Some(SortState {
+            kind: crate::store::table::SortKind::Auto,
             column: 0,
             descending: false,
         });

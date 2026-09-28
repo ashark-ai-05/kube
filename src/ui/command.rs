@@ -23,6 +23,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("cluster", "Choose cluster"),
     ("namespace", "Choose namespace"),
     ("filter", "Filter resources by name or label:key=value"),
+    (
+        "sort",
+        "Sort resources by name, age, restarts or another column",
+    ),
     ("clear", "Clear the resource filter"),
     ("mouse", "Toggle mouse capture for terminal text selection"),
     ("sidebar", "Toggle resource sidebar"),
@@ -149,7 +153,7 @@ impl CommandBar {
         ])
         .split(inner);
         if self.help {
-            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter\nCtrl-O cluster · Ctrl-N namespace · click top bar\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · v fold/expand · ←/→ pan when unwrapped · J pretty JSON\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
+            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter · s sort resources\nCtrl-O cluster · Ctrl-N namespace · click top bar\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · v fold/expand · ←/→ pan when unwrapped\nEnter/click record details · J JSON · o original\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
             return;
         }
         f.render_widget(

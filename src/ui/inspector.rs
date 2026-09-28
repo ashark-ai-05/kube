@@ -301,6 +301,12 @@ impl Inspector {
                         .find(|(r, _)| r.contains((m.column, m.row).into()))
                     {
                         code = Some(KeyCode::Char(*key));
+                    } else if self.mode == Mode::Logs
+                        && self.body.contains((m.column, m.row).into())
+                        && self.editing.is_none()
+                    {
+                        self.log_view.toggle_details((m.row - self.body.y) as usize);
+                        return Effect::None;
                     } else if self.mode == Mode::Related
                         && self.body.contains((m.column, m.row).into())
                     {
@@ -425,8 +431,14 @@ impl Inspector {
                 self.log_view.toggle_follow();
             }
             KeyCode::Char('J') if self.mode == Mode::Logs => {
-                self.log_view.pretty = !self.log_view.pretty
+                self.log_view.pretty = !self.log_view.pretty;
+                self.log_view.raw = false;
             }
+            KeyCode::Char('o') if self.mode == Mode::Logs => {
+                self.log_view.raw = !self.log_view.raw;
+                self.log_view.pretty = false;
+            }
+            KeyCode::Enter if self.mode == Mode::Logs => self.log_view.toggle_details(0),
             KeyCode::Char('w') if self.mode == Mode::Logs => {
                 self.log_view.wrap = !self.log_view.wrap
             }
@@ -562,7 +574,7 @@ impl Inspector {
         let rows = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(match self.mode {
-                Mode::Logs => 1,
+                Mode::Logs => 2,
                 Mode::Overview => 4,
                 _ => 0,
             }),
@@ -593,6 +605,38 @@ impl Inspector {
         }
         self.actions.clear();
         if self.mode == Mode::Logs {
+            let toolbar = Rect {
+                height: rows[1].height.min(1),
+                ..rows[1]
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " {} ",
+                            self.log_view
+                                .format_label(self.logs.search_regex().is_some())
+                        ),
+                        theme::label_style().bg(theme::SURFACE),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  {}  · Enter/click details · J JSON · o original",
+                            self.logs
+                                .single_source()
+                                .and_then(|s| s.rsplit('/').next())
+                                .unwrap_or("multiple sources")
+                        ),
+                        theme::muted_style(),
+                    ),
+                ])),
+                toolbar,
+            );
+            let search_area = Rect {
+                y: rows[1].y.saturating_add(1),
+                height: rows[1].height.saturating_sub(1),
+                ..rows[1]
+            };
             let query = if matches!(self.editing, Some(Edit::Search)) {
                 &self.input
             } else {
@@ -630,9 +674,9 @@ impl Inspector {
                         theme::PAPER
                     },
                 )),
-                rows[1],
+                search_area,
             );
-            self.actions.push((rows[1], '/'));
+            self.actions.push((search_area, '/'));
             let lines = self.log_view.rows(
                 &self.logs,
                 rows[2].width,
@@ -789,6 +833,7 @@ impl Inspector {
                     },
                 ),
                 ('J', "JSON"),
+                ('o', "Original"),
                 (
                     'z',
                     if self.maximized {

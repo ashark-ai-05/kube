@@ -257,6 +257,7 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PickerOutcome {
     ClusterChosen(String),
+    SortChosen(String),
     /// `None` is the all-namespaces scope, same convention as
     /// `namespace_choice_from_label`.
     NamespaceChosen(Option<String>),
@@ -288,6 +289,9 @@ fn resolve_confirm(overlay: &Overlay, index: Option<usize>) -> PickerOutcome {
             Some(label) => PickerOutcome::ClusterChosen(label),
             None => PickerOutcome::NoOp,
         },
+        Overlay::SortPicker(p) => resolve_picker_choice(p, i)
+            .map(PickerOutcome::SortChosen)
+            .unwrap_or(PickerOutcome::NoOp),
         Overlay::NamespacePicker(p) => match resolve_picker_choice(p, i) {
             Some(label) => PickerOutcome::NamespaceChosen(namespace_choice_from_label(&label)),
             None => {
@@ -1942,7 +1946,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 );
                 clamp_selection(p);
             }
-            Overlay::None => {}
+            Overlay::SortPicker(_) | Overlay::None => {}
         }
 
         let mut quit = false;
@@ -2223,6 +2227,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         needs_redraw = true;
                         continue;
                     }
+                    KeyCode::Char('s') if inspector.is_none() && !overlay.is_open() => {
+                        command = Some("sort".into())
+                    }
                     KeyCode::Char('m') if inspector.is_none() && !overlay.is_open() => {
                         command = Some("mouse".into())
                     }
@@ -2464,6 +2471,17 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         );
                     }
                     "help" => palette.help = true,
+                    "sort" => {
+                        inspector = None;
+                        workspace.home = false;
+                        filter_edit = None;
+                        overlay = Overlay::SortPicker(crate::ui::views::table::sort_picker(
+                            &crate::ui::views::table::column_names(
+                                &active_kind,
+                                snapshot.table.as_ref(),
+                            ),
+                        ));
+                    }
                     "palette" => palette.start(),
                     "filter" => filter_edit = Some(filter_text.clone()),
                     "clear" => {
@@ -2743,7 +2761,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         Overlay::None => {
                             view.selected = apply_selection(view.selected, d, table_rows);
                         }
-                        Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) => {
+                        Overlay::ClusterPicker(p)
+                        | Overlay::NamespacePicker(p)
+                        | Overlay::SortPicker(p) => {
                             let n = filtered_indices(&p.items, &p.filter).len();
                             p.selected = apply_selection(p.selected, d, n);
                         }
@@ -2755,6 +2775,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     // order again: `toggle_sort` is what `render_table_with_data`
                     // reads.
                     view.toggle_sort(i);
+                    view.selected = 0;
+                    view.offset = 0;
+                    reset_selection = true;
                     needs_redraw = true;
                 }
                 Action::ToggleFocus => {
@@ -2937,6 +2960,19 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 Action::PickerSelect(_) | Action::PickerConfirm => {
                     match resolve_confirm(&overlay, confirm_index) {
                         PickerOutcome::NoOp => {}
+                        PickerOutcome::SortChosen(label) => {
+                            let headers = crate::ui::views::table::column_names(
+                                &active_kind,
+                                snapshot.table.as_ref(),
+                            );
+                            view.sort = crate::ui::views::table::sort_choice(&label, &headers);
+                            view.selected = 0;
+                            view.offset = 0;
+                            reset_selection = true;
+                            overlay = Overlay::None;
+                            operations.notice = format!("Sorted: {label} · s change sort");
+                            needs_redraw = true;
+                        }
                         PickerOutcome::InvalidNamespaceTyped(typed) => {
                             // Left open rather than closed: the picker
                             // couldn't have done anything with this text
@@ -3093,7 +3129,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         })
                         .title(format!(" {} ", active_kind.kind))
                         .title_bottom(ratatui::text::Line::styled(
-                            " Enter inspect · l logs · / filter ",
+                            " Enter inspect · l logs · / filter · s sort ",
                             theme::muted_style(),
                         )),
                     table_area,
@@ -4774,6 +4810,7 @@ mod tests {
             ];
             let table = disagreeing_table();
             let sort = SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 1,
                 descending: false,
             };
@@ -4803,6 +4840,7 @@ mod tests {
                 pod_named("web-alpha"),
             ];
             let sort = SortState {
+                kind: crate::store::table::SortKind::Auto,
                 column: 0,
                 descending: false,
             };

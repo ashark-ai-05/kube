@@ -123,7 +123,7 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, hits: &mut 
         Span::styled("\u{2315} ", theme::label_style()),
         Span::styled(
             if picker.filter.is_empty() {
-                "Type to search namespaces or contexts…".into()
+                "Type to filter choices…".into()
             } else {
                 format!("{}▏", picker.filter)
             },
