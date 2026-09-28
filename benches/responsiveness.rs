@@ -91,7 +91,25 @@ fn main() {
             .unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
-    report("10,000-pod Pod monitor", samples, 16.);
+    report("10,000-pod cached monitor navigation", samples, 16.);
+    let mut samples = vec![];
+    for _ in 0..100 {
+        workspace.dashboard.metrics.revision += 1;
+        let start = Instant::now();
+        workspace.clear_hits();
+        terminal
+            .draw(|f| {
+                workspace.render_home(
+                    f,
+                    f.area(),
+                    &objects,
+                    kube_tui::app::event::WatchStatus::Synced,
+                )
+            })
+            .unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report("10,000-pod monitor metric refresh", samples, 50.);
     let mut logs = LogBuffer::default();
     let start = Instant::now();
     for i in 0..100_000 {

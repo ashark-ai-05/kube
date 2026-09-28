@@ -4,7 +4,11 @@ pub mod pod;
 use kube::api::DynamicObject;
 use metrics::{MetricsFeed, Usage};
 use pod::{Budget, Filter, Identity, Sort};
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub struct Row {
     pub object: Arc<DynamicObject>,
@@ -12,6 +16,15 @@ pub struct Row {
     pub budget: Budget,
     pub restarts: u64,
     pub age: Option<u64>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ViewKey {
+    filter: Filter,
+    search: String,
+    sort: Sort,
+    descending: bool,
+    revision: u64,
 }
 
 pub struct Dashboard {
@@ -30,6 +43,10 @@ pub struct Dashboard {
     sampled_revision: u64,
     history_key: Option<Identity>,
     pub list_height: usize,
+    source: Vec<Arc<DynamicObject>>,
+    view_key: Option<ViewKey>,
+    refreshed: Option<Instant>,
+    counts: [usize; 4],
 }
 impl Default for Dashboard {
     fn default() -> Self {
@@ -49,6 +66,10 @@ impl Default for Dashboard {
             sampled_revision: 0,
             history_key: None,
             list_height: 10,
+            source: vec![],
+            view_key: None,
+            refreshed: None,
+            counts: [0; 4],
         }
     }
 }
@@ -76,6 +97,32 @@ impl Dashboard {
         self.descending = descending;
     }
     pub fn refresh(&mut self, objects: &[Arc<DynamicObject>]) -> [usize; 4] {
+        let key = ViewKey {
+            filter: self.filter,
+            search: self.search.clone(),
+            sort: self.sort,
+            descending: self.descending,
+            revision: self.metrics.revision,
+        };
+        // Watches replace immutable Arc objects. Key navigation can reuse derived
+        // facts while updates, scope, filters, metrics and age ticks invalidate them.
+        if self.view_key.as_ref() == Some(&key)
+            && self
+                .refreshed
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+            && self.source.len() == objects.len()
+            && self
+                .source
+                .iter()
+                .zip(objects)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            self.sample_selection();
+            return self.counts;
+        }
+        self.source = objects.to_vec();
+        self.view_key = Some(key);
+        self.refreshed = Some(Instant::now());
         let mut counts = [0; 4];
         let filters = [
             Filter::All,
@@ -145,6 +192,11 @@ impl Dashboard {
             .unwrap_or(self.selected)
             .min(self.rows.len().saturating_sub(1));
         self.anchor = self.selected_pod().map(|o| Identity::of(o));
+        self.counts = counts;
+        self.sample_selection();
+        counts
+    }
+    fn sample_selection(&mut self) {
         if self.history_key != self.anchor {
             self.history.clear();
             self.history_key = self.anchor.clone();
@@ -158,7 +210,6 @@ impl Dashboard {
             }
             self.sampled_revision = self.metrics.revision;
         }
-        counts
     }
 }
 
@@ -239,5 +290,45 @@ mod tests {
         assert!(
             dashboard.rows.is_empty() && dashboard.history.is_empty() && dashboard.anchor.is_none()
         );
+    }
+    #[test]
+    fn cached_navigation_invalidates_on_watch_filters_and_new_metrics() {
+        let mut dashboard = Dashboard::default();
+        let mut pods = vec![
+            pod("a", "demo", "a", 0, true),
+            pod("b", "demo", "b", 0, true),
+        ];
+        dashboard.refresh(&pods);
+        let first = dashboard.refreshed;
+        dashboard.move_selection(1);
+        dashboard.refresh(&pods);
+        assert_eq!(first, dashboard.refreshed);
+        assert_eq!(
+            dashboard.history_key.as_ref().unwrap().uid.as_deref(),
+            Some("b")
+        );
+        pods[0] = pod("a", "demo", "a", 7, false);
+        assert_eq!(dashboard.refresh(&pods), [2, 1, 1, 0]);
+        assert_eq!(dashboard.rows[0].restarts, 7);
+        dashboard.metrics.latest.insert(
+            ("demo".into(), "b".into()),
+            PodUsage {
+                usage: Usage {
+                    cpu_milli: 123.,
+                    memory_bytes: 90. * 1048576.,
+                },
+                timestamp: Utc::now(),
+                containers: BTreeMap::new(),
+            },
+        );
+        dashboard.metrics.revision += 1;
+        assert_eq!(dashboard.refresh(&pods), [2, 1, 1, 1]);
+        assert_eq!(dashboard.rows[1].usage.unwrap().cpu_milli, 123.);
+        dashboard.set_filter(Filter::Restarts);
+        dashboard.refresh(&pods);
+        assert_eq!(dashboard.rows.len(), 1);
+        dashboard.refreshed = Some(Instant::now() - Duration::from_secs(2));
+        dashboard.refresh(&pods);
+        assert!(dashboard.refreshed.unwrap().elapsed() < Duration::from_secs(1));
     }
 }
