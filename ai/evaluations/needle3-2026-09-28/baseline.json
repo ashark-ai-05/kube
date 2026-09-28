@@ -1,0 +1,239 @@
+[
+  {
+    "query": "Show failing pods in payments",
+    "function_calls": [],
+    "confidence": 0.0743,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "List pods in all namespaces",
+    "function_calls": [
+      {
+        "name": "browse_resources",
+        "arguments": {
+          "kind": "Pod",
+          "namespace": "all"
+        }
+      }
+    ],
+    "confidence": 0.1109,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show deployments",
+    "function_calls": [
+      {
+        "name": "browse_resources",
+        "arguments": {
+          "kind": "Deployment"
+        }
+      }
+    ],
+    "confidence": 0.1671,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show services in demo",
+    "function_calls": [],
+    "confidence": 0.0712,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Previous logs for this pod",
+    "function_calls": [
+      {
+        "name": "open_logs",
+        "arguments": {
+          "previous": true
+        }
+      }
+    ],
+    "confidence": 0.3056,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show me logs",
+    "function_calls": [
+      {
+        "name": "open_logs",
+        "arguments": {}
+      }
+    ],
+    "confidence": 0.3979,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Why is this deployment stuck?",
+    "function_calls": [],
+    "confidence": 0.0867,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show events",
+    "function_calls": [
+      {
+        "name": "open_logs",
+        "arguments": {
+          "previous": false
+        }
+      }
+    ],
+    "confidence": 0.3217,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show YAML",
+    "function_calls": [
+      {
+        "name": "open_logs",
+        "arguments": {
+          "previous": false
+        }
+      }
+    ],
+    "confidence": 0.1992,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Switch to staging",
+    "function_calls": [
+      {
+        "name": "switch_namespace",
+        "arguments": {
+          "namespace": "staging"
+        }
+      }
+    ],
+    "confidence": 0.3752,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Switch namespace demo",
+    "function_calls": [
+      {
+        "name": "switch_namespace",
+        "arguments": {
+          "namespace": "demo"
+        }
+      }
+    ],
+    "confidence": 0.1713,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "please delete all pods",
+    "function_calls": [],
+    "confidence": 0.0305,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "exec bash",
+    "function_calls": [],
+    "confidence": 0.0529,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "scale web to 4",
+    "function_calls": [],
+    "confidence": 0.0413,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Read the live logs for this pod",
+    "function_calls": [],
+    "confidence": 0.0924,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show pods in the payments namespace",
+    "function_calls": [],
+    "confidence": 0.0683,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Take me to staging",
+    "function_calls": [
+      {
+        "name": "switch_namespace",
+        "arguments": {
+          "namespace": "staging"
+        }
+      }
+    ],
+    "confidence": 0.1638,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Show the events for the selected deployment",
+    "function_calls": [
+      {
+        "name": "open_logs",
+        "arguments": {
+          "previous": false
+        }
+      }
+    ],
+    "confidence": 0.2502,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Can I see the YAML for this resource?",
+    "function_calls": [
+      {
+        "name": "inspect_resource",
+        "arguments": {
+          "view": "yaml"
+        }
+      }
+    ],
+    "confidence": 0.3322,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Find unhealthy deployments in demo",
+    "function_calls": [],
+    "confidence": 0.0976,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "List services across every namespace",
+    "function_calls": [
+      {
+        "name": "browse_resources",
+        "arguments": {
+          "kind": "Service"
+        }
+      }
+    ],
+    "confidence": 0.1585,
+    "success": true,
+    "error": null
+  },
+  {
+    "query": "Tell me a joke",
+    "function_calls": [],
+    "confidence": 0.0459,
+    "success": true,
+    "error": null
+  }
+]

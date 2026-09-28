@@ -35,3 +35,7 @@ Upstream references:
 - https://github.com/ggml-org/llama.cpp/releases/tag/b11223
 
 See `NOTICE.txt` and `licenses/` for redistribution terms and attribution.
+
+## Could a model live in Git?
+
+Yes: a sufficiently small artifact can be committed normally, and the current 292 MB model could use Git LFS. Git LFS stores the weight object separately from its Git pointer. We investigated a 35 MB alternative with two tool schemas; it confused scopes and omitted requested filters. It is not shipped. See the [reproducible small-model investigation](evaluations/needle3-2026-09-28/README.md). Bundling is technically straightforward; high command accuracy still needs domain training and held-out evaluation.
