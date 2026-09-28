@@ -1,0 +1,9 @@
+Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms
+
+The bundled model and any derivatives are subject to the attached Gemma Terms of Use, including the use restrictions in Section 3.2 and the incorporated Gemma Prohibited Use Policy. Copies are included in licenses/.
+
+Model: google/functiongemma-270m-it, converted and Q8_0 quantized by ggml-org/functiongemma-270m-it-GGUF at revision 2566ce14aedfc14fdd0de955ba67346425e67126. The upstream quantized weights are distributed unchanged by kube. Checksums and source URLs are recorded in manifest.json.
+
+Runtime: llama.cpp b11223. Its MIT license is included in licenses/LLAMA-LICENSE.txt. The upstream runtime is distributed unchanged.
+
+This is an experimental natural-language navigation aid. Review every proposed action. It does not provide autonomous Kubernetes administration or expert root-cause analysis.

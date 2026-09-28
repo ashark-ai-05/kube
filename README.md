@@ -17,13 +17,15 @@ Uses `KUBECONFIG` or `~/.kube/config` by default. `--kubeconfig PATH` overrides 
 
 Fleet radar opens with readiness counts, a pod attention queue and namespace signals for the selected scope. Counts come from the current watch; it does not query every cluster. Running pods without readiness evidence are shown as unknown.
 
-`F2` opens Fleet radar. `F3` opens Focus studio, the resource browser. The compact rail contains common workloads and recent investigations; `Ctrl-R` or **All resources** opens the full discovered API catalog, including CRDs. `Tab` moves between the rail, resource list and inspector. The inspector adds readiness and owner context with direct Events, Logs and Related tabs. Cluster and namespace selectors stay visible throughout.
+`F2` opens Fleet radar. `F3` opens Focus studio, the resource browser. The compact rail contains common workloads and recent investigations; `Ctrl-R` or **All resources** opens the full discovered API catalog, including CRDs. `Tab` moves between the rail, resource list and inspector. The inspector adds readiness and owner context with direct Events, Logs and Related tabs. Cluster and namespace selectors stay visible throughout. Tables hide the API’s optional wide columns on smaller terminals to leave more room for resource names.
+
+![Focus studio with wrapped and folded logs](docs/images/focus-studio.png)
 
 ## Investigate
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
 
-Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Copy/export retain full metadata.
+Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Consecutive repeated messages and Java-style stack frames collapse into expandable groups (`v` toggles folding). Search automatically expands groups, and copy/export retain every raw record. Copy/export retain full metadata.
 
 Logs aggregate up to 16 pod/container streams, include source labels and timestamps, and follow replacement pods. Choose a container, inspect previous-container logs, search literal text or `re:patterns`, pause/follow, choose a time window, and export the filtered buffer. Kubernetes only exposes retained container logs; this is not a historical logging backend. Reconnect deduplication is best effort for identical timestamps.
 
@@ -50,7 +52,32 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | `Esc` / `q` | Close inspector or quit |
 | `Ctrl-C` | Quit |
 
-Inspector actions are clickable. Logs: `w` wrap on/off; `←`/`→` pan unwrapped lines; `/` or `Ctrl-F` search; `n`/`N` next/previous matching line; `F` matching lines/context; `Ctrl-U` clear an editing query; `Esc` cancel editing or clear a committed search; `Home` oldest retained line; `End` live tail; `f` pause/follow; `c` cycle containers; `p` previous instance; `s` time window; `J` pretty JSON; `e` export; `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).
+Inspector actions are clickable. Logs: `v` fold/expand repeated messages and stack frames; `w` wrap on/off; `←`/`→` pan unwrapped lines; `/` or `Ctrl-F` search; `n`/`N` next/previous matching line; `F` matching lines/context; `Ctrl-U` clear an editing query; `Esc` cancel editing or clear a committed search; `Home` oldest retained line; `End` live tail; `f` pause/follow; `c` cycle containers; `p` previous instance; `s` time window; `J` pretty JSON; `e` export; `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).
+
+## Ask Kube (optional local AI)
+
+Press `Ctrl-Space`, click **Ask Kube**, or enter `:ask`. Try `show failing pods in payments`, `show deployments`, `previous logs for this pod`, `why is this deployment stuck?`, or `switch to staging`. Review the displayed cluster, namespace, selected resource and proposed action, then press Enter to apply. Esc cancels. This path only reads and navigates; existing explicit commands handle mutations.
+
+Common phrases are interpreted directly and work in the standard binary. The optional **AI edition** also includes FunctionGemma 270M Q8_0 (291,557,792 bytes) and a CPU runtime for other wording. Extract the whole archive and run `./kube`; keep the adjacent `ai/` directory. There is no separate model installation or runtime download. The weights are release assets and are not committed to Git.
+
+Local model suggestions are **experimental**. The unfine-tuned model can choose the wrong action or arguments; unsupported arguments and invented namespace defaults are rejected, and every accepted suggestion still requires a visible preview. It is not a general Kubernetes expert. Diagnosis opens the app's observed status, events and logs rather than generating root-cause claims. Only the typed request and fixed action definitions reach the worker; kubeconfigs, credentials, object contents and log buffers are never passed to it.
+
+The worker starts only when needed, uses two CPU threads and a 2,048-token context, and exits after each request or cancellation. It listens only on an authenticated loopback connection; the TUI remains responsive. `KUBE_AI_DIR=/path/to/ai` can select a locally assembled bundle. With no bundle installed, built-in phrases still work and other wording gets an actionable explanation.
+
+To assemble the optional distribution (network needed **at packaging time**):
+
+```sh
+cargo build --release --locked
+mkdir package
+cp target/release/kube package/
+python3 scripts/package-ai.py package --platform macos-arm64  # or ubuntu-x64
+KUBE_AI_DIR="$PWD/package/ai" cargo test --locked --test assistant_local -- --ignored
+cargo run --locked --example assistant-eval
+```
+
+The packager verifies pinned SHA-256 hashes and the model size budget and includes the model/runtime licenses. The **Build binaries** workflow has an `include_ai` option to produce both editions. `cargo run --example assistant-eval -- --model-only` measures raw model accuracy separately; failures are expected with the current experimental model and are documented in [ai/README.md](ai/README.md).
+
+![Ask Kube action preview](docs/images/ask-kube.png)
 
 ## Operations
 

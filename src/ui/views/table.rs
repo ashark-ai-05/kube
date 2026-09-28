@@ -165,8 +165,23 @@ pub fn render_table_with_data(
         .iter()
         .position(|h| h.eq_ignore_ascii_case("status"));
 
-    // In a narrow split pane keep names readable. Sort state and hit zones
-    // still refer to original column indexes, including server printer columns.
+    // Respect the API's optional/wide columns before sacrificing resource names.
+    // Hit zones and sort keys remain indexes into the original printer columns.
+    let available: Vec<usize> = match &source {
+        ColumnSource::Server(table) if area.width < 150 => table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.priority == 0)
+            .map(|(i, _)| i)
+            .collect(),
+        _ => (0..headers.len()).collect(),
+    };
+    let available = if available.is_empty() {
+        (0..headers.len()).collect()
+    } else {
+        available
+    };
     let displayed: Vec<usize> = if area.width < 60 && headers.len() > 2 {
         let name = headers
             .iter()
@@ -178,7 +193,19 @@ pub fn render_table_with_data(
         widths = vec![Constraint::Fill(1), Constraint::Length(18)];
         vec![name, secondary]
     } else {
-        (0..headers.len()).collect()
+        widths = available
+            .iter()
+            .map(
+                |index| match (&source, headers[*index].to_ascii_lowercase().as_str()) {
+                    (ColumnSource::Server(_), "ready") => Constraint::Length(7),
+                    (ColumnSource::Server(_), "status") => Constraint::Length(18),
+                    (ColumnSource::Server(_), "restarts") => Constraint::Length(14),
+                    (ColumnSource::Server(_), "age") => Constraint::Length(7),
+                    _ => widths[*index],
+                },
+            )
+            .collect();
+        available
     };
     let project = |cells: &[String]| {
         let projected: Vec<String> = displayed
@@ -943,5 +970,53 @@ mod tests {
             seen.len() >= 2,
             "expected multiple distinct column-header hit zones across the row, got {seen:?}"
         );
+    }
+    #[test]
+    fn optional_server_columns_hide_without_changing_sort_hit_identity() {
+        use crate::store::table::{TableColumn, TableRow};
+        let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        let mut view = TableView::new();
+        let mut hits = HitRegistry::new();
+        let table = TableData {
+            columns: vec![
+                TableColumn {
+                    name: "Name".into(),
+                    priority: 0,
+                },
+                TableColumn {
+                    name: "WideOnly".into(),
+                    priority: 1,
+                },
+                TableColumn {
+                    name: "Status".into(),
+                    priority: 0,
+                },
+            ],
+            rows: vec![TableRow {
+                cells: vec![
+                    "a-long-readable-resource-name".into(),
+                    "hidden-metadata".into(),
+                    "Running".into(),
+                ],
+                identity: None,
+            }],
+        };
+        term.draw(|f| {
+            render_table_with_data(
+                f,
+                f.area(),
+                &[],
+                &GroupVersionKind::gvk("", "v1", "Pod"),
+                Some(table.clone()),
+                &mut view,
+                &mut hits,
+            )
+        })
+        .unwrap();
+        let text = dump(&term, 100, 8);
+        assert!(text.contains("a-long-readable-resource-name"));
+        assert!(!text.contains("WideOnly"));
+        assert!(!text.contains("hidden-metadata"));
+        assert_eq!(hits.hit(90, 1), Some(&HitTarget::ColumnHeader(2)));
     }
 }

@@ -24,6 +24,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo run --locked --example assistant-eval
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 scripts/terminal-smoke.py
@@ -56,5 +57,6 @@ jobs:
       - run: python3 -m pip install -r scripts/requirements-test.txt
       - run: python3 scripts/tui-cluster-smoke.py target/release/kube --stress
       - run: python3 scripts/tui-ux-smoke.py target/release/kube
+      - run: python3 scripts/assistant-smoke.py target/release/kube
       - if: always()
         run: kind delete cluster --name kube-tui-acceptance

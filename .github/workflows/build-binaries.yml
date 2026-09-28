@@ -1,6 +1,11 @@
 name: Build binaries
 on:
   workflow_dispatch:
+    inputs:
+      include_ai:
+        description: 'Also package the optional offline local model (about 292 MB)'
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 permissions:
@@ -15,8 +20,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            ai_platform: ubuntu-x64
           - os: macos-latest
             target: aarch64-apple-darwin
+            ai_platform: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -34,6 +41,14 @@ jobs:
           cp README.md package/README.md
           tar -czf kube-${{ matrix.target }}.tar.gz -C package .
           shasum -a 256 kube-${{ matrix.target }}.tar.gz > kube-${{ matrix.target }}.sha256
+      - name: Package optional AI edition
+        if: inputs.include_ai
+        run: |
+          python3 scripts/package-ai.py package --platform '${{ matrix.ai_platform }}'
+          KUBE_AI_DIR="$PWD/package/ai" cargo test --locked --test assistant_local -- --ignored
+          cargo run --locked --example assistant-eval
+          tar -czf kube-ai-${{ matrix.target }}.tar.gz -C package .
+          shasum -a 256 kube-ai-${{ matrix.target }}.tar.gz > kube-ai-${{ matrix.target }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: kube-${{ matrix.target }}

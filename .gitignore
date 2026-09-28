@@ -20,3 +20,10 @@ admin.conf
 # Python terminal-test bytecode
 __pycache__/
 *.pyc
+
+# Optional AI release assets, never source-controlled.
+*.gguf
+/ai/runtime/
+/package/
+/package-ai/
+/ai-cache/

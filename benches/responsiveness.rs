@@ -37,6 +37,24 @@ fn main() {
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
     report("10,000-resource cached navigation", samples, 16.);
+    let mut workspace = kube_tui::ui::workspace::Workspace::default();
+    let mut samples = vec![];
+    for _ in 0..100 {
+        let start = Instant::now();
+        workspace.clear_hits();
+        terminal
+            .draw(|f| {
+                workspace.render_home(
+                    f,
+                    f.area(),
+                    &objects,
+                    kube_tui::app::event::WatchStatus::Synced,
+                )
+            })
+            .unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report("10,000-pod Fleet radar", samples, 16.);
     let mut logs = LogBuffer::default();
     let start = Instant::now();
     for i in 0..100_000 {

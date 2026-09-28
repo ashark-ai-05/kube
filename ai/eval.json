@@ -1,0 +1,16 @@
+[
+  {"query":"Show failing pods in payments","expected":"Show unhealthy Pod · namespace payments"},
+  {"query":"List pods in all namespaces","expected":"Show Pod · all namespaces"},
+  {"query":"Show deployments","expected":"Show Deployment · current namespace"},
+  {"query":"Show services in demo","expected":"Show Service · namespace demo"},
+  {"query":"Previous logs for this pod","expected":"Open previous container logs for the selected resource"},
+  {"query":"Show me logs","expected":"Open logs for the selected resource"},
+  {"query":"Why is this deployment stuck?","expected":"Open overview for the selected resource"},
+  {"query":"Show events","expected":"Open events for the selected resource"},
+  {"query":"Show YAML","expected":"Open yaml for the selected resource"},
+  {"query":"Switch to staging","expected":"Choose cluster context: staging"},
+  {"query":"Switch namespace demo","expected":"Select namespace demo"},
+  {"query":"please delete all pods","reject":true},
+  {"query":"exec bash","reject":true},
+  {"query":"scale web to 4","reject":true}
+]

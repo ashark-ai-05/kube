@@ -1280,6 +1280,63 @@ fn spawn_refetch_wake(tx: mpsc::UnboundedSender<AppEvent>, after: Duration) {
     });
 }
 
+fn request_context(
+    session: &SharedSession,
+    label: String,
+    opts: &cluster::ConnectOptions,
+    entries: &[ClusterEntry],
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let target = ClusterId(label);
+    let mut switch_opts = opts.clone();
+    switch_opts.context = Some(target.0.clone());
+    let auth = entries
+        .iter()
+        .find(|e| e.id == target)
+        .map(|e| e.context.auth.clone())
+        .unwrap_or(AuthMethod::None);
+    let session2 = session.clone();
+    let session3 = session.clone();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        switch_cluster(
+            session2,
+            target,
+            None,
+            tx2.clone(),
+            move || async move {
+                cluster::connect_with(&switch_opts).await.map_err(|e| {
+                    anyhow::anyhow!(connect_failure_hint(&auth, &cluster::safe_error_text(&e)))
+                })
+            },
+            move |client, store, ns| {
+                supervise(
+                    "watch",
+                    spawn_discovery_and_watches(session3, client, store, ns, tx2.clone()),
+                    tx2,
+                )
+            },
+        )
+        .await;
+    });
+}
+async fn request_namespace(
+    session: &SharedSession,
+    namespace: Option<String>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let session3 = session.clone();
+    let tx2 = tx.clone();
+    restart_watch(session.clone(), namespace, move |client, store, ns| {
+        supervise(
+            "watch",
+            spawn_discovery_and_watches(session3, client, store, ns, tx2.clone()),
+            tx2,
+        )
+    })
+    .await;
+}
+
 pub async fn run() -> anyhow::Result<()> {
     // Parse CLI arguments first, before any terminal setup.
     // This allows us to handle --help and errors cleanly to stdout/stderr.
@@ -1515,6 +1572,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     }
     let mut palette = CommandBar::default();
     let mut header = Header::default();
+    let mut assistant = crate::ui::assistant::Assistant::new(tx.clone());
     let mut operations = Operations::new(tx.clone());
     operations.kubeconfig_paths = opts.kubeconfig_paths.clone();
     let mut filter_text = String::new();
@@ -1723,6 +1781,8 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
         // switch cannot show the previous cluster's health over this
         // cluster's (empty) object list, nor one kind's count beside
         // another's availability.
+        assistant.sync_scope(StoreId::of(&store));
+        needs_redraw |= assistant.drain();
         if workspace_store != Some(StoreId::of(&store)) {
             workspace.recent.clear();
             workspace_store = Some(StoreId::of(&store));
@@ -1910,6 +1970,121 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 needs_redraw = true;
                 continue;
             }
+            if assistant.open {
+                needs_redraw = true;
+                if let Some(intent) = assistant.handle(input) {
+                    use crate::assistant::{Intent, Scope};
+                    if assistant.scope != Some(StoreId::of(&session.lock().await.store))
+                        || connecting_name.is_some()
+                    {
+                        operations.notice = "Scope changed or a cluster switch is in progress. Ask again when connected.".into();
+                        continue;
+                    }
+                    match intent {
+                        Intent::Browse {
+                            kind,
+                            scope,
+                            attention,
+                        } => {
+                            if let Some(gvk) = kinds
+                                .iter()
+                                .find(|k| k.gvk.kind == kind)
+                                .map(|k| k.gvk.clone())
+                                .or_else(|| (kind == "Pod").then(crate::app::session::default_kind))
+                            {
+                                let target = match scope {
+                                    Scope::Current => namespace.clone(),
+                                    Scope::All => None,
+                                    Scope::Named(n) => Some(n),
+                                };
+                                if target != namespace {
+                                    request_namespace(&session, target, &tx).await;
+                                }
+                                session.lock().await.active_kind = gvk.clone();
+                                active_kind_now = gvk;
+                                filter_text = if attention {
+                                    "health:unhealthy".into()
+                                } else {
+                                    String::new()
+                                };
+                                view.selected = 0;
+                                view.offset = 0;
+                                view.sort = None;
+                                reset_selection = true;
+                                inspector = None;
+                                detail = None;
+                                workspace.home = false;
+                                pane_focus = Focus::Table;
+                                operations.notice = "Applied read-only navigation".into();
+                            } else {
+                                operations.notice =
+                                    format!("{kind} is not available in this cluster");
+                            }
+                        }
+                        Intent::Namespace(scope) => {
+                            let target = match scope {
+                                Scope::Current => namespace.clone(),
+                                Scope::All => None,
+                                Scope::Named(n) => Some(n),
+                            };
+                            if target != namespace {
+                                request_namespace(&session, target, &tx).await;
+                            }
+                            filter_text.clear();
+                            inspector = None;
+                            detail = None;
+                            reset_selection = true;
+                        }
+                        Intent::Cluster(name) => {
+                            if entries.iter().any(|e| e.id.0 == name) {
+                                request_context(&session, name, &opts, &entries, &tx);
+                            } else {
+                                operations.notice="Choose an exact cluster context; no context was switched automatically".into();
+                                overlay = Overlay::ClusterPicker(Picker {
+                                    title: "Clusters".into(),
+                                    items: cluster_picker_items(&entries),
+                                    filter: name,
+                                    selected: 0,
+                                    scroll: 0,
+                                });
+                            }
+                        }
+                        Intent::Inspect { mode, previous } => {
+                            if let Some(object) = assistant
+                                .object
+                                .as_ref()
+                                .and_then(|target| {
+                                    objects.iter().find(|o| {
+                                        o.uid() == target.uid() && o.name_any() == target.name_any()
+                                    })
+                                })
+                                .map(|o| (**o).clone())
+                            {
+                                workspace.remember(&object);
+                                let mut panel = Inspector::new(
+                                    object,
+                                    mode,
+                                    client.clone(),
+                                    kinds.clone(),
+                                    tx.clone(),
+                                );
+                                if previous {
+                                    panel.previous_logs();
+                                }
+                                inspector = Some(panel);
+                                inspector_store = Some(StoreId::of(&store));
+                            } else {
+                                operations.notice =
+                                    "Select a current resource first, then ask again.".into();
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppEvent::Wake);
+                    // Do not process subsequent keys against the old scope snapshot.
+                    break;
+                }
+                continue;
+            }
             if palette.help {
                 if matches!(input, Event::Key(_)) {
                     palette.help = false;
@@ -1974,6 +2149,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 && k.modifiers.contains(KeyModifiers::CONTROL)
             {
                 match k.code {
+                    KeyCode::Char(' ') => command = Some("ask".into()),
                     KeyCode::Char('n') => command = Some("namespace".into()),
                     KeyCode::Char('o') => command = Some("cluster".into()),
                     KeyCode::Char('r') if !overlay.is_open() && !palette.open => {
@@ -2117,7 +2293,8 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 }
             }
             if !overlay.is_open() && !palette.open && filter_edit.is_none() {
-                if let Event::Mouse(m) = input
+                if command.is_none()
+                    && let Event::Mouse(m) = input
                     && m.kind
                         == crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -2269,6 +2446,22 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             ));
                             inspector_store = Some(StoreId::of(&store));
                         }
+                    }
+                    "ask" => {
+                        palette.open = false;
+                        filter_edit = None;
+                        overlay = Overlay::None;
+                        assistant.start(
+                            StoreId::of(&store),
+                            &context_name,
+                            scope,
+                            if workspace.home && inspector.is_none() {
+                                None
+                            } else {
+                                selected
+                            },
+                            command.strip_prefix("ask").unwrap_or("").trim(),
+                        );
                     }
                     "help" => palette.help = true,
                     "palette" => palette.start(),
@@ -2758,123 +2951,12 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         }
                         PickerOutcome::ClusterChosen(label) => {
                             overlay = Overlay::None;
-                            let target = ClusterId(label);
-                            // Inherits `allow_interactive_auth: false`
-                            // from `opts`: this connect runs with the
-                            // alternate screen live, so no exec plugin
-                            // may prompt into it. See
-                            // `ConnectOptions::allow_interactive_auth`.
-                            let mut switch_opts = opts.clone();
-                            switch_opts.context = Some(target.0.clone());
-                            // How the target authenticates, so a
-                            // refusal to prompt can say which command
-                            // to run instead of just failing.
-                            let target_auth = entries
-                                .iter()
-                                .find(|e| e.id == target)
-                                .map(|e| e.context.auth.clone())
-                                .unwrap_or(AuthMethod::None);
-                            let session2 = session.clone();
-                            let session3 = session.clone();
-                            let tx2 = tx.clone();
-                            tokio::spawn(async move {
-                                switch_cluster(
-                                    session2,
-                                    target,
-                                    // Contexts frequently set no namespace and
-                                    // `default` is empty on these clusters — so a
-                                    // switch overrides whatever `-A`/`-n` chose for
-                                    // the INITIAL connect with all-namespaces.
-                                    // `switch_cluster` records this scope on the
-                                    // session and hands the SAME value to the closure
-                                    // below, so what the status bar reports and what
-                                    // the watch actually watches cannot disagree.
-                                    None,
-                                    tx2.clone(),
-                                    move || async move {
-                                        cluster::connect_with(&switch_opts).await.map_err(|e| {
-                                            // `safe_error_text`, not `{e:#}`:
-                                            // this text becomes
-                                            // `SessionEvent::ConnectFailed`'s
-                                            // reason and is drawn in the status
-                                            // bar. Switching to a cluster whose
-                                            // plugin fails after printing an
-                                            // ExecCredential is exactly the
-                                            // shape that leaks a token there.
-                                            // The plugin's NAME still reaches
-                                            // the user, from the kubeconfig via
-                                            // `connect_failure_hint` — never
-                                            // from the error, whose own `cmd`
-                                            // field carries the process
-                                            // environment. See `cluster::redact`.
-                                            anyhow::anyhow!(connect_failure_hint(
-                                                &target_auth,
-                                                &cluster::safe_error_text(&e)
-                                            ))
-                                        })
-                                    },
-                                    // The new cluster's kinds are its own:
-                                    // discovery runs against the client this
-                                    // switch just obtained, into the store it
-                                    // just minted, and stands down if either
-                                    // is superseded before it answers. See
-                                    // `spawn_discovery_and_watches`.
-                                    move |client, store, ns| {
-                                        supervise(
-                                            "watch",
-                                            spawn_discovery_and_watches(
-                                                session3,
-                                                client,
-                                                store,
-                                                ns,
-                                                tx2.clone(),
-                                            ),
-                                            tx2,
-                                        )
-                                    },
-                                )
-                                .await;
-                            });
+                            request_context(&session, label, &opts, &entries, &tx);
                             needs_redraw = true;
                         }
                         PickerOutcome::NamespaceChosen(ns_choice) => {
                             overlay = Overlay::None;
-                            let session3 = session.clone();
-                            let tx2 = tx.clone();
-                            // `restart_watch` reads the session's CURRENT client
-                            // from the same lock it uses to tear down and replace
-                            // the store — not a copy captured earlier, which could
-                            // have gone stale if a cluster switch completed in the
-                            // gap between capturing it and taking the lock. See
-                            // `Session::client`'s doc comment for the interleaving
-                            // this closes. It records the scope under that same
-                            // guard and passes it on to the closure, so nothing
-                            // here has to update a display copy afterwards.
-                            //
-                            // Discovery re-runs here too. The kinds have not
-                            // changed — it is the same cluster — but the
-                            // watches have all just been torn down and every
-                            // one of them has to be restarted against the new
-                            // store and scope, and the alternative is reading
-                            // `session.kinds` in a SEPARATE lock acquisition
-                            // before this one, which is precisely the stale-
-                            // read shape `restart_watch`'s own doc comment
-                            // exists to close. One extra discovery round-trip
-                            // per namespace change is the cheaper mistake.
-                            restart_watch(session.clone(), ns_choice, move |client, store, ns| {
-                                supervise(
-                                    "watch",
-                                    spawn_discovery_and_watches(
-                                        session3,
-                                        client,
-                                        store,
-                                        ns,
-                                        tx2.clone(),
-                                    ),
-                                    tx2,
-                                )
-                            })
-                            .await;
+                            request_namespace(&session, ns_choice, &tx).await;
                             needs_redraw = true;
                         }
                     }
@@ -3101,6 +3183,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             if palette.open || palette.help {
                 palette.render(f);
             }
+            assistant.render(f);
             operations.render(f);
         })?;
     }

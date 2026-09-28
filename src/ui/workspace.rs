@@ -246,11 +246,11 @@ impl Workspace {
         if area.height > 22 {
             let r = Rect::new(area.x + 1, area.bottom() - 3, area.width - 2, 2);
             f.render_widget(
-                Paragraph::new(" ^O Cluster · ^N Scope\n ^K Commands · ? Help")
+                Paragraph::new(" ^Space Ask Kube\n ^K Commands · ? Help")
                     .style(Style::default().fg(theme::VIOLET)),
                 r,
             );
-            self.buttons.push((r, "palette".into()));
+            self.buttons.push((r, "ask".into()));
         }
     }
     pub fn render_home(
@@ -288,24 +288,26 @@ impl Workspace {
             ]),
             rows[0],
         );
-        let counts = [
-            objects
-                .iter()
-                .filter(|o| health(o) == Health::Ready)
-                .count(),
-            objects
-                .iter()
-                .filter(|o| health(o) == Health::Attention)
-                .count(),
-            objects
-                .iter()
-                .filter(|o| health(o) == Health::Completed)
-                .count(),
-            objects
-                .iter()
-                .filter(|o| health(o) == Health::Unknown)
-                .count(),
-        ];
+        let mut counts = [0usize; 4];
+        let mut issues = Vec::new();
+        let mut namespaces = BTreeMap::<&str, (usize, usize)>::new();
+        for (index, object) in objects.iter().enumerate() {
+            let value = health(object);
+            counts[match value {
+                Health::Ready => 0,
+                Health::Attention => 1,
+                Health::Completed => 2,
+                Health::Unknown => 3,
+            }] += 1;
+            if value == Health::Attention {
+                issues.push((index, object));
+            }
+            let entry = namespaces
+                .entry(object.metadata.namespace.as_deref().unwrap_or(""))
+                .or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(value == Health::Attention);
+        }
         let cards = Layout::horizontal([Constraint::Fill(1); 4])
             .spacing(1)
             .split(rows[1]);
@@ -342,11 +344,6 @@ impl Workspace {
         })
         .spacing(3)
         .split(rows[2]);
-        let issues: Vec<_> = objects
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| health(o) == Health::Attention)
-            .collect();
         self.issue = self.issue.min(issues.len().saturating_sub(1));
         let mut lines = vec![
             Line::styled("ATTENTION QUEUE", theme::muted_style()),
@@ -399,14 +396,6 @@ impl Workspace {
             ));
         }
         f.render_widget(Paragraph::new(lines), columns[0]);
-        let mut namespaces = BTreeMap::<String, (usize, usize)>::new();
-        for object in objects {
-            let value = namespaces
-                .entry(object.namespace().unwrap_or_default())
-                .or_default();
-            value.0 += 1;
-            value.1 += usize::from(health(object) == Health::Attention);
-        }
         let mut lines = vec![
             Line::styled("NAMESPACE SIGNALS", theme::muted_style()),
             Line::from(""),

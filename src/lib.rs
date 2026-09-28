@@ -5,3 +5,5 @@ pub mod logs;
 pub mod store;
 pub mod terminal;
 pub mod ui;
+
+pub mod assistant;

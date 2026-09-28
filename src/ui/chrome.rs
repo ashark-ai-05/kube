@@ -139,6 +139,7 @@ impl Header {
                 (" F2 Fleet radar ", "home"),
                 (" F3 Focus studio ", "browse"),
                 (" ^R Resources ", "resources"),
+                (" ^Space Ask Kube ", "ask"),
             ];
             let mut x = 1;
             for (label, command) in labels {

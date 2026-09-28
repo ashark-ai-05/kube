@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("ask", "Ask Kube using natural language"),
     ("home", "Fleet radar: pod health in the current scope"),
     ("browse", "Focus studio: browse current resources"),
     ("resources", "Toggle the complete API resource catalog"),
@@ -148,7 +149,7 @@ impl CommandBar {
         ])
         .split(inner);
         if self.help {
-            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter\nCtrl-O cluster · Ctrl-N namespace · click top bar\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · ←/→ pan when unwrapped · J pretty JSON\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
+            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter\nCtrl-O cluster · Ctrl-N namespace · click top bar\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · v fold/expand · ←/→ pan when unwrapped · J pretty JSON\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
             return;
         }
         f.render_widget(
@@ -206,6 +207,9 @@ pub fn fuzzy_match(query: &str, text: &str) -> bool {
 pub fn matches_resource(query: &str, obj: &kube::api::DynamicObject) -> bool {
     use kube::ResourceExt;
     query.split_whitespace().all(|part| {
+        if part == "health:unhealthy" {
+            return crate::ui::workspace::health(obj) == crate::ui::workspace::Health::Attention;
+        }
         if let Some(label) = part.strip_prefix("label:") {
             if let Some((key, value)) = label.split_once("!=") {
                 return obj.labels().get(key).is_none_or(|v| v != value);
