@@ -1417,6 +1417,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "ratatui",
+ "regex",
  "serde_json",
  "serde_norway",
  "thiserror 2.0.20",

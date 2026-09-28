@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod namespaces;
 pub mod redact;
 pub mod registry;
+pub mod related;
 pub use auth::{
     AuthMethod, ConnectOptions, connect_with, disable_interactive_exec, kubeconfig_paths_from_env,
     merge_kubeconfigs,

@@ -154,6 +154,28 @@ pub async fn fetch_events(client: &Client, ns: &str, name: &str) -> anyhow::Resu
     Ok(event_rows(&list.items, Utc::now()))
 }
 
+/// UID prevents events from another kind or a deleted same-named object leaking in.
+pub async fn fetch_events_for_uid(
+    client: &Client,
+    namespace: Option<&str>,
+    name: &str,
+    uid: Option<&str>,
+) -> anyhow::Result<Vec<EventRow>> {
+    let api: Api<Event> = match namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
+    let selector = match uid {
+        Some(uid) => format!("involvedObject.uid={uid}"),
+        None => field_selector_for(name, namespace),
+    };
+    let list = api
+        .list(&ListParams::default().fields(&selector))
+        .await
+        .map_err(|e| classify_fetch_error(name, e))?;
+    Ok(event_rows(&list.items, Utc::now()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

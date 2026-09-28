@@ -732,3 +732,59 @@ async fn on_demand_watches_reach_cluster_resources_in_namespace_mode() {
     );
     handle.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated kind cluster"]
+async fn workload_relationships_and_container_logs_are_live() {
+    use kube::{
+        ResourceExt,
+        api::{DeleteParams, DynamicObject, PostParams},
+    };
+    use kube_tui::{
+        cluster::related,
+        logs::stream::{Message, Options, StreamSession},
+    };
+    let _serial = cluster_lock().await;
+    let client = kube_tui::cluster::connect().await.unwrap();
+    let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
+        kube::Api::namespaced(client.clone(), "demo");
+    let deployment = deployments.get("web").await.unwrap();
+    let object: DynamicObject =
+        serde_json::from_value(serde_json::to_value(deployment).unwrap()).unwrap();
+    assert!(
+        !related::pods_for(client.clone(), &object)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let kinds = discover_kinds(&client).await.unwrap();
+    let relations = related::fetch_related(client.clone(), &object, &kinds).await;
+    assert!(
+        relations
+            .objects
+            .iter()
+            .any(|o| related::kind(o) == "ReplicaSet")
+    );
+    assert!(relations.objects.iter().any(|o| related::kind(o) == "Pod"));
+    let api: kube::Api<Pod> = kube::Api::namespaced(client.clone(), "demo");
+    let pod:Pod=serde_json::from_value(serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"generateName":"log-acceptance-"},"spec":{"restartPolicy":"Never","containers":[{"name":"app","image":"nginx:alpine","command":["sh","-c","while true; do echo acceptance-live-log; sleep 1; done"]}]}})).unwrap();
+    let pod = api.create(&PostParams::default(), &pod).await.unwrap();
+    let name = pod.name_any();
+    let result=tokio::time::timeout(Duration::from_secs(60),async{
+        loop {
+            let p=api.get(&name).await.unwrap();
+            if p.status.as_ref().is_some_and(|s|s.phase.as_deref()==Some("Running")){break;}
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let object=serde_json::from_value(serde_json::to_value(&pod).unwrap()).unwrap();
+        let (wake,mut events)=mpsc::unbounded_channel();
+        let mut stream=StreamSession::start(client,object,Options::default(),wake);
+        loop {
+            events.recv().await.unwrap();
+            if stream.drain().iter().any(|m|matches!(m,Message::Line(l) if l.text.contains("acceptance-live-log")&&l.source.ends_with("/app"))){break;}
+        }
+        drop(stream);
+    }).await;
+    api.delete(&name, &DeleteParams::default()).await.unwrap();
+    result.expect("live log line should reach the viewer within 60 seconds");
+}

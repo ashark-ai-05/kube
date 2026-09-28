@@ -433,8 +433,25 @@ fn event_line_text(row: &EventRow) -> String {
 /// Serialize a DynamicObject to YAML string using serde_norway.
 /// The output leads with apiVersion, kind, metadata (kubectl convention) and
 /// requires no post-processing for readability.
-fn object_to_yaml(obj: &DynamicObject) -> String {
-    serde_norway::to_string(obj).unwrap_or_else(|_| "Failed to serialize YAML".to_string())
+pub fn object_to_yaml(obj: &DynamicObject) -> String {
+    let mut safe = obj.clone();
+    if safe
+        .types
+        .as_ref()
+        .is_some_and(|t| t.kind == "Secret" && t.api_version == "v1")
+    {
+        for field in ["data", "stringData"] {
+            if let Some(values) = safe.data.get_mut(field).and_then(|v| v.as_object_mut()) {
+                for value in values.values_mut() {
+                    *value = serde_json::Value::String("<redacted>".into());
+                }
+            }
+        }
+        if let Some(annotations) = &mut safe.metadata.annotations {
+            annotations.remove("kubectl.kubernetes.io/last-applied-configuration");
+        }
+    }
+    serde_norway::to_string(&safe).unwrap_or_else(|_| "Failed to serialize YAML".to_string())
 }
 
 /// Number of screen rows one logical (pre-wrap) line of `text` occupies once

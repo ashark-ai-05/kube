@@ -59,7 +59,11 @@ impl KindCache {
     /// visible forever, since no Delete is ever emitted for them.
     pub fn apply(&mut self, event: watcher::Event<DynamicObject>) {
         match event {
-            watcher::Event::Apply(obj) => {
+            watcher::Event::Apply(mut obj) => {
+                obj.types.get_or_insert_with(|| kube::core::TypeMeta {
+                    api_version: self.resource.api_version.clone(),
+                    kind: self.resource.kind.clone(),
+                });
                 self.objects.insert(key_of(&obj), Arc::new(obj));
             }
             watcher::Event::Delete(obj) => {
@@ -68,7 +72,11 @@ impl KindCache {
             watcher::Event::Init => {
                 self.init_buffer = Some(IndexMap::new());
             }
-            watcher::Event::InitApply(obj) => {
+            watcher::Event::InitApply(mut obj) => {
+                obj.types.get_or_insert_with(|| kube::core::TypeMeta {
+                    api_version: self.resource.api_version.clone(),
+                    kind: self.resource.kind.clone(),
+                });
                 if let Some(buf) = self.init_buffer.as_mut() {
                     buf.insert(key_of(&obj), Arc::new(obj));
                 } else {

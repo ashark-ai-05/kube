@@ -27,3 +27,8 @@ thiserror = "2"
 http = "1"
 unicode-width = "0.2"
 serde_norway = "0.9"
+regex = "1"
+
+[[bench]]
+name = "responsiveness"
+harness = false

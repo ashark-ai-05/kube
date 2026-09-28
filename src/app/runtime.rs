@@ -21,6 +21,7 @@ use crate::store::table::{
 use crate::store::watch::StoreId;
 use crate::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
 use crate::ui::hit::HitRegistry;
+use crate::ui::inspector::{Effect, Inspector, Mode};
 use crate::ui::ribbon::{render_ribbon, split_ribbon};
 use crate::ui::theme;
 use crate::ui::tree::{KindTree, TreeGroup, TreeKind, TreeRow, flatten};
@@ -1456,6 +1457,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         scroll: 0,
     };
     let mut pane = DetailPane::new();
+    let mut inspector: Option<Inspector> = None;
+    let mut inspector_store: Option<StoreId> = None;
     let mut hits = HitRegistry::new();
     let mut last_error: Option<String> = None;
     // At most one picker is ever open; opening one replaces whatever was
@@ -1497,6 +1500,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             }
         }
         let batch = coalesce(batch);
+        if let Some(panel) = &mut inspector {
+            needs_redraw |= panel.drain();
+        }
 
         if batch.quit {
             break;
@@ -1597,6 +1603,13 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             }
             cache.request_kind(&active_kind);
         }
+        if inspector_store
+            .as_ref()
+            .is_some_and(|id| *id != StoreId::of(&store))
+        {
+            inspector = None;
+            inspector_store = None;
+        }
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let scope = display_namespace(namespace.as_deref());
         let connecting_name = connecting_cluster_name(&entries);
@@ -1642,6 +1655,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // moves included — is thousands of refcount bumps for nothing.
         let objects: &[Arc<DynamicObject>] = &snapshot.objects;
         let status = snapshot.status;
+        if let Some(panel) = &mut inspector
+            && let Some(object) = objects.iter().find(|o| o.uid() == panel.object.uid())
+        {
+            panel.refresh_object(object);
+        }
 
         // The tree is rebuilt from that same snapshot every pass — counts
         // change constantly — carrying the user's expansion state and
@@ -1768,6 +1786,71 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // and silently does nothing.
         let mut active_kind_now = active_kind.clone();
         for input in &batch.inputs {
+            use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+            if let Event::Key(k) = input
+                && k.kind == KeyEventKind::Press
+                && k.code == KeyCode::Char('c')
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                quit = true;
+                break;
+            }
+            if let Some(panel) = &mut inspector {
+                match panel.handle(input) {
+                    Effect::Close => {
+                        inspector = None;
+                    }
+                    Effect::Navigate(object) => {
+                        let gvk = crate::cluster::related::gvk(&object);
+                        session.lock().await.active_kind = gvk;
+                        panel.replace(*object);
+                        let _ = tx.send(AppEvent::Wake);
+                    }
+                    Effect::Export(path) => {
+                        if let Err(e) = panel.export(path) {
+                            panel.status = format!("Export failed: {e}");
+                        }
+                    }
+                    Effect::Copy(text) => {
+                        panel.status = match copy_text(&text) {
+                            Ok(()) => "Copied to clipboard".into(),
+                            Err(e) => format!("Copy failed: {e}; use Export"),
+                        };
+                    }
+                    Effect::None => {}
+                }
+                needs_redraw = true;
+                continue;
+            }
+            if !overlay.is_open()
+                && let Event::Key(k) = input
+                && k.kind == KeyEventKind::Press
+                && matches!(k.code, KeyCode::Char('l' | 'r'))
+            {
+                if let Some((ns, name)) = selected_object(
+                    objects,
+                    &active_kind,
+                    snapshot.table.as_ref(),
+                    view.sort.as_ref(),
+                    view.selected,
+                ) && let Some(obj) = find_object(objects, ns.as_deref(), &name)
+                {
+                    inspector = Some(Inspector::new(
+                        (**obj).clone(),
+                        if k.code == KeyCode::Char('l') {
+                            Mode::Logs
+                        } else {
+                            Mode::Related
+                        },
+                        client.clone(),
+                        kinds.clone(),
+                        tx.clone(),
+                    ));
+                    inspector_store = Some(StoreId::of(&store));
+                }
+                needs_redraw = true;
+                continue;
+            }
             // A resize changes the layout but produces no action, so it has to
             // arm the redraw itself.
             if matches!(input, crossterm::event::Event::Resize(_, _)) {
@@ -2179,6 +2262,17 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         if detail.is_some() && detail_object.is_none() {
             detail = None;
         }
+        if let Some(obj) = detail_object.as_ref() {
+            inspector = Some(Inspector::new(
+                (**obj).clone(),
+                Mode::Overview,
+                client.clone(),
+                kinds.clone(),
+                tx.clone(),
+            ));
+            inspector_store = Some(StoreId::of(&store));
+            detail = None;
+        }
         let (events, events_error) = match detail.as_ref() {
             Some(d) => (d.events.as_slice(), d.events_error.as_deref()),
             None => (&[][..], None),
@@ -2196,7 +2290,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     last_error: last_error.as_deref(),
                     show_hint,
                     connecting: connecting_name.as_deref(),
-                    detail_object: detail_object.as_deref(),
+                    detail_object: None,
                     events,
                     events_error,
                 },
@@ -2206,6 +2300,36 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 &mut overlay,
                 &mut hits,
             );
+            if let Some(panel) = &mut inspector {
+                let area = f.area();
+                let content = ratatui::layout::Rect::new(
+                    SIDEBAR_WIDTH + 1,
+                    0,
+                    area.width.saturating_sub(SIDEBAR_WIDTH + 1),
+                    area.height.saturating_sub(1),
+                );
+                let panel_area = if content.width >= 120 {
+                    let panes = Layout::horizontal([
+                        Constraint::Percentage(35),
+                        Constraint::Percentage(65),
+                    ])
+                    .split(content);
+                    f.render_widget(ratatui::widgets::Clear, panes[0]);
+                    render_table_with_data(
+                        f,
+                        panes[0],
+                        objects,
+                        &active_kind,
+                        snapshot.table.clone(),
+                        &mut view,
+                        &mut hits,
+                    );
+                    panes[1]
+                } else {
+                    content
+                };
+                panel.render(f, panel_area);
+            }
         })?;
     }
 
@@ -2214,6 +2338,32 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // mouse capture / leave alternate screen / disable raw mode sequence the
     // old `ratatui::restore()` path performed. Normal exit and panic exit now
     // share one restoration implementation, so neither can drift from the other.
+    Ok(())
+}
+
+fn copy_text(text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("pbcopy");
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let mut c = std::process::Command::new("xclip");
+        c.args(["-selection", "clipboard"]);
+        c
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("clipboard unavailable"))?
+        .write_all(text.as_bytes())?;
+    if !child.wait()?.success() {
+        anyhow::bail!("clipboard command failed");
+    }
     Ok(())
 }
 
