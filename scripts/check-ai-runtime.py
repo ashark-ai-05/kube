@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check a packaged CPU runtime before compiling; report startup logs on failure."""
+"""Check a packaged CPU runtime; report startup logs on failure."""
 import argparse
 import os
 import pathlib

@@ -29,7 +29,7 @@ The drawer displays the current cluster, namespace, selected resource and propos
 
 ## Runtime and validation
 
-Only the typed query and fixed action specification reach the worker. No kubeconfig, credentials, pod contents or logs are sent. The worker uses authenticated loopback HTTP, two CPU threads, no GPU offloading, a 4,096-token context, bounded JSON output, and a 60-second overall deadline. It starts on demand and exits after every request or cancellation; idle model memory is not retained. Cold requests take several seconds and are slower than the deterministic path. Inference runs outside the UI loop.
+Only the typed query and fixed action specification reach the worker. No kubeconfig, credentials, pod contents or logs are sent. The worker uses authenticated loopback HTTP, two CPU threads, no GPU offloading, a 4,096-token context, bounded JSON output, and a 90-second overall deadline. It starts on demand and exits after every request or cancellation; idle model memory is not retained. Local cold requests took roughly 8–13 seconds during evaluation; a hosted Mac needed 31 seconds for its first runtime startup alone, so slower hosts can take substantially longer. Inference runs outside the UI loop and Esc cancels immediately.
 
 A constrained JSON grammar produces the closed Rust action type. Validation rejects unknown/duplicate arguments, invented scopes, missing explicit namespaces, unsupported conditions, named inspection targets and compound actions. These checks reduce mistakes; they do not prove semantic correctness. Model proposals remain **experimental** and always require a visible preview. No claim of broad or production-level NLP accuracy is made.
 

@@ -33,7 +33,9 @@ impl Bundle {
     }
     pub async fn infer(&self, query: &str) -> Result<Intent, String> {
         super::check_query(query)?;
-        tokio::time::timeout(Duration::from_secs(60), self.infer_inner(query))
+        // A fresh hosted Mac needed 31 s for runtime startup alone, and 29 s
+        // for a subsequent full request. Leave room for both on a cold install.
+        tokio::time::timeout(Duration::from_secs(90), self.infer_inner(query))
             .await
             .map_err(|_| "Local model timed out. Rephrase or use Commands.".to_string())?
     }

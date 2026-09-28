@@ -32,11 +32,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Check packaged CPU runtime
+      - name: Prepare optional AI assets
         if: inputs.include_ai
         run: |
           python3 scripts/package-ai.py package --platform '${{ matrix.ai_platform }}'
-          python3 scripts/check-ai-runtime.py package/ai
       - run: cargo test --locked
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
@@ -50,6 +49,7 @@ jobs:
         if: inputs.include_ai
         run: |
           KUBE_AI_DIR="$PWD/package/ai" cargo test --locked --test assistant_local -- --ignored
+          python3 scripts/check-ai-runtime.py package/ai
           cargo run --locked --example assistant-eval
           tar -czf kube-ai-${{ matrix.target }}.tar.gz -C package .
           shasum -a 256 kube-ai-${{ matrix.target }}.tar.gz > kube-ai-${{ matrix.target }}.sha256
