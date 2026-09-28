@@ -104,7 +104,7 @@ try:
         resize(150, 40)
         process = subprocess.Popen([binary, '--kubeconfig', str(selected_file), '--context', chosen['name'], '-n', 'demo'],
                                    stdin=slave, stdout=slave, stderr=slave, env=env)
-        expect('Fleet radar', 30)
+        expect('Pod monitor', 30)
         assert 'RESTARTS' not in text(), 'Dashboard must clear underlying table'
         capture('fleet-radar')
         send('\x1bOR')

@@ -15,19 +15,23 @@ Uses `KUBECONFIG` or `~/.kube/config` by default. `--kubeconfig PATH` overrides 
 
 ## Workspace
 
-Fleet radar opens with readiness counts, a pod attention queue and namespace signals for the selected scope. Counts come from the current watch; it does not query every cluster. Running pods without readiness evidence are shown as unknown.
+Pod monitor opens with a flat pod table and a detail dock for the selected pod. Counts come from the current watch in the selected scope; running pods without readiness evidence are shown as unknown.
 
-`F2` opens Fleet radar. `F3` opens Focus studio, the resource browser. The compact rail contains common workloads and recent investigations; `Ctrl-R` or **All resources** opens the full discovered API catalog, including CRDs. `Tab` moves between the rail, resource list and inspector. The inspector adds readiness and owner context with direct Events, Logs and Related tabs. Cluster and namespace selectors stay visible throughout. Tables hide the API’s optional wide columns on smaller terminals to leave more room for resource names.
+`F2` opens Pod monitor. `F3` opens Focus studio, the resource browser. The compact rail contains common workloads and recent investigations; `Ctrl-R` or **All resources** opens the full discovered API catalog, including CRDs. `Tab` moves between the rail, resource list and inspector. The inspector adds readiness and owner context with direct Events, Logs and Related tabs. Cluster and namespace selectors stay visible throughout. Tables hide the API’s optional wide columns on smaller terminals to leave more room for resource names.
 
 ![Focus studio with wrapped and folded logs](docs/images/focus-studio.png)
 
-## Pod groups and live dashboard
+## Pod monitor
 
-Fleet radar (`F2`) groups pods by `app.kubernetes.io/name`, then `app`, then their controller owner. Pods without those fields appear as Ungrouped. Namespaces remain separate. Each group shows readiness, restarts, node count and measured CPU/memory. Select with arrows and Enter, or click a group, to browse only its pods; Esc returns to the dashboard. `g` focuses groups, `a` focuses the attention queue, and `F3` returns to the full resource list. The selected group's grouping source and node names appear below the cards.
+`F2` shows individual pods with readiness, status, restarts, age, CPU, memory and node. There is no pod grouping. Arrow keys or a click select a pod; Enter inspects it and `l` opens its logs. `s` chooses a column and direction; clickable headers toggle sorting. Selection follows the pod's namespace, name and UID when rows reorder.
 
-CPU and memory charts use the current namespace scope and refresh every five seconds while the dashboard is visible. They keep up to 60 local samples; switching namespace or cluster clears history and cancels old requests. Install metrics-server and grant list access to `pods.metrics.k8s.io` to see usage. Missing, denied or stale measurements are labelled unavailable; partial coverage shows the measured pod count. These charts are session history, not Prometheus or historical monitoring. Inspect an individual pod's Metrics tab for its container usage.
+The top filters show All (`0`), Not ready (`1`), Restarts (`2`) and memory usage at least 80% of limit (`3`). `/` searches names and labels. `0` clears both the health filter and search. Missing metrics or limits never count as high memory.
 
-Override grouping with `kube --groups /path/to/groups.yaml`, or save a file at `$XDG_CONFIG_HOME/kube/groups.yaml` (normally `~/.config/kube/groups.yaml`). See [examples/pod-groups.yaml](examples/pod-groups.yaml). Rules support namespace, Kubernetes label selectors, name prefixes and regexes. All conditions within a rule must match; the first matching rule wins, followed by the default labels/owner fallback. Files are validated before entering the terminal UI.
+The detail dock shows owner, node, age, last restart, termination reason, CPU/memory requests and limits, and trends for the selected pod. `D` hides/shows the dock. `d` switches to container usage, uptime, readiness, images and configured liveness/readiness/startup probes. Probe configuration is not a live liveness measurement; recent Kubernetes warning events show observed failures. Enter opens the full inspector and event history.
+
+Usage refreshes every five seconds while the monitor is visible and retains up to 60 session samples. Selecting a different pod or switching namespace/cluster clears its history and cancels old event requests. Metrics-server and read access to `pods.metrics.k8s.io` are required for consumption data. Missing, denied or stale measurements display as unavailable; gaps are not fabricated as zero. Memory percentages use the pod-level limit when set, otherwise the sum of application and restartable-sidecar limits; incomplete limits display as unknown. Request/limit totals exclude one-shot init containers. Charts show local session history, not historical monitoring.
+
+![Flat pod monitor with selected-pod metrics](docs/images/pod-monitor.png)
 
 ## Investigate
 
@@ -43,8 +47,9 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 
 | Key | Action |
 | --- | --- |
-| `F2` / `F3` | Fleet radar / Focus studio |
-| `g` / `a` on Fleet radar | Focus pod groups / attention queue |
+| `F2` / `F3` | Pod monitor / Focus studio |
+| `0`–`3` on Pod monitor | All / not ready / restarts / high memory |
+| `d` / `D` on Pod monitor | Container/probe details / hide or show dock |
 | `Ctrl-R` / All resources | Toggle the complete API resource catalog |
 | `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |

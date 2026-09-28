@@ -36,10 +36,9 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
-          mkdir -p package/examples
+          mkdir -p package
           cp target/${{ matrix.target }}/release/kube package/kube
           cp README.md package/README.md
-          cp examples/pod-groups.yaml package/examples/
           tar -czf kube-${{ matrix.target }}.tar.gz -C package .
           shasum -a 256 kube-${{ matrix.target }}.tar.gz > kube-${{ matrix.target }}.sha256
       - name: Package optional AI edition

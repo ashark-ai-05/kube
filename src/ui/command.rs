@@ -9,7 +9,7 @@ use ratatui::{
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("ask", "Ask Kube using natural language"),
-    ("home", "Fleet radar: pod health in the current scope"),
+    ("home", "Pod monitor: pod health in the current scope"),
     ("browse", "Focus studio: browse current resources"),
     ("resources", "Toggle the complete API resource catalog"),
     ("kind Pod", "Browse pods"),

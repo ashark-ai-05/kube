@@ -1355,7 +1355,6 @@ pub async fn run() -> anyhow::Result<()> {
                 "      --context <name>          Start with this context; switch using the top bar"
             );
             println!("  -h, --help                    Show this help message");
-            println!("      --groups <file>           Custom pod grouping YAML");
             std::process::exit(0);
         }
         CliOutcome::Error(msg) => {
@@ -1373,7 +1372,6 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> anyhow::Result<()> {
     // First: a panic anywhere below must still leave the terminal usable.
     install_panic_hook();
-    let group_config = crate::dashboard::groups::GroupConfig::load(source.groups.as_deref())?;
 
     // Corporate kubeconfigs are routinely split across several files joined by
     // KUBECONFIG; `cluster::connect()` only ever reads the default location, so
@@ -1567,7 +1565,6 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     let mut pane = DetailPane::new();
     pane.catalog = false;
     let mut workspace = crate::ui::workspace::Workspace::default();
-    workspace.dashboard.config = group_config;
     let mut workspace_store = None;
     pane.sidebar_width = preferences.sidebar;
     if !preferences.mouse {
@@ -1793,18 +1790,12 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
         }
         let mut snapshot = store_snapshot(&store, &active_kind, &kinds).await;
         needs_redraw |= workspace.dashboard.metrics.drain();
-        if !filter_text.is_empty()
-            || (active_kind.kind == "Pod" && workspace.dashboard.active_group.is_some())
-        {
-            snapshot.objects.retain(|obj| {
-                matches_resource(&filter_text, obj)
-                    && (active_kind.kind != "Pod"
-                        || workspace
-                            .dashboard
-                            .active_group
-                            .as_ref()
-                            .is_none_or(|key| workspace.dashboard.config.key(obj) == *key))
-            });
+        needs_redraw |= workspace.dashboard.events.drain();
+        workspace.dashboard.search = filter_text.clone();
+        if !filter_text.is_empty() && !workspace.home {
+            snapshot
+                .objects
+                .retain(|obj| matches_resource(&filter_text, obj));
             let visible: HashSet<_> = snapshot
                 .objects
                 .iter()
@@ -2028,7 +2019,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                                 detail = None;
                                 workspace.home = false;
                                 pane_focus = Focus::Table;
-                                workspace.dashboard.active_group = None;
+                                workspace
+                                    .dashboard
+                                    .set_filter(crate::dashboard::pod::Filter::All);
                                 operations.notice = "Applied read-only navigation".into();
                             } else {
                                 operations.notice =
@@ -2215,13 +2208,6 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 match key.code {
                     KeyCode::F(2) if !overlay.is_open() => command = Some("home".into()),
                     KeyCode::F(3) if !overlay.is_open() => command = Some("browse".into()),
-                    KeyCode::Esc
-                        if inspector.is_none()
-                            && !overlay.is_open()
-                            && workspace.dashboard.active_group.is_some() =>
-                    {
-                        command = Some("home".into())
-                    }
                     KeyCode::Char(':')
                         if !overlay.is_open()
                             && !inspector.as_ref().is_some_and(|p| p.editing()) =>
@@ -2239,7 +2225,6 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         continue;
                     }
                     KeyCode::Char('/') if inspector.is_none() && !overlay.is_open() => {
-                        workspace.home = false;
                         filter_edit = Some(filter_text.clone());
                         needs_redraw = true;
                         continue;
@@ -2270,6 +2255,22 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             if let Event::Mouse(mouse) = input {
                 use crossterm::event::{MouseButton, MouseEventKind};
                 match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if workspace.home
+                            && inspector.is_none()
+                            && !overlay.is_open()
+                            && mouse.column > pane.sidebar_width =>
+                    {
+                        workspace.dashboard.move_selection(
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                -3
+                            } else {
+                                3
+                            },
+                        );
+                        needs_redraw = true;
+                        continue;
+                    }
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse.row < HEADER_HEIGHT && !overlay.is_open() =>
                     {
@@ -2352,67 +2353,56 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             continue;
                         }
                     } else if workspace.home && inspector.is_none() {
-                        let issues: Vec<_> = objects
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, o)| {
-                                crate::ui::workspace::health(o)
-                                    == crate::ui::workspace::Health::Attention
-                            })
-                            .collect();
+                        use crate::dashboard::pod::Filter;
                         match k.code {
-                            KeyCode::Char('g') => {
-                                workspace.dashboard.issues_focus = false;
-                                needs_redraw = true;
-                                continue;
-                            }
-                            KeyCode::Char('a') => {
-                                workspace.dashboard.issues_focus = true;
-                                needs_redraw = true;
-                                continue;
-                            }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                if workspace.dashboard.issues_focus {
-                                    workspace.issue =
-                                        (workspace.issue + 1).min(issues.len().saturating_sub(1));
-                                } else {
-                                    workspace.dashboard.selected = (workspace.dashboard.selected
-                                        + 1)
-                                    .min(workspace.dashboard.groups.len().saturating_sub(1));
-                                }
+                                workspace.dashboard.move_selection(1)
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                if workspace.dashboard.issues_focus {
-                                    workspace.issue = workspace.issue.saturating_sub(1);
-                                } else {
-                                    workspace.dashboard.selected =
-                                        workspace.dashboard.selected.saturating_sub(1);
-                                }
+                                workspace.dashboard.move_selection(-1)
                             }
-                            KeyCode::Enter => {
-                                command = if !workspace.dashboard.issues_focus {
-                                    workspace
-                                        .dashboard
-                                        .groups
-                                        .get(workspace.dashboard.selected)
-                                        .map(|_| format!("group {}", workspace.dashboard.selected))
-                                } else {
-                                    issues
-                                        .get(workspace.issue)
-                                        .map(|(i, _)| format!("inspect {i}"))
-                                };
+                            KeyCode::PageDown => workspace
+                                .dashboard
+                                .move_selection(workspace.dashboard.list_height as isize),
+                            KeyCode::PageUp => workspace
+                                .dashboard
+                                .move_selection(-(workspace.dashboard.list_height as isize)),
+                            KeyCode::Home => workspace
+                                .dashboard
+                                .move_selection(-(workspace.dashboard.selected as isize)),
+                            KeyCode::End => workspace
+                                .dashboard
+                                .move_selection(workspace.dashboard.rows.len() as isize),
+                            KeyCode::Char('0') => {
+                                workspace.dashboard.set_filter(Filter::All);
+                                filter_text.clear();
                             }
-                            KeyCode::Char('/') => {
-                                workspace.home = false;
-                                filter_edit = Some(filter_text.clone());
+                            KeyCode::Char('1') => workspace.dashboard.set_filter(Filter::NotReady),
+                            KeyCode::Char('2') => workspace.dashboard.set_filter(Filter::Restarts),
+                            KeyCode::Char('3') => {
+                                workspace.dashboard.set_filter(Filter::HighMemory)
                             }
+                            KeyCode::Char('D') => {
+                                workspace.dashboard.details = !workspace.dashboard.details
+                            }
+                            KeyCode::Char('d') => {
+                                workspace.dashboard.containers = !workspace.dashboard.containers
+                            }
+                            KeyCode::Enter => command = Some("overview".into()),
+                            KeyCode::Char('l') => command = Some("logs".into()),
+                            KeyCode::Char('r') => command = Some("related".into()),
                             _ => {}
                         }
                         if matches!(
                             k.code,
-                            KeyCode::Down | KeyCode::Up | KeyCode::Char('j' | 'k') | KeyCode::Enter
-                        ) && command.is_none()
-                        {
+                            KeyCode::Down
+                                | KeyCode::Up
+                                | KeyCode::PageDown
+                                | KeyCode::PageUp
+                                | KeyCode::Home
+                                | KeyCode::End
+                                | KeyCode::Char('j' | 'k' | '0' | '1' | '2' | '3' | 'd' | 'D')
+                        ) {
                             needs_redraw = true;
                             continue;
                         }
@@ -2420,25 +2410,38 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 }
             }
             if let Some(command) = command {
-                let selected = inspector.as_ref().map(|p| p.object.clone()).or_else(|| {
-                    selected_object(
-                        objects,
-                        &active_kind,
-                        snapshot.table.as_ref(),
-                        view.sort.as_ref(),
-                        view.selected,
-                    )
-                    .and_then(|(ns, name)| {
-                        find_object(objects, ns.as_deref(), &name).map(|o| (**o).clone())
+                let selected = inspector
+                    .as_ref()
+                    .map(|p| p.object.clone())
+                    .or_else(|| {
+                        workspace
+                            .home
+                            .then(|| workspace.dashboard.selected_pod().map(|p| (**p).clone()))
+                            .flatten()
                     })
-                });
+                    .or_else(|| {
+                        if workspace.home {
+                            return None;
+                        }
+
+                        selected_object(
+                            objects,
+                            &active_kind,
+                            snapshot.table.as_ref(),
+                            view.sort.as_ref(),
+                            view.selected,
+                        )
+                        .and_then(|(ns, name)| {
+                            find_object(objects, ns.as_deref(), &name).map(|o| (**o).clone())
+                        })
+                    });
                 let words: Vec<_> = command.split_whitespace().collect();
                 match words.first().copied().unwrap_or("") {
                     "home" | "browse" | "kind" => {
-                        if workspace.dashboard.active_group.is_some() {
-                            operations.notice.clear();
-                        }
-                        workspace.dashboard.active_group = None;
+                        operations.notice.clear();
+                        workspace
+                            .dashboard
+                            .set_filter(crate::dashboard::pod::Filter::All);
                         let desired = if words[0] == "home" {
                             "Pod"
                         } else if words[0] == "kind" {
@@ -2478,26 +2481,30 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             panel.focused = false;
                         }
                     }
-                    "focus-groups" => workspace.dashboard.issues_focus = false,
-                    "focus-issues" => workspace.dashboard.issues_focus = true,
-                    "group" => {
-                        if let Some(group) = words
+                    "pod-filter" => {
+                        if let Some(filter) = words
                             .get(1)
-                            .and_then(|i| i.parse::<usize>().ok())
-                            .and_then(|i| workspace.dashboard.groups.get(i))
+                            .and_then(|v| crate::dashboard::pod::Filter::parse(v))
                         {
-                            workspace.dashboard.active_group = Some(group.key.clone());
-                            operations.notice =
-                                format!("Group: {} · Esc back to dashboard", group.key.name);
-                            let kind = crate::app::session::default_kind();
-                            session.lock().await.active_kind = kind.clone();
-                            active_kind_now = kind;
-                            workspace.home = false;
-                            filter_text.clear();
-                            view.selected = 0;
-                            view.offset = 0;
-                            view.sort = None;
-                            reset_selection = true;
+                            workspace.dashboard.set_filter(filter);
+                            pane_focus = Focus::Table;
+                        }
+                    }
+                    "pod-sort" => {
+                        if let Some(sort) = words
+                            .get(1)
+                            .and_then(|v| crate::dashboard::pod::Sort::parse(v))
+                        {
+                            let descending =
+                                workspace.dashboard.sort == sort && !workspace.dashboard.descending;
+                            workspace.dashboard.set_sort(sort, descending);
+                        }
+                    }
+                    "pod-select" => {
+                        if let Some(index) = words.get(1).and_then(|v| v.parse::<usize>().ok()) {
+                            workspace.dashboard.move_selection(
+                                index as isize - workspace.dashboard.selected as isize,
+                            );
                             pane_focus = Focus::Table;
                         }
                     }
@@ -2535,30 +2542,38 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             StoreId::of(&store),
                             &context_name,
                             scope,
-                            if workspace.home && inspector.is_none() {
-                                None
-                            } else {
-                                selected
-                            },
+                            selected,
                             command.strip_prefix("ask").unwrap_or("").trim(),
                         );
                     }
                     "help" => palette.help = true,
                     "sort" => {
                         inspector = None;
-                        workspace.home = false;
                         filter_edit = None;
-                        overlay = Overlay::SortPicker(crate::ui::views::table::sort_picker(
-                            &crate::ui::views::table::column_names(
+                        let headers = if workspace.home {
+                            crate::dashboard::pod::Sort::ALL
+                                .iter()
+                                .map(|s| s.label().to_string())
+                                .collect()
+                        } else {
+                            crate::ui::views::table::column_names(
                                 &active_kind,
                                 snapshot.table.as_ref(),
-                            ),
-                        ));
+                            )
+                        };
+                        let mut picker = crate::ui::views::table::sort_picker(&headers);
+                        if workspace.home {
+                            picker.items.remove(0);
+                            picker.title = "Sort pods".into();
+                        }
+                        overlay = Overlay::SortPicker(picker);
                     }
                     "palette" => palette.start(),
                     "filter" => filter_edit = Some(filter_text.clone()),
                     "clear" => {
-                        workspace.dashboard.active_group = None;
+                        workspace
+                            .dashboard
+                            .set_filter(crate::dashboard::pod::Filter::All);
                         filter_text.clear();
                         view.selected = 0;
                         reset_selection = true;
@@ -2869,7 +2884,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 // expand a group, or make a kind active — so one arm serves
                 // both and they cannot drift apart.
                 Action::SelectTreeRow(_) | Action::ActivateTreeRow => {
-                    workspace.dashboard.active_group = None;
+                    workspace
+                        .dashboard
+                        .set_filter(crate::dashboard::pod::Filter::All);
                     if let Action::SelectTreeRow(i) = action {
                         tree.selected = i;
                         pane_focus = Focus::Sidebar;
@@ -3036,14 +3053,22 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     match resolve_confirm(&overlay, confirm_index) {
                         PickerOutcome::NoOp => {}
                         PickerOutcome::SortChosen(label) => {
-                            let headers = crate::ui::views::table::column_names(
-                                &active_kind,
-                                snapshot.table.as_ref(),
-                            );
-                            view.sort = crate::ui::views::table::sort_choice(&label, &headers);
-                            view.selected = 0;
-                            view.offset = 0;
-                            reset_selection = true;
+                            if workspace.home {
+                                if let Some((name, direction)) = label.rsplit_once(' ')
+                                    && let Some(sort) = crate::dashboard::pod::Sort::parse(name)
+                                {
+                                    workspace.dashboard.set_sort(sort, direction == "↓");
+                                }
+                            } else {
+                                let headers = crate::ui::views::table::column_names(
+                                    &active_kind,
+                                    snapshot.table.as_ref(),
+                                );
+                                view.sort = crate::ui::views::table::sort_choice(&label, &headers);
+                                view.selected = 0;
+                                view.offset = 0;
+                                reset_selection = true;
+                            }
                             overlay = Overlay::None;
                             operations.notice = format!("Sorted: {label} · s change sort");
                             needs_redraw = true;
@@ -3208,13 +3233,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         } else {
                             theme::border_style()
                         })
-                        .title(match &workspace.dashboard.active_group {
-                            Some(group) => format!(
-                                " {} · {} / {} ",
-                                active_kind.kind, group.namespace, group.name
-                            ),
-                            None => format!(" {} ", active_kind.kind),
-                        })
+                        .title(format!(" {} ", active_kind.kind))
                         .title_bottom(ratatui::text::Line::styled(
                             " Enter inspect · l logs · / filter · s sort ",
                             theme::muted_style(),
@@ -3309,6 +3328,13 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             assistant.render(f);
             operations.render(f);
         })?;
+        let event_target = (workspace.home && inspector.is_none() && connecting_name.is_none())
+            .then(|| workspace.dashboard.anchor.clone())
+            .flatten();
+        workspace
+            .dashboard
+            .events
+            .set_target(event_target, client.clone(), tx.clone());
     }
 
     if preferences_changed {

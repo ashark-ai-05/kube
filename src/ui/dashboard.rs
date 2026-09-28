@@ -1,10 +1,13 @@
 use crate::{
     app::event::WatchStatus,
-    dashboard::{GroupSummary, metrics::Usage},
+    dashboard::{
+        Dashboard,
+        pod::{self, Filter, Sort},
+    },
     ui::{
         log_view::ellipsis,
         theme,
-        workspace::{Health, Workspace, health, reason},
+        workspace::{Workspace, health, health_style},
     },
 };
 use kube::{ResourceExt, api::DynamicObject};
@@ -13,9 +16,9 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 pub fn render(
     f: &mut Frame,
@@ -30,390 +33,468 @@ pub fn render(
         area,
     );
     let inner = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
     );
-    let compact = inner.height < 25;
-    let rows = Layout::vertical([
+    let dashboard = &mut workspace.dashboard;
+    let counts = dashboard.refresh(objects);
+    let compact = inner.height < 28;
+    let sections = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(2),
-        Constraint::Length(if compact { 2 } else { 3 }),
-        Constraint::Length(if compact { 3 } else { 5 }),
-        Constraint::Fill(1),
-        Constraint::Length(if compact { 2 } else { 3 }),
+        Constraint::Min(4),
+        Constraint::Length(if !dashboard.details {
+            0
+        } else if compact {
+            7
+        } else {
+            11
+        }),
+        Constraint::Length(1),
     ])
-    .spacing(if compact { 0 } else { 1 })
+    .spacing(1)
     .split(inner);
-    let dash = &mut workspace.dashboard;
-    let previous = dash.groups.get(dash.selected).map(|g| g.key.clone());
-    let mut groups = BTreeMap::new();
-    let mut counts = [0usize; 4];
-    let mut issues = vec![];
-    let mut total = Usage::default();
-    let mut measured = 0;
-    for (index, pod) in objects.iter().enumerate() {
-        let value = health(pod);
-        counts[match value {
-            Health::Ready => 0,
-            Health::Attention => 1,
-            Health::Completed => 2,
-            Health::Unknown => 3,
-        }] += 1;
-        if value == Health::Attention {
-            issues.push((index, pod));
-        }
-        let key = dash.config.key(pod);
-        let group = groups
-            .entry(key.clone())
-            .or_insert_with(|| GroupSummary::new(key));
-        group.pods += 1;
-        group.ready += usize::from(value == Health::Ready);
-        group.issues += usize::from(value == Health::Attention);
-        for field in ["containerStatuses", "initContainerStatuses"] {
-            if let Some(containers) = pod.data["status"][field].as_array() {
-                group.restarts = group.restarts.saturating_add(
-                    containers
-                        .iter()
-                        .filter_map(|c| c["restartCount"].as_u64())
-                        .fold(0u64, u64::saturating_add),
-                );
-            }
-        }
-        if let Some(node) = pod.data["spec"]["nodeName"].as_str() {
-            group.nodes.insert(node.into());
-        }
-        if let Some(usage) = dash.metrics.usage(pod) {
-            group.usage.add(usage);
-            group.measured += 1;
-            total.add(usage);
-            measured += 1;
-        }
-    }
-    dash.groups = groups.into_values().collect();
-    dash.selected = previous
-        .and_then(|key| dash.groups.iter().position(|g| g.key == key))
-        .unwrap_or(dash.selected)
-        .min(dash.groups.len().saturating_sub(1));
-    if dash.sampled_revision != dash.metrics.revision {
-        dash.history.push_back((measured > 0).then_some(total));
-        while dash.history.len() > 60 {
-            dash.history.pop_front();
-        }
-        dash.sampled_revision = dash.metrics.revision;
-    }
+    let status_label = if status == WatchStatus::Synced {
+        "live"
+    } else {
+        "watch incomplete"
+    };
     f.render_widget(
-        Paragraph::new(vec![
-            Line::styled("Fleet radar", theme::header_style()),
-            Line::styled(
-                format!(
-                    "{} pod groups · {} · {}",
-                    dash.groups.len(),
-                    if dash.config.has_rules() {
-                        "config → labels → owner"
-                    } else {
-                        "app labels → workload owner"
-                    },
-                    if status == WatchStatus::Synced {
-                        "live watch"
-                    } else {
-                        "watch incomplete"
-                    }
-                ),
+        Paragraph::new(Line::from(vec![
+            Span::styled("POD MONITOR  ", theme::header_style()),
+            Span::styled(
+                format!("{} pods · {status_label}", objects.len()),
                 theme::muted_style(),
             ),
-        ]),
-        rows[0],
+        ])),
+        sections[0],
     );
-    let cards = Layout::horizontal([Constraint::Fill(1); 4])
+    let filters = [
+        Filter::All,
+        Filter::NotReady,
+        Filter::Restarts,
+        Filter::HighMemory,
+    ];
+    let tiles = Layout::horizontal([Constraint::Fill(1); 4])
         .spacing(1)
-        .split(rows[1]);
-    for (i, (label, color)) in [
-        ("READY", theme::TEAL),
-        ("ATTENTION", theme::CORAL),
-        ("COMPLETED", theme::MIST),
-        ("UNKNOWN", theme::AMBER),
-    ]
-    .iter()
-    .enumerate()
-    {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", counts[i]),
-                    Style::default().fg(*color).bold(),
-                ),
-                Span::styled(
-                    if cards[i].width < 15 && i == 1 {
-                        "ATTN"
-                    } else {
-                        *label
-                    },
-                    theme::muted_style(),
-                ),
-            ]))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(*color))
-                    .style(Style::default().bg(theme::ABYSS)),
-            ),
-            cards[i],
-        );
-    }
-    let charts = Layout::horizontal([Constraint::Fill(1); 2])
-        .spacing(2)
-        .split(rows[2]);
-    for (i, label) in ["CPU · millicores", "MEMORY · MiB"].iter().enumerate() {
-        let color = if i == 0 { theme::TEAL } else { theme::VIOLET };
-        let value = if measured == 0 {
-            "Unavailable".into()
-        } else if i == 0 {
-            format!("{:.1} mCPU", total.cpu_milli)
+        .split(sections[1]);
+    for (i, filter) in filters.iter().enumerate() {
+        let selected = dashboard.filter == *filter;
+        let label = if inner.width < 70 {
+            match filter {
+                Filter::NotReady => "Unready",
+                Filter::HighMemory => "Mem 80%",
+                _ => filter.label(),
+            }
         } else {
-            format!("{:.1} MiB", total.memory_bytes / 1048576.)
+            filter.label()
         };
-        let values: Vec<_> = dash
-            .history
-            .iter()
-            .map(|p| {
-                p.map(|u| {
-                    if i == 0 {
-                        u.cpu_milli
-                    } else {
-                        u.memory_bytes / 1048576.
-                    }
+        f.render_widget(
+            Paragraph::new(format!("{label} {}", counts[i]))
+                .style(if selected {
+                    theme::text_style().bg(theme::SURFACE)
+                } else {
+                    theme::muted_style()
                 })
-            })
-            .collect();
-        let note = if measured > 0 {
-            format!(
-                "{measured}/{} pods measured · recent samples",
-                objects.len()
-            )
-        } else {
-            dash.metrics
-                .error
-                .clone()
-                .unwrap_or_else(|| "Waiting for metrics-server samples…".into())
-        };
-        let mut lines = vec![Line::styled(
-            format!(" {value}"),
-            Style::default().fg(color).bold(),
-        )];
-        if charts[i].height >= 4 {
-            lines.push(Line::styled(
-                trend(&values, charts[i].width.saturating_sub(2) as usize),
-                Style::default().fg(color),
-            ));
-        }
-        lines.push(Line::styled(
-            format!(
-                " {}",
-                ellipsis(&note, charts[i].width.saturating_sub(2) as usize)
-            ),
-            theme::muted_style(),
-        ));
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title(format!(" {label} "))
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(color))
-                    .style(Style::default().bg(theme::ABYSS)),
-            ),
-            charts[i],
-        );
-    }
-    let wide = rows[3].width >= 100;
-    let columns = Layout::horizontal(if wide {
-        vec![Constraint::Percentage(66), Constraint::Percentage(34)]
-    } else if dash.issues_focus {
-        vec![Constraint::Length(0), Constraint::Fill(1)]
-    } else {
-        vec![Constraint::Fill(1), Constraint::Length(0)]
-    })
-    .spacing(if wide { 2 } else { 0 })
-    .split(rows[3]);
-    if columns[0].width > 0 {
-        let mut lines = vec![Line::styled(
-            "POD GROUPS · g",
-            if !dash.issues_focus {
-                theme::label_style()
-            } else {
-                theme::muted_style()
-            },
-        )];
-        workspace.buttons.push((
-            Rect {
-                height: 1,
-                ..columns[0]
-            },
-            "focus-groups".into(),
-        ));
-        let count = (columns[0].height.saturating_sub(1) / 3).max(1) as usize;
-        let start = dash.selected.saturating_sub(count - 1);
-        for (i, g) in dash.groups.iter().enumerate().skip(start).take(count) {
-            let y = columns[0].y + lines.len() as u16;
-            let width = columns[0].width as usize;
-            let name = ellipsis(&g.key.name, width.saturating_sub(21));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} {name}",
-                        if i == dash.selected && !dash.issues_focus {
-                            "›"
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(if selected {
+                            theme::label_style()
                         } else {
-                            " "
+                            theme::border_style()
+                        }),
+                ),
+            tiles[i],
+        );
+        workspace
+            .buttons
+            .push((tiles[i], format!("pod-filter {}", filter.key())));
+    }
+    let wide = inner.width >= 100;
+    let medium = inner.width >= 70;
+    let mut headers = vec!["Name", "Ready", "Restarts", "Age", "CPU", "Memory"];
+    let mut widths = vec![
+        Constraint::Fill(3),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Length(9),
+        Constraint::Length(if medium { 17 } else { 10 }),
+    ];
+    if medium {
+        headers.push("Status");
+        widths.push(Constraint::Length(16));
+    }
+    if wide {
+        headers.push("Node");
+        widths.push(Constraint::Fill(1));
+    }
+    if !medium {
+        headers.remove(3);
+        widths.remove(3);
+        headers.remove(1);
+        widths.remove(1);
+    }
+    let cell_rects = Layout::horizontal(widths.clone()).spacing(1).split(Rect {
+        x: sections[2].x + 2,
+        width: sections[2].width.saturating_sub(2),
+        height: 1,
+        ..sections[2]
+    });
+    for (i, header) in headers.iter().enumerate() {
+        if Sort::parse(header).is_some() {
+            workspace
+                .buttons
+                .push((cell_rects[i], format!("pod-sort {header}")));
+        }
+    }
+    let head = Row::new(headers.iter().map(|header| {
+        Cell::from(format!(
+            "{}{}",
+            header,
+            if dashboard.sort.label() == *header {
+                if dashboard.descending { " ↓" } else { " ↑" }
+            } else {
+                ""
+            }
+        ))
+    }))
+    .style(theme::label_style())
+    .bottom_margin(1);
+    let visible = sections[2].height.saturating_sub(2).max(1) as usize;
+    dashboard.list_height = visible;
+    let start = dashboard.selected.saturating_sub(visible.saturating_sub(1));
+    let multi_namespace = objects.first().is_some_and(|first| {
+        objects
+            .iter()
+            .any(|p| p.metadata.namespace != first.metadata.namespace)
+    });
+    let rows: Vec<_> = dashboard
+        .rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, row)| {
+            let object = &row.object;
+            let name = if multi_namespace {
+                format!(
+                    "{}/{}",
+                    object.namespace().unwrap_or_default(),
+                    object.name_any()
+                )
+            } else {
+                object.name_any()
+            };
+            let mem = row
+                .usage
+                .map(|u| {
+                    format!(
+                        "{:.0}Mi{}",
+                        u.memory_bytes / 1048576.,
+                        if medium {
+                            row.budget
+                                .memory_percent(Some(u))
+                                .map(|p| format!(" {p:.0}%"))
+                                .unwrap_or_else(|| " / —".into())
+                        } else {
+                            String::new()
                         }
-                    ),
-                    if i == dash.selected && !dash.issues_focus {
-                        theme::text_style().bg(theme::SURFACE)
+                    )
+                })
+                .unwrap_or_else(|| "—".into());
+            let all = [
+                Cell::from(name).style(health_style(health(object))),
+                Cell::from(pod::ready(object)),
+                Cell::from(row.restarts.to_string()).style(if row.restarts > 0 {
+                    Style::default().fg(theme::AMBER)
+                } else {
+                    theme::muted_style()
+                }),
+                Cell::from(row.age.map(pod::duration).unwrap_or_else(|| "—".into())),
+                Cell::from(
+                    row.usage
+                        .map(|u| format!("{:.0}m", u.cpu_milli))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(mem).style(
+                    if row
+                        .budget
+                        .memory_percent(row.usage)
+                        .is_some_and(|n| n >= 80.)
+                    {
+                        Style::default().fg(theme::AMBER)
                     } else {
                         theme::text_style()
                     },
                 ),
-                Span::styled(
-                    format!("  {}/{} ready", g.ready, g.pods),
-                    if g.issues > 0 {
-                        Style::default().fg(theme::AMBER)
-                    } else {
-                        theme::label_style()
-                    },
+                Cell::from(pod::status(object)).style(health_style(health(object))),
+                Cell::from(
+                    object.data["spec"]["nodeName"]
+                        .as_str()
+                        .unwrap_or("Unscheduled")
+                        .to_string(),
                 ),
-            ]));
-            let usage = if g.measured == 0 {
-                "CPU — · RAM —".into()
+            ];
+            let indices: Vec<usize> = if wide {
+                (0..8).collect()
+            } else if medium {
+                (0..7).collect()
             } else {
-                format!(
-                    "{:.0}m · {:.0}MiB{}",
-                    g.usage.cpu_milli,
-                    g.usage.memory_bytes / 1048576.,
-                    if g.measured < g.pods { " partial" } else { "" }
-                )
+                vec![0, 2, 4, 5]
             };
-            lines.push(Line::styled(
-                ellipsis(
-                    &format!(
-                        "  {} · ↻ {} · {} nodes · {usage}",
-                        g.key.namespace,
-                        g.restarts,
-                        g.nodes.len()
-                    ),
-                    width,
-                ),
-                theme::muted_style(),
-            ));
-            lines.push(Line::from(""));
             workspace.buttons.push((
-                Rect::new(columns[0].x, y, columns[0].width, 2),
-                format!("group {i}"),
-            ));
-        }
-        if dash.groups.is_empty() {
-            lines.push(Line::styled(
-                "Waiting for pods in this scope…",
-                theme::muted_style(),
-            ));
-        }
-        f.render_widget(Paragraph::new(lines), columns[0]);
-    }
-    if columns[1].width > 0 {
-        workspace.issue = workspace.issue.min(issues.len().saturating_sub(1));
-        let mut lines = vec![Line::styled(
-            "ATTENTION · a",
-            if dash.issues_focus {
-                theme::label_style()
-            } else {
-                theme::muted_style()
-            },
-        )];
-        workspace.buttons.push((
-            Rect {
-                height: 1,
-                ..columns[1]
-            },
-            "focus-issues".into(),
-        ));
-        let count = (columns[1].height.saturating_sub(1) / 3).max(1) as usize;
-        let start = workspace.issue.saturating_sub(count - 1);
-        for (n, (index, pod)) in issues.iter().enumerate().skip(start).take(count) {
-            let y = columns[1].y + lines.len() as u16;
-            lines.push(Line::styled(
-                ellipsis(
-                    &format!(
-                        "{} {}",
-                        if n == workspace.issue && dash.issues_focus {
-                            "›"
-                        } else {
-                            " "
-                        },
-                        pod.name_any()
-                    ),
-                    columns[1].width as usize,
+                Rect::new(
+                    sections[2].x,
+                    sections[2].y + 2 + (i - start) as u16,
+                    sections[2].width,
+                    1,
                 ),
-                if n == workspace.issue && dash.issues_focus {
-                    theme::text_style().bg(theme::SURFACE)
-                } else {
-                    theme::text_style()
-                },
+                format!("pod-select {i}"),
             ));
-            lines.push(Line::styled(
-                ellipsis(&format!("  {}", reason(pod)), columns[1].width as usize),
-                Style::default().fg(theme::CORAL),
-            ));
-            lines.push(Line::from(""));
-            workspace.buttons.push((
-                Rect::new(columns[1].x, y, columns[1].width, 2),
-                format!("inspect {index}"),
-            ));
-        }
-        if issues.is_empty() {
-            lines.push(Line::styled(
-                if status == WatchStatus::Synced {
-                    "No pod issues observed"
-                } else {
-                    "Waiting for pod watch"
-                },
-                theme::muted_style(),
-            ));
-        }
-        f.render_widget(Paragraph::new(lines), columns[1]);
-    }
-    let metadata = dash
-        .groups
-        .get(dash.selected)
-        .map(|g| {
-            format!(
-                "Grouped by {} · nodes: {}",
-                g.key.origin,
-                if g.nodes.is_empty() {
-                    "unscheduled".into()
-                } else {
-                    g.nodes.iter().cloned().collect::<Vec<_>>().join(", ")
-                }
+            Row::new(
+                indices
+                    .into_iter()
+                    .map(|i| all[i].clone())
+                    .collect::<Vec<_>>(),
             )
         })
-        .unwrap_or_default();
+        .collect();
+    let mut table_state = TableState::default()
+        .with_selected((!dashboard.rows.is_empty()).then_some(dashboard.selected - start));
+    f.render_stateful_widget(
+        Table::new(rows, widths)
+            .header(head)
+            .column_spacing(1)
+            .row_highlight_style(theme::text_style().bg(theme::SURFACE))
+            .highlight_symbol("› "),
+        sections[2],
+        &mut table_state,
+    );
+    if dashboard.rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("No pods match this view · 0 resets filters")
+                .style(theme::muted_style()),
+            Rect {
+                y: sections[2].y + 2,
+                height: 1,
+                ..sections[2]
+            },
+        );
+    }
+    if dashboard.details {
+        render_detail(f, sections[3], dashboard);
+    }
+    f.render_widget(Paragraph::new(if compact{"↑↓ select · Enter inspect · l logs · s sort · d / D details"}else{"↑↓ select · Enter inspect · l logs · s sort · / search · d containers · D hide details · 0–3 filters"}).style(theme::muted_style()),sections[4]);
+}
+fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
+    let Some(row) = dashboard.rows.get(dashboard.selected) else {
+        return;
+    };
+    let object = &row.object;
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme::label_style())
+        .title(Line::styled(
+            format!(
+                " {} / {} · {} ",
+                object.namespace().unwrap_or_default(),
+                object.name_any(),
+                pod::status(object)
+            ),
+            theme::label_style(),
+        ));
+    let inside = block.inner(area);
+    f.render_widget(block, area);
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .split(inside);
+    let metadata = format!(
+        "{} · node {} · age {} · last restart {}",
+        pod::owner(object),
+        object.data["spec"]["nodeName"]
+            .as_str()
+            .unwrap_or("Unscheduled"),
+        row.age.map(pod::duration).unwrap_or_else(|| "—".into()),
+        pod::last_restart(object)
+            .map(|n| format!("{} ago", pod::duration(n)))
+            .unwrap_or_else(|| "—".into())
+    );
     f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                ellipsis(&metadata, rows[4].width as usize),
-                theme::muted_style(),
-            ),
-            Line::styled(
-                "g groups · a issues · ↑↓ choose · Enter open · F3 all pods",
-                theme::muted_style(),
-            ),
-            Line::styled(
-                "Metrics refresh every 5s here; up to 60 local samples.",
-                theme::muted_style(),
-            ),
-        ]),
-        rows[4],
+        Paragraph::new(ellipsis(&metadata, sections[0].width as usize)).style(theme::muted_style()),
+        sections[0],
+    );
+    if dashboard.containers {
+        render_containers(f, sections[1], dashboard, &row.object);
+    } else {
+        let columns = Layout::horizontal([Constraint::Fill(1); 2])
+            .spacing(2)
+            .split(sections[1]);
+        for (i, title) in ["CPU", "MEMORY"].iter().enumerate() {
+            let color = if i == 0 { theme::TEAL } else { theme::VIOLET };
+            let value = row
+                .usage
+                .map(|u| {
+                    if i == 0 {
+                        format!("{:.1} mCPU", u.cpu_milli)
+                    } else {
+                        format!("{:.1} MiB", u.memory_bytes / 1048576.)
+                    }
+                })
+                .unwrap_or_else(|| "Unavailable".into());
+            let budget = if i == 0 {
+                format!(
+                    "request {} · limit {}",
+                    cpu(row.budget.cpu_request),
+                    cpu(row.budget.cpu_limit)
+                )
+            } else {
+                format!(
+                    "request {} · limit {}",
+                    memory(row.budget.memory_request),
+                    memory(row.budget.memory_limit)
+                )
+            };
+            let mut lines = vec![
+                Line::from(vec![Span::styled(
+                    format!("{title}  {value}"),
+                    Style::default().fg(color).bold(),
+                )]),
+                Line::styled(
+                    ellipsis(&budget, columns[i].width as usize),
+                    theme::muted_style(),
+                ),
+            ];
+            if columns[i].height > 2 {
+                let values: Vec<_> = dashboard
+                    .history
+                    .iter()
+                    .map(|u| {
+                        u.map(|u| {
+                            if i == 0 {
+                                u.cpu_milli
+                            } else {
+                                u.memory_bytes / 1048576.
+                            }
+                        })
+                    })
+                    .collect();
+                lines.push(Line::styled(
+                    trend(&values, columns[i].width as usize),
+                    Style::default().fg(color),
+                ));
+            }
+            if columns[i].height > 3 {
+                lines.push(Line::styled(
+                    if row.usage.is_some() {
+                        "5s polling · selected-pod session samples".into()
+                    } else {
+                        dashboard
+                            .metrics
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Waiting for metrics-server samples".into())
+                    },
+                    theme::muted_style(),
+                ));
+            }
+            if columns[i].height > 4 {
+                let note = if i == 0 {
+                    format!("{} restarts · {} ready", row.restarts, pod::ready(object))
+                } else {
+                    let ended = pod::termination(object);
+                    if ended.is_empty() {
+                        "Memory % in table is usage / limit".into()
+                    } else {
+                        ended
+                    }
+                };
+                lines.push(Line::styled(
+                    ellipsis(&note, columns[i].width as usize),
+                    theme::muted_style(),
+                ));
+            }
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(theme::ABYSS)),
+                columns[i],
+            );
+        }
+    }
+    f.render_widget(
+        Paragraph::new(ellipsis(
+            &dashboard.events.note(),
+            sections[2].width as usize,
+        ))
+        .style(theme::muted_style()),
+        sections[2],
     );
 }
-
+fn render_containers(f: &mut Frame, area: Rect, dashboard: &Dashboard, object: &DynamicObject) {
+    let lines: Vec<_> = object.data["spec"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            object.data["spec"]["initContainers"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .flat_map(|c| {
+            let name = c["name"].as_str().unwrap_or("container");
+            let usage = dashboard.metrics.container(object, name);
+            let status = pod::statuses(object).find(|s| s["name"] == name);
+            let uptime = status
+                .and_then(|s| s["state"]["running"]["startedAt"].as_str())
+                .and_then(pod::since)
+                .map(pod::duration)
+                .unwrap_or_else(|| "—".into());
+            let probe = |key: &str| {
+                if c.get(key).is_some_and(|v| v.is_object()) {
+                    "set"
+                } else {
+                    "—"
+                }
+            };
+            let text = format!(
+                "{name} · {} · {} · uptime {uptime} · ready {}",
+                cpu(usage.map(|u| u.cpu_milli)),
+                memory(usage.map(|u| u.memory_bytes)),
+                if status.is_some_and(|s| s["ready"] == true) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            let detail = format!(
+                "  probes: live {} / ready {} / startup {} · {}",
+                probe("livenessProbe"),
+                probe("readinessProbe"),
+                probe("startupProbe"),
+                c["image"].as_str().unwrap_or("")
+            );
+            [
+                Line::styled(ellipsis(&text, area.width as usize), theme::text_style()),
+                Line::styled(ellipsis(&detail, area.width as usize), theme::muted_style()),
+            ]
+        })
+        .take(area.height as usize)
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+fn cpu(n: Option<f64>) -> String {
+    n.map(|n| format!("{n:.0}m")).unwrap_or_else(|| "—".into())
+}
+fn memory(n: Option<f64>) -> String {
+    n.map(|n| format!("{:.0}Mi", n / 1048576.))
+        .unwrap_or_else(|| "—".into())
+}
 fn trend(values: &[Option<f64>], width: usize) -> String {
     let values = &values[values.len().saturating_sub(width)..];
     let max = values
@@ -434,53 +515,69 @@ fn trend(values: &[Option<f64>], width: usize) -> String {
         })
         .collect()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn graph_gaps_are_distinct_from_real_zero_usage() {
-        assert_eq!(trend(&[Some(0.), None, Some(10.)], 10), "▁·█");
+    use ratatui::{Terminal, backend::TestBackend};
+    fn objects() -> Vec<Arc<DynamicObject>> {
+        ["web-a","web-b"].iter().map(|name| Arc::new(serde_json::from_value(serde_json::json!({
+            "apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"demo","uid":name},
+            "spec":{"nodeName":"worker","containers":[{"name":"app","image":"example:1","livenessProbe":{"httpGet":{"path":"/health","port":8080}},"readinessProbe":{"httpGet":{"path":"/ready","port":8080}}}]},
+            "status":{"phase":"Running","containerStatuses":[{"name":"app","ready":true,"restartCount":2}],"conditions":[{"type":"Ready","status":"True"}]}
+        })).unwrap())).collect()
     }
     #[test]
-    fn dashboard_exposes_group_metadata_and_handles_small_empty_terminals() {
-        use ratatui::{Terminal, backend::TestBackend};
-        let pod: DynamicObject = serde_json::from_value(serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"namespace":"demo","name":"api-1","labels":{"app":"api"}},"spec":{"nodeName":"worker-1"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"ready":true,"restartCount":12}]}})).unwrap();
-        let mut workspace = Workspace::default();
-        for (width, height) in [(150, 40), (80, 24), (30, 10), (1, 1)] {
+    fn responsive_flat_view_exposes_selection_probes_and_honest_metric_gaps() {
+        let objects = objects();
+        for (width, height) in [(150, 40), (80, 24), (48, 16)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut workspace = Workspace::default();
             terminal
-                .draw(|f| {
-                    render(
-                        f,
-                        f.area(),
-                        &[Arc::new(pod.clone())],
-                        WatchStatus::Synced,
-                        &mut workspace,
-                    )
-                })
+                .draw(|f| render(f, f.area(), &objects, WatchStatus::Synced, &mut workspace))
                 .unwrap();
-            assert_eq!(workspace.dashboard.groups[0].restarts, 12);
-            assert_eq!(workspace.dashboard.groups[0].nodes.len(), 1);
-            if width >= 80 {
-                let text = terminal
-                    .backend()
-                    .buffer()
-                    .content
-                    .iter()
-                    .map(|c| c.symbol())
-                    .collect::<String>();
-                assert!(text.contains("Unavailable"));
-                assert!(text.contains("worker-1"));
-                assert!(text.contains("app label"));
-                assert!(
-                    text.contains("1/1 ready"),
-                    "groups must remain visible at 80x24"
-                );
+            let snapshot = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(snapshot.contains("POD MONITOR"), "{width}x{height}");
+            assert!(snapshot.contains("web-a"));
+            assert!(!snapshot.contains("POD GROUPS"));
+            if height >= 24 {
+                assert!(snapshot.contains("Unavailable"));
             }
+            workspace.dashboard.containers = true;
             terminal
-                .draw(|f| render(f, f.area(), &[], WatchStatus::Synced, &mut workspace))
+                .draw(|f| render(f, f.area(), &objects, WatchStatus::Synced, &mut workspace))
                 .unwrap();
-            assert!(workspace.dashboard.groups.is_empty());
+            let snapshot = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            if width >= 80 && height >= 24 {
+                assert!(snapshot.contains("live set / ready set"));
+            }
+            assert_eq!(
+                workspace
+                    .dashboard
+                    .selected_pod()
+                    .unwrap()
+                    .metadata
+                    .name
+                    .as_deref(),
+                Some("web-a")
+            );
         }
+    }
+    #[test]
+    fn gaps_are_not_zero_measurements() {
+        assert_eq!(trend(&[Some(0.), None, Some(2.)], 3), "▁·█");
+        assert_eq!(trend(&[Some(1.), None], 1), "·");
     }
 }

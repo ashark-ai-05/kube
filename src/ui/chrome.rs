@@ -136,7 +136,7 @@ impl Header {
         self.buttons.push((cells[3], "help"));
         if area.height > 2 {
             let labels = [
-                (" F2 Fleet radar ", "home"),
+                (" F2 Pod monitor ", "home"),
                 (" F3 Focus studio ", "browse"),
                 (" ^R Resources ", "resources"),
                 (" ^Space Ask Kube ", "ask"),

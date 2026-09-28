@@ -113,7 +113,6 @@ pub struct Workspace {
     pub home: bool,
     pub catalog: bool,
     pub selected: usize,
-    pub issue: usize,
     pub recent: Vec<DynamicObject>,
     pub(crate) buttons: Vec<(Rect, String)>,
     pub dashboard: crate::dashboard::Dashboard,
@@ -125,7 +124,6 @@ impl Default for Workspace {
             home: true,
             catalog: false,
             selected: 0,
-            issue: 0,
             recent: vec![],
             buttons: vec![],
         }
@@ -180,7 +178,7 @@ impl Workspace {
             return;
         }
         let labels = [
-            "◈  Fleet radar",
+            "◈  Pod monitor",
             "▤  Pods",
             "▤  Deployments",
             "▤  StatefulSets",

@@ -18,6 +18,7 @@ impl Usage {
 pub struct PodUsage {
     pub usage: Usage,
     pub timestamp: DateTime<Utc>,
+    pub containers: BTreeMap<String, Usage>,
 }
 type Snapshot = BTreeMap<(String, String), PodUsage>;
 #[derive(Default)]
@@ -93,6 +94,14 @@ impl MetricsFeed {
         }
         changed
     }
+    pub fn container(&self, pod: &DynamicObject, name: &str) -> Option<Usage> {
+        self.usage(pod)?;
+        self.latest
+            .get(&(pod.namespace().unwrap_or_default(), pod.name_any()))?
+            .containers
+            .get(name)
+            .copied()
+    }
     pub fn usage(&self, pod: &DynamicObject) -> Option<Usage> {
         if self.latest.is_empty() {
             return None;
@@ -146,11 +155,25 @@ fn parse(value: &serde_json::Value) -> Result<Snapshot, String> {
                 return None;
             }
             let mut usage = Usage::default();
+            let mut by_container = BTreeMap::new();
             for container in containers {
-                usage.cpu_milli += quantity(container["usage"]["cpu"].as_str()?)? * 1000.;
-                usage.memory_bytes += quantity(container["usage"]["memory"].as_str()?)?;
+                let current = Usage {
+                    cpu_milli: quantity(container["usage"]["cpu"].as_str()?)? * 1000.,
+                    memory_bytes: quantity(container["usage"]["memory"].as_str()?)?,
+                };
+                usage.add(current);
+                if let Some(name) = container["name"].as_str() {
+                    by_container.insert(name.into(), current);
+                }
             }
-            Some((key, PodUsage { usage, timestamp }))
+            Some((
+                key,
+                PodUsage {
+                    usage,
+                    timestamp,
+                    containers: by_container,
+                },
+            ))
         })
         .collect())
 }
@@ -211,6 +234,7 @@ mod tests {
                     memory_bytes: 1024.,
                 },
                 timestamp: Utc::now(),
+                containers: BTreeMap::new(),
             },
         );
         assert_eq!(feed.usage(&pod).unwrap().cpu_milli, 7.);
@@ -246,6 +270,7 @@ mod tests {
             PodUsage {
                 usage: Usage::default(),
                 timestamp: Utc::now(),
+                containers: BTreeMap::new(),
             },
         );
         tx.send(Err("API 403".into())).await.unwrap();

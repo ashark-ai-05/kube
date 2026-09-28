@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix='kube-ask-') as temp:
     env.pop('NO_COLOR', None)
     process = subprocess.Popen([binary, '--kubeconfig', config, '-n', 'demo'], stdin=slave, stdout=slave, stderr=slave, env=env)
     try:
-        expect('Fleet radar')
+        expect('Pod monitor')
         send('\x1bOR')
         expect('web-')
         send('/web-\r')

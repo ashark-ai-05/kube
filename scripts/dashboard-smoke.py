@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real terminal grouping, live metrics and scope isolation on the owned kind fixture."""
+"""Real terminal flat pod navigation, live metrics and scope isolation on the owned kind fixture."""
 import codecs
 import fcntl
 import json
@@ -22,7 +22,7 @@ if not config or 'kind-kube-tui-' not in pathlib.Path(config).read_text():
     raise SystemExit('Use the dedicated kind-kube-tui-* kubeconfig for this test.')
 binary = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/kube').resolve())
 name = 'kube-dashboard-' + uuid.uuid4().hex[:6]
-fixture = {'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': 'demo', 'labels': {'app': name}}, 'spec': {'containers': [{'name': 'worker', 'image': 'nginx:alpine'}]}}
+fixture = {'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': 'demo', 'labels': {'app': name}}, 'spec': {'containers': [{'name': 'worker', 'image': 'nginx:alpine', 'resources': {'requests': {'cpu': '10m', 'memory': '16Mi'}, 'limits': {'cpu': '200m', 'memory': '128Mi'}}, 'readinessProbe': {'httpGet': {'path': '/', 'port': 80}}, 'livenessProbe': {'httpGet': {'path': '/', 'port': 80}}}]}}
 subprocess.run(['kubectl', 'create', '-f', '-'], input=json.dumps(fixture), text=True, check=True, stdout=subprocess.DEVNULL)
 master, slave = pty.openpty()
 before = termios.tcgetattr(slave)
@@ -75,69 +75,86 @@ def capture(label):
 
 try:
     with tempfile.TemporaryDirectory(prefix='kube-dashboard-') as temp:
-        groups = pathlib.Path(temp) / 'groups.yaml'
-        groups.write_text('version: 1\ngroups:\n- name: Web services\n  namespace: demo\n  selector:\n    matchLabels: {app: web}\n- name: Background workers\n  namespace: demo\n  selector:\n    matchLabels: {app: ' + name + '}\n')
         resize(150, 40)
         env = dict(os.environ, TERM='xterm-256color', XDG_CONFIG_HOME=temp)
         env.pop('NO_COLOR', None)
-        process = subprocess.Popen([binary, '--kubeconfig', config, '--groups', str(groups), '-n', 'demo'], stdin=slave, stdout=slave, stderr=slave, env=env)
-        expect('Fleet radar')
-        expect('Web services')
-        expect('Background workers')
-        expect('mCPU', 90)
-        expect('4/4 pods measured', 90)
-        pump(10.2)  # Multiple real samples, not a fabricated graph.
-        capture('fleet-radar')
-        # Alphabetical group order: background first; Enter must not show web pods.
-        send('\r')
-        expect('Pod · demo / Background workers')
+        process = subprocess.Popen([binary, '--kubeconfig', config, '-n', 'demo'], stdin=slave, stdout=slave, stderr=slave, env=env)
+        expect('POD MONITOR')
         expect(name)
-        assert 'web-' not in text(), text()
-        send('\x1b')
-        expect('Fleet radar')
-        row = next(i for i, line in enumerate(screen.display) if 'Web services' in line)
-        send(f'\x1b[<0;45;{row + 1}M\x1b[<0;45;{row + 1}m')
-        expect('Pod · demo / Web services')
         expect('web-')
-        assert name not in text(), text()
-        # Inspect then unwind, with repeated Esc staying in the application.
+        expect('mCPU', 90)
+        expect('limit 128Mi', 90)
+        assert 'POD GROUPS' not in text()
+        pump(10.2)
+        capture('pod-monitor')
+        send('d')
+        expect('live set / ready set')
+        expect('nginx:alpine')
+        capture('pod-containers')
+        send('d')
+        send('D')
+        assert 'request 10m' not in text()
+        send('D')
+        expect('request 10m')
+        # Sorting must preserve the same pod for inspection, even after the row moves.
+        send('s')
+        expect('Sort pods')
+        send('Memory')
+        send('\x1b[B\r')
+        expect('Sorted: Memory')
         send('\r')
         expect('Overview')
+        expect(name)
         send('\x1b')
-        expect('Pod · demo / Web services')
-        send('\x1b')
-        expect('Fleet radar')
+        expect('POD MONITOR')
         for _ in range(4):
             send('\x1b')
             assert process.poll() is None
-        resize(80, 24)
-        expect('Web services')
-        capture('fleet-small')
-        send('a')
-        expect('ATTENTION')
-        send('g')
-        expect('POD GROUPS')
-        resize(150, 40)
+        send('2')
+        expect('No pods match')
+        send('0')
+        expect(name)
+        send('/' + name + '\r')
+        expect(name)
+        assert 'web-' not in text(), text()
+        send('l')
+        expect('Logs')
+        expect(name)
+        send('\x1b')
+        expect('POD MONITOR')
+        send('0')
+        expect('web-')
+        # Click the actual pod row, then inspect that selection.
+        row = next(i for i,line in enumerate(screen.display) if 'web-' in line and 'Running' in line)
+        send(f'\x1b[<0;40;{row+1}M\x1b[<0;40;{row+1}m')
+        send('\r')
+        expect('Overview')
+        expect('Pod · demo/web-')
+        send('\x1b')
+        resize(80,24)
+        expect('POD MONITOR')
+        expect('web-')
+        capture('pod-small')
+        resize(150,40)
         send('\x0e')
         expect('Namespaces')
         send('kube-system\r')
         expect('coredns')
-        expect('mCPU')
-        assert 'Web services' not in text() and 'Background workers' not in text(), text()
-        capture('fleet-system')
+        expect('mCPU',90)
+        assert name not in text(),text()
+        capture('pod-system')
         send('\x0e')
         expect('Namespaces')
         send('demo\r')
-        expect('Web services')
-        send('\x1bOR')  # F3 clears grouping and returns the complete list.
         expect(name)
+        send('\x1bOR')
         expect('web-')
         send('q')
         process.wait(timeout=5)
         pump()
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == before
-        print('Dashboard: real metrics, custom groups, scoped drilldown, Esc, narrow layout and namespace reset passed.')
+        print('Pod monitor: real metrics, probes, sorting, selected-pod inspection/logs, filters, mouse, Esc, narrow layout and namespace reset passed.')
 finally:
     if process and process.poll() is None:
         process.kill()

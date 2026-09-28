@@ -71,6 +71,7 @@ fn main() {
                     memory_bytes: 1048576.,
                 },
                 timestamp: chrono::Utc::now(),
+                containers: std::collections::BTreeMap::new(),
             },
         );
     }
@@ -90,7 +91,7 @@ fn main() {
             .unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
-    report("10,000-pod Fleet radar", samples, 16.);
+    report("10,000-pod Pod monitor", samples, 16.);
     let mut logs = LogBuffer::default();
     let start = Instant::now();
     for i in 0..100_000 {

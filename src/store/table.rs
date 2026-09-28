@@ -195,7 +195,7 @@ impl SortState {
         }
     }
 }
-fn age_seconds(value: &str) -> Option<f64> {
+pub(crate) fn age_seconds(value: &str) -> Option<f64> {
     let mut total = 0f64;
     let mut start = 0;
     for (i, c) in value.char_indices() {
