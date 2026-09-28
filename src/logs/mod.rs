@@ -33,6 +33,7 @@ pub struct LogBuffer {
     max_bytes: usize,
     max_lines: usize,
     filter: Option<Regex>,
+    matching_added: u64,
     pub dropped: u64,
 }
 impl Default for LogBuffer {
@@ -51,6 +52,7 @@ impl LogBuffer {
             max_bytes,
             max_lines,
             filter: None,
+            matching_added: 0,
             dropped: 0,
         }
     }
@@ -66,6 +68,7 @@ impl LogBuffer {
         }
         line.text = safe_text(&line.text);
         if self.accepts(&line) {
+            self.matching_added += 1;
             self.matches.push_back(self.next);
         }
         self.next += 1;
@@ -108,6 +111,9 @@ impl LogBuffer {
     }
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub fn matching_added(&self) -> u64 {
+        self.matching_added
     }
     pub fn matched(&self) -> usize {
         self.matches.len()

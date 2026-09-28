@@ -219,7 +219,7 @@ impl Inspector {
             }
         }
         if let Some(stream) = &mut self.stream {
-            let before = self.logs.matched();
+            let before = self.logs.matching_added();
             for msg in stream.drain() {
                 changed = true;
                 match msg {
@@ -231,7 +231,7 @@ impl Inspector {
             if !self.follow {
                 self.scroll = self
                     .scroll
-                    .saturating_add(self.logs.matched().saturating_sub(before));
+                    .saturating_add(self.logs.matching_added().saturating_sub(before) as usize);
             }
         }
         changed

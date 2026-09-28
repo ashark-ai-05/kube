@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod discovery;
 pub mod namespaces;
+pub mod operations;
 pub mod redact;
 pub mod registry;
 pub mod related;

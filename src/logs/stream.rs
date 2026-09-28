@@ -105,7 +105,7 @@ impl StreamSession {
                                         if tasks.len()>=16 { sender.send(Message::Status("16 concurrent streams; select a container to narrow the view".into())).await;break; }
                                         sources.insert(key.clone());
                                         let sender=sender.clone();let client=client.clone();let options=options.clone();let ns=ns.clone();let name=name.clone();
-                                        tasks.spawn(async move { stream_one(client,&ns,&name,&container.name,&key.0,options,sender).await; key });
+                                        tasks.spawn(async move { stream_one(client,&ns,&name,&container.name,(&key.0,key.2),options,sender).await; key });
                                     }
                                 }
                                 let mut names:Vec<_>=containers.iter().cloned().collect();names.sort();sender.send(Message::Containers(names)).await;
@@ -147,7 +147,7 @@ async fn stream_one(
     ns: &str,
     pod: &str,
     container: &str,
-    expected_uid: &str,
+    expected: (&str, i32),
     options: Options,
     sender: Sender,
 ) {
@@ -159,7 +159,7 @@ async fn stream_one(
     let mut last_lines = std::collections::VecDeque::new();
     loop {
         match api.get(pod).await {
-            Ok(current) if current.uid().as_deref() != Some(expected_uid) => return,
+            Ok(current) if source_replaced(&current, expected.0, container, expected.1) => return,
             Err(kube::Error::Api(status)) if matches!(status.code, 403 | 404) => return,
             _ => {}
         }
@@ -168,7 +168,11 @@ async fn stream_one(
             follow: !options.previous,
             previous: options.previous,
             timestamps: true,
-            tail_lines: if since.is_none() { Some(1000) } else { None },
+            tail_lines: if since.is_none() && options.since_seconds.is_none() {
+                Some(1000)
+            } else {
+                None
+            },
             since_seconds: if since.is_none() {
                 options.since_seconds
             } else {
@@ -206,7 +210,10 @@ async fn stream_one(
                                     }
                                     since = Some(stamp);
                                     last_lines.push_back(text.clone());
-                                    if last_lines.len() > 256 {
+                                    while last_lines.len() > 256
+                                        || last_lines.iter().map(String::len).sum::<usize>()
+                                            > crate::logs::MAX_LINE_BYTES
+                                    {
                                         last_lines.pop_front();
                                     }
                                 }
@@ -266,8 +273,7 @@ async fn stream_one(
                     .await;
             }
             Err(e) => {
-                let permanent =
-                    matches!(&e,kube::Error::Api(s) if matches!(s.code,400|401|403|404));
+                let permanent = matches!(&e,kube::Error::Api(s) if matches!(s.code,401|403|404));
                 if !sender
                     .send(Message::Status(format!(
                         "{source}: {}",
@@ -284,5 +290,33 @@ async fn stream_one(
         }
         tokio::time::sleep(Duration::from_secs(retry)).await;
         retry = (retry * 2).min(30);
+    }
+}
+
+// A restarted container is a new stream, even when the Pod UID is unchanged.
+fn source_replaced(pod: &Pod, uid: &str, container: &str, restart: i32) -> bool {
+    pod.uid().as_deref() != Some(uid)
+        || pod.status.as_ref().is_some_and(|status| {
+            status
+                .container_statuses
+                .iter()
+                .flatten()
+                .chain(status.init_container_statuses.iter().flatten())
+                .any(|s| s.name == container && s.restart_count != restart)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn container_restart_or_replaced_pod_ends_old_stream() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata":{"uid":"pod-uid"},
+            "status":{"containerStatuses":[{"name":"app","restartCount":2,"ready":true,"image":"app","imageID":"sha256:abc"}]}
+        })).unwrap();
+        assert!(!source_replaced(&pod, "pod-uid", "app", 2));
+        assert!(source_replaced(&pod, "pod-uid", "app", 1));
+        assert!(source_replaced(&pod, "previous-uid", "app", 2));
     }
 }

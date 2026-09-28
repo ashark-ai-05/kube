@@ -32,6 +32,11 @@ use crate::ui::views::picker::{
 use crate::ui::views::sidebar::render_sidebar;
 use crate::ui::views::status::render_status;
 use crate::ui::views::table::{TableView, render_table_with_data};
+use crate::ui::{
+    command::{CommandBar, matches_resource},
+    operations::Operations,
+    preferences::Preferences,
+};
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
@@ -399,10 +404,6 @@ fn next_error(
     }
     error
 }
-
-/// How wide the kind tree is, in columns. Wide enough for `PersistentVolume`
-/// plus a count and the two-cell indent `render_sidebar` draws kinds with.
-const SIDEBAR_WIDTH: u16 = 28;
 
 /// How close together two clicks on the same row must be to count as a
 /// double-click. Crossterm reports only individual button presses — there is
@@ -854,13 +855,22 @@ fn render_frame(
     let (ribbon_area, rest) = split_ribbon(full);
     render_ribbon(f, ribbon_area, Some(args.context_name), hits);
 
-    let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(rest);
+    let content = ratatui::layout::Rect::new(
+        rest.x,
+        rest.y.saturating_add(1),
+        rest.width,
+        rest.height.saturating_sub(1),
+    );
+    let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(content);
     // The sidebar takes a fixed width and the table whatever is left. On a
     // terminal too narrow to hold both, `Layout` shrinks the sidebar rather
     // than overlapping them, and every view here already guards a zero-sized
     // area.
-    let body = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
-        .split(chunks[0]);
+    let body = Layout::horizontal([
+        Constraint::Length(pane.sidebar_width.min(full.width / 3)),
+        Constraint::Fill(1),
+    ])
+    .split(chunks[0]);
     render_sidebar(f, body[0], tree, hits, args.gvk);
     render_table_with_data(
         f,
@@ -1373,33 +1383,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         .push(supervise("watch", discovery_handle, tx.clone()));
 
     // Feed terminal input into the same channel so there is one wake source.
-    let input_handle = {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut events = crossterm::event::EventStream::new();
-            loop {
-                match events.next().await {
-                    Some(Ok(e)) => {
-                        if tx.send(AppEvent::Input(e)).is_err() {
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        // Without this the UI would stay alive accepting nothing,
-                        // and raw mode means there is no signal-based way out.
-                        let _ = tx.send(AppEvent::Error(format!("input stream failed: {e}")));
-                        let _ = tx.send(AppEvent::Quit);
-                        break;
-                    }
-                    None => {
-                        let _ = tx.send(AppEvent::Error("input stream ended".to_string()));
-                        let _ = tx.send(AppEvent::Quit);
-                        break;
-                    }
-                }
-            }
-        })
-    };
+    let input_handle = spawn_input(tx.clone());
 
     // Same reasoning as the watch task: a panicking input reader would
     // otherwise stop delivering keystrokes and mouse clicks with no visible
@@ -1407,7 +1391,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     //
     // Deliberately not tracked in the session: the input reader outlives every
     // cluster, so a switch must not abort it.
-    let _input_supervisor = supervise("input", input_handle, tx.clone());
+    let mut input_supervisor = supervise("input", input_handle, tx.clone());
 
     // `kill <pid>` skips every `Drop`, so without this the process dies holding
     // raw mode, mouse capture and the alternate screen — the dead shell this
@@ -1456,7 +1440,23 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         selected: 0,
         scroll: 0,
     };
+    let mut preferences = Preferences::load();
+    let mut preferences_changed = false;
     let mut pane = DetailPane::new();
+    pane.sidebar_width = preferences.sidebar;
+    if !preferences.mouse {
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+    }
+    let mut palette = CommandBar::default();
+    let mut operations = Operations::new(tx.clone());
+    let mut filter_text = String::new();
+    let mut filter_edit: Option<String> = None;
+    let mut dragging = false;
+    let mut drag_inspector = false;
+    let mut inspector_divider: Option<u16> = None;
+    let mut terminal_width = 140u16;
+    let mut operations_store: Option<StoreId> = None;
+    let mut selected_anchor: Option<(StoreId, GroupVersionKind, (Option<String>, String))> = None;
     let mut inspector: Option<Inspector> = None;
     let mut inspector_store: Option<StoreId> = None;
     let mut hits = HitRegistry::new();
@@ -1500,6 +1500,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             }
         }
         let batch = coalesce(batch);
+        needs_redraw |= operations.drain();
         if let Some(panel) = &mut inspector {
             needs_redraw |= panel.drain();
         }
@@ -1609,6 +1610,11 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         {
             inspector = None;
             inspector_store = None;
+            operations.reset_context();
+        }
+        if operations_store.as_ref() != Some(&StoreId::of(&store)) {
+            operations.reset_context();
+            operations_store = Some(StoreId::of(&store));
         }
         let context_name = active_cluster.unwrap_or_else(|| startup_context_name.clone());
         let scope = display_namespace(namespace.as_deref());
@@ -1649,7 +1655,37 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         // switch cannot show the previous cluster's health over this
         // cluster's (empty) object list, nor one kind's count beside
         // another's availability.
-        let snapshot = store_snapshot(&store, &active_kind, &kinds).await;
+        let mut snapshot = store_snapshot(&store, &active_kind, &kinds).await;
+        if !filter_text.is_empty() {
+            snapshot
+                .objects
+                .retain(|obj| matches_resource(&filter_text, obj));
+            let visible: HashSet<_> = snapshot
+                .objects
+                .iter()
+                .map(|o| (o.namespace(), o.name_any()))
+                .collect();
+            if let Some(table) = &mut snapshot.table {
+                table.rows.retain(|r| {
+                    r.identity.as_ref().is_some_and(|id| {
+                        visible.contains(&(id.namespace.clone(), id.name.clone()))
+                    })
+                });
+            }
+        }
+        if let Some((id, kind, identity)) = &selected_anchor
+            && *id == StoreId::of(&store)
+            && kind == &active_kind
+            && let Some(index) = index_for_identity(
+                &snapshot.objects,
+                snapshot.table.as_ref(),
+                &active_kind,
+                view.sort.as_ref(),
+                identity,
+            )
+        {
+            view.selected = index;
+        }
         // Borrowed, not cloned: this is the live object list, which on a busy
         // namespace is thousands of `Arc`s, and a clone per event batch — mouse
         // moves included — is thousands of refcount bumps for nothing.
@@ -1777,6 +1813,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
 
         let mut quit = false;
+        let mut reset_selection = false;
         // What this pass has ACTUALLY written as the active kind so far,
         // distinct from `active_kind` (read once, before any input in this
         // batch was processed). Two sidebar clicks queued in the same
@@ -1794,6 +1831,291 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             {
                 quit = true;
                 break;
+            }
+            if operations.confirming() {
+                operations.handle(input);
+                needs_redraw = true;
+                continue;
+            }
+            if palette.help {
+                if matches!(input, Event::Key(_)) {
+                    palette.help = false;
+                }
+                needs_redraw = true;
+                continue;
+            }
+            let mut command = None;
+            if palette.open {
+                command = palette.handle(input);
+                needs_redraw = true;
+                if command.is_none() {
+                    continue;
+                }
+            } else if let Some(previous) = &filter_edit {
+                if let Event::Key(key) = input
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Esc => {
+                            filter_text = previous.clone();
+                            filter_edit = None;
+                        }
+                        KeyCode::Enter => filter_edit = None,
+                        KeyCode::Char(c) => filter_text.push(c),
+                        KeyCode::Backspace => {
+                            filter_text.pop();
+                        }
+                        _ => {}
+                    }
+                    view.selected = 0;
+                    reset_selection = true;
+                    let _ = tx.send(AppEvent::Wake);
+                }
+                needs_redraw = true;
+                continue;
+            } else if let Event::Key(key) = input
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char(':') => {
+                        palette.start();
+                        needs_redraw = true;
+                        continue;
+                    }
+                    KeyCode::Char('?') => {
+                        palette.help = true;
+                        needs_redraw = true;
+                        continue;
+                    }
+                    KeyCode::Char('/') if inspector.is_none() && !overlay.is_open() => {
+                        filter_edit = Some(filter_text.clone());
+                        needs_redraw = true;
+                        continue;
+                    }
+                    KeyCode::Char('m') if inspector.is_none() && !overlay.is_open() => {
+                        command = Some("mouse".into())
+                    }
+                    KeyCode::Char('b') if inspector.is_none() && !overlay.is_open() => {
+                        command = Some("sidebar".into())
+                    }
+                    KeyCode::Char('[' | ']') if inspector.is_none() && !overlay.is_open() => {
+                        pane.sidebar_width = if key.code == KeyCode::Char('[') {
+                            pane.sidebar_width.saturating_sub(2)
+                        } else {
+                            (pane.sidebar_width + 2).min(60)
+                        };
+                        preferences.sidebar = pane.sidebar_width;
+                        preferences_changed = true;
+                        needs_redraw = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Event::Mouse(mouse) = input {
+                use crossterm::event::{MouseButton, MouseEventKind};
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => {
+                        palette.start();
+                        needs_redraw = true;
+                        continue;
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if inspector.is_some()
+                            && inspector_divider.is_some_and(|x| mouse.column.abs_diff(x) <= 1) =>
+                    {
+                        drag_inspector = true;
+                        continue;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if drag_inspector => {
+                        preferences.inspector = ((terminal_width.saturating_sub(mouse.column)
+                            as u32
+                            * 100)
+                            / (terminal_width.saturating_sub(pane.sidebar_width + 1).max(1) as u32))
+                            .clamp(30, 80) as u16;
+                        preferences_changed = true;
+                        needs_redraw = true;
+                        continue;
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse.column.abs_diff(pane.sidebar_width + 1) <= 1 =>
+                    {
+                        dragging = true;
+                        continue;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if dragging => {
+                        pane.sidebar_width = mouse.column.saturating_sub(1).clamp(12, 60);
+                        preferences.sidebar = pane.sidebar_width;
+                        preferences_changed = true;
+                        needs_redraw = true;
+                        continue;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        dragging = false;
+                        drag_inspector = false;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(command) = command {
+                let selected = inspector.as_ref().map(|p| p.object.clone()).or_else(|| {
+                    selected_object(
+                        objects,
+                        &active_kind,
+                        snapshot.table.as_ref(),
+                        view.sort.as_ref(),
+                        view.selected,
+                    )
+                    .and_then(|(ns, name)| {
+                        find_object(objects, ns.as_deref(), &name).map(|o| (**o).clone())
+                    })
+                });
+                let words: Vec<_> = command.split_whitespace().collect();
+                match words.first().copied().unwrap_or("") {
+                    "help" => palette.help = true,
+                    "filter" => filter_edit = Some(filter_text.clone()),
+                    "clear" => {
+                        filter_text.clear();
+                        view.selected = 0;
+                        reset_selection = true;
+                    }
+                    "write" => {
+                        operations.writable = true;
+                        operations.notice =
+                            "Writes enabled; each action still requires its resource name".into();
+                    }
+                    "readonly" => {
+                        operations.writable = false;
+                        operations.notice = "Read-only mode".into();
+                    }
+                    "mouse" => {
+                        preferences.mouse = !preferences.mouse;
+                        preferences_changed = true;
+                        if preferences.mouse {
+                            crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::event::EnableMouseCapture
+                            )?;
+                        } else {
+                            crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::event::DisableMouseCapture
+                            )?;
+                        }
+                    }
+                    "sidebar" => {
+                        pane.sidebar_width = if pane.sidebar_width == 0 { 28 } else { 0 };
+                        preferences.sidebar = pane.sidebar_width;
+                        preferences_changed = true;
+                    }
+                    "cluster" => {
+                        inspector = None;
+                        overlay = Overlay::ClusterPicker(Picker {
+                            title: "Clusters".into(),
+                            items: cluster_picker_items(&entries),
+                            filter: String::new(),
+                            selected: 0,
+                            scroll: 0,
+                        });
+                    }
+                    "namespace" => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        let store = StoreId::of(&store);
+                        tokio::spawn(async move {
+                            let result = list_namespaces(&client).await;
+                            let _ = tx.send(AppEvent::NamespacesListed { store, result });
+                        });
+                        inspector = None;
+                        overlay = Overlay::NamespacePicker(Picker {
+                            title: "Namespaces".into(),
+                            items: namespace_picker_items(
+                                namespaces_from_api.as_ref(),
+                                objects,
+                                namespace.as_deref(),
+                            ),
+                            filter: String::new(),
+                            selected: 0,
+                            scroll: 0,
+                        });
+                    }
+                    "overview" | "yaml" | "events" | "logs" | "related" | "metrics" => {
+                        if let Some(object) = selected {
+                            let mode = match words[0] {
+                                "yaml" => Mode::Yaml,
+                                "events" => Mode::Events,
+                                "logs" => Mode::Logs,
+                                "related" => Mode::Related,
+                                "metrics" => Mode::Metrics,
+                                _ => Mode::Overview,
+                            };
+                            inspector = Some(Inspector::new(
+                                object,
+                                mode,
+                                client.clone(),
+                                kinds.clone(),
+                                tx.clone(),
+                            ));
+                            inspector_store = Some(StoreId::of(&store));
+                        }
+                    }
+                    "scale" | "restart" | "delete" => operations.prepare(
+                        &command,
+                        selected,
+                        client.clone(),
+                        &kinds,
+                        &context_name,
+                    ),
+                    "stop-forwards" => operations.stop_forwards(),
+                    "forward" => {
+                        if let Some(object) = selected
+                            && let Err(e) = operations.forward(
+                                &object,
+                                &context_name,
+                                words.get(1).copied().unwrap_or(""),
+                            )
+                        {
+                            operations.notice = cluster::safe_error_text(&e);
+                        }
+                    }
+                    "exec" => {
+                        if let Some(object) = selected {
+                            match crate::ui::operations::exec_command(
+                                &object,
+                                &context_name,
+                                words.get(1).copied(),
+                            ) {
+                                Ok(mut command) => {
+                                    input_supervisor.abort();
+                                    let _ = (&mut input_supervisor).await;
+                                    use crate::terminal::TerminalControl;
+                                    RealTerminal.restore()?;
+                                    let result = command.status().await;
+                                    enable_raw_mode()?;
+                                    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                    if preferences.mouse {
+                                        crossterm::execute!(
+                                            std::io::stdout(),
+                                            crossterm::event::EnableMouseCapture
+                                        )?;
+                                    }
+                                    term.resize(term.size()?.into())?;
+                                    input_supervisor =
+                                        supervise("input", spawn_input(tx.clone()), tx.clone());
+                                    operations.notice = match result {
+                                        Ok(status) => format!("Shell exited: {status}"),
+                                        Err(e) => format!("Could not open shell: {e}"),
+                                    };
+                                }
+                                Err(e) => operations.notice = cluster::safe_error_text(&e),
+                            }
+                        }
+                    }
+                    _ => operations.notice = format!("Unknown command: {command}"),
+                }
+                let _ = tx.send(AppEvent::Wake);
+                needs_redraw = true;
+                continue;
             }
             if let Some(panel) = &mut inspector {
                 match panel.handle(input) {
@@ -2242,6 +2564,18 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         if quit {
             break;
         }
+        if active_kind_now == active_kind && !reset_selection {
+            selected_anchor = selected_object(
+                objects,
+                &active_kind,
+                snapshot.table.as_ref(),
+                view.sort.as_ref(),
+                view.selected,
+            )
+            .map(|key| (StoreId::of(&store), active_kind.clone(), key));
+        } else {
+            selected_anchor = None;
+        }
         if !needs_redraw {
             continue;
         }
@@ -2278,6 +2612,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             None => (&[][..], None),
         };
         term.draw(|f| {
+            terminal_width = f.area().width;
+            inspector_divider = None;
             render_frame(
                 f,
                 FrameArgs {
@@ -2303,15 +2639,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             if let Some(panel) = &mut inspector {
                 let area = f.area();
                 let content = ratatui::layout::Rect::new(
-                    SIDEBAR_WIDTH + 1,
-                    0,
-                    area.width.saturating_sub(SIDEBAR_WIDTH + 1),
+                    pane.sidebar_width.min(area.width / 3) + 1,
+                    1,
+                    area.width
+                        .saturating_sub(pane.sidebar_width.min(area.width / 3) + 1),
                     area.height.saturating_sub(1),
                 );
                 let panel_area = if content.width >= 120 {
                     let panes = Layout::horizontal([
-                        Constraint::Percentage(35),
-                        Constraint::Percentage(65),
+                        Constraint::Percentage(100 - preferences.inspector),
+                        Constraint::Percentage(preferences.inspector),
                     ])
                     .split(content);
                     f.render_widget(ratatui::widgets::Clear, panes[0]);
@@ -2324,21 +2661,117 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         &mut view,
                         &mut hits,
                     );
+                    inspector_divider = Some(panes[1].x);
                     panes[1]
                 } else {
                     content
                 };
                 panel.render(f, panel_area);
             }
+            let full = f.area();
+            let toolbar = if filter_edit.is_some() {
+                format!(" / {}█  Enter apply · Esc cancel", filter_text)
+            } else {
+                format!(
+                    " kube  : commands  / filter  ? help  l logs  r related  [{}] {}  {}",
+                    if operations.writable {
+                        "WRITE"
+                    } else {
+                        "READ ONLY"
+                    },
+                    if filter_text.is_empty() {
+                        String::new()
+                    } else {
+                        format!("filter: {filter_text}")
+                    },
+                    operations.notice
+                )
+            };
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(toolbar).style(theme::header_style()),
+                ratatui::layout::Rect::new(full.x, full.y, full.width, 1),
+            );
+            if palette.open || palette.help {
+                palette.render(f);
+            }
+            operations.render(f);
         })?;
     }
 
+    if preferences_changed {
+        preferences.save()?;
+    }
+    input_supervisor.abort();
     // No explicit teardown: dropping `term` shows the cursor again and then
     // `_guard` runs `RealTerminal::restore()`, which is exactly the disable
     // mouse capture / leave alternate screen / disable raw mode sequence the
     // old `ratatui::restore()` path performed. Normal exit and panic exit now
     // share one restoration implementation, so neither can drift from the other.
     Ok(())
+}
+
+fn spawn_input(tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut events = crossterm::event::EventStream::new();
+            loop {
+                match events.next().await {
+                    Some(Ok(e)) => {
+                        if tx.send(AppEvent::Input(e)).is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // Without this the UI would stay alive accepting nothing,
+                        // and raw mode means there is no signal-based way out.
+                        let _ = tx.send(AppEvent::Error(format!("input stream failed: {e}")));
+                        let _ = tx.send(AppEvent::Quit);
+                        break;
+                    }
+                    None => {
+                        let _ = tx.send(AppEvent::Error("input stream ended".to_string()));
+                        let _ = tx.send(AppEvent::Quit);
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
+fn index_for_identity(
+    objects: &[Arc<DynamicObject>],
+    table: Option<&TableData>,
+    gvk: &GroupVersionKind,
+    sort: Option<&SortState>,
+    identity: &(Option<String>, String),
+) -> Option<usize> {
+    if let Some(table) = table {
+        let mut rows = table.rows.clone();
+        if let Some(sort) = sort {
+            sort_table_rows(&mut rows, sort);
+        }
+        return rows.iter().position(|r| {
+            r.identity
+                .as_ref()
+                .is_some_and(|id| id.namespace == identity.0 && id.name == identity.1)
+        });
+    }
+    let index = objects
+        .iter()
+        .position(|o| o.namespace() == identity.0 && o.name_any() == identity.1)?;
+    if let Some(sort) = sort {
+        let cols = columns_for(gvk);
+        let cells: Vec<Vec<String>> = objects
+            .iter()
+            .map(|o| cols.iter().map(|c| (c.extract)(o)).collect())
+            .collect();
+        return sorted_indices(&cells, sort)
+            .iter()
+            .position(|i| *i == index);
+    }
+    Some(index)
 }
 
 fn copy_text(text: &str) -> anyhow::Result<()> {

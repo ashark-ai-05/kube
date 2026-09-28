@@ -771,11 +771,8 @@ async fn workload_relationships_and_container_logs_are_live() {
     let pod = api.create(&PostParams::default(), &pod).await.unwrap();
     let name = pod.name_any();
     let result=tokio::time::timeout(Duration::from_secs(60),async{
-        loop {
-            let p=api.get(&name).await.unwrap();
-            if p.status.as_ref().is_some_and(|s|s.phase.as_deref()==Some("Running")){break;}
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        // Open immediately while the container is still creating. The stream
+        // must recover from the API's transient 400 without reopening the view.
         let object=serde_json::from_value(serde_json::to_value(&pod).unwrap()).unwrap();
         let (wake,mut events)=mpsc::unbounded_channel();
         let mut stream=StreamSession::start(client,object,Options::default(),wake);
@@ -787,4 +784,80 @@ async fn workload_relationships_and_container_logs_are_live() {
     }).await;
     api.delete(&name, &DeleteParams::default()).await.unwrap();
     result.expect("live log line should reach the viewer within 60 seconds");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated kind cluster"]
+async fn mutations_check_identity_and_change_only_the_selected_resource() {
+    use kube::{
+        Api, ResourceExt,
+        api::{DeleteParams, DynamicObject, PostParams},
+    };
+    use kube_tui::cluster::operations::{Operation, execute};
+    let _serial = cluster_lock().await;
+    let client = kube_tui::cluster::connect().await.unwrap();
+    let api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::namespaced(client.clone(), "demo");
+    let template=serde_json::from_value(serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"generateName":"operation-acceptance-"},"spec":{"replicas":0,"selector":{"matchLabels":{"app":"operation-acceptance"}},"template":{"metadata":{"labels":{"app":"operation-acceptance"}},"spec":{"containers":[{"name":"web","image":"nginx:alpine"}]}}}})).unwrap();
+    let created = api.create(&PostParams::default(), &template).await.unwrap();
+    let name = created.name_any();
+    let resource = ApiResource::erase::<k8s_openapi::api::apps::v1::Deployment>(&());
+    let object: DynamicObject =
+        serde_json::from_value(serde_json::to_value(created).unwrap()).unwrap();
+    execute(
+        client.clone(),
+        object.clone(),
+        resource.clone(),
+        Operation::Scale(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        api.get(&name).await.unwrap().spec.unwrap().replicas,
+        Some(1)
+    );
+    execute(
+        client.clone(),
+        object.clone(),
+        resource.clone(),
+        Operation::Restart,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.get(&name)
+            .await
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .metadata
+            .unwrap()
+            .annotations
+            .unwrap()
+            .contains_key("kubectl.kubernetes.io/restartedAt")
+    );
+    execute(client.clone(), object, resource, Operation::Delete)
+        .await
+        .unwrap();
+    let cms: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(client.clone(), "demo");
+    let cm=serde_json::from_value(serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"generateName":"identity-acceptance-"}})).unwrap();
+    let old = cms.create(&PostParams::default(), &cm).await.unwrap();
+    let name = old.name_any();
+    let object = serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+    cms.delete(&name, &DeleteParams::default()).await.unwrap();
+    let new = serde_json::from_value(
+        serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name}}),
+    )
+    .unwrap();
+    cms.create(&PostParams::default(), &new).await.unwrap();
+    let result = execute(
+        client,
+        object,
+        ApiResource::erase::<k8s_openapi::api::core::v1::ConfigMap>(&()),
+        Operation::Delete,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("replaced"));
+    assert!(cms.get(&name).await.is_ok());
+    cms.delete(&name, &DeleteParams::default()).await.unwrap();
 }

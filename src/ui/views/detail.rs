@@ -101,6 +101,7 @@ impl DetailTab {
 /// builds with managedFields) is expensive; caching it prevents re-serializing
 /// an unchanged object on every frame.
 pub struct DetailPane {
+    pub sidebar_width: u16,
     pub tab: DetailTab,
     pub yaml_scroll: u16,
     pub events_scroll: u16,
@@ -116,6 +117,7 @@ impl Default for DetailPane {
 impl DetailPane {
     pub fn new() -> Self {
         Self {
+            sidebar_width: 28,
             tab: DetailTab::Overview,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -633,6 +635,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -665,6 +668,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -957,6 +961,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -1012,6 +1017,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 9999,
@@ -1040,6 +1046,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let obj = pod_with_status();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 9999,
@@ -1241,6 +1248,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
         let mut hits = HitRegistry::new();
         let mut pane = DetailPane {
+            sidebar_width: 28,
             tab: DetailTab::Yaml,
             yaml_scroll: 9999,
             events_scroll: 0,
