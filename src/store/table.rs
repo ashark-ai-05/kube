@@ -168,9 +168,8 @@ impl SortKind {
     }
 }
 impl SortState {
-    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        let numeric = |s: &str| match self.kind {
+    fn numeric(&self, s: &str) -> Option<f64> {
+        match self.kind {
             SortKind::Age => age_seconds(s),
             SortKind::Number => s
                 .split_whitespace()
@@ -180,8 +179,17 @@ impl SortState {
                 .filter(|n| n.is_finite()),
             SortKind::Auto => s.parse::<f64>().ok().filter(|n| n.is_finite()),
             SortKind::Text => None,
-        };
-        let order = match (numeric(a), numeric(b)) {
+        }
+    }
+    fn compare_keys(
+        &self,
+        a: &str,
+        a_number: Option<f64>,
+        b: &str,
+        b_number: Option<f64>,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let order = match (a_number, b_number) {
             (Some(x), Some(y)) => x.total_cmp(&y),
             // Keep missing or invalid numerical values last in either direction.
             (Some(_), None) => return Ordering::Less,
@@ -193,6 +201,9 @@ impl SortState {
         } else {
             order
         }
+    }
+    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        self.compare_keys(a, self.numeric(a), b, self.numeric(b))
     }
 }
 pub(crate) fn age_seconds(value: &str) -> Option<f64> {
@@ -263,6 +274,38 @@ mod semantic_sort_tests {
             ["pod-12", "pod-2", "pod-9"]
         );
     }
+    #[test]
+    fn cached_keys_preserve_semantic_order_missing_values_and_ties() {
+        for (kind, values, ascending, descending) in [
+            (
+                SortKind::Number,
+                vec!["9 (2h ago)", "12 (1m ago)", "2", "?", "9 (1h ago)"],
+                vec![2, 0, 4, 1, 3],
+                vec![1, 0, 4, 2, 3],
+            ),
+            (
+                SortKind::Age,
+                vec!["2d3h", "10m", "9s", "1d", "?", "3h40m"],
+                vec![2, 1, 5, 3, 0, 4],
+                vec![0, 3, 5, 1, 2, 4],
+            ),
+        ] {
+            let rows: Vec<_> = values.iter().map(|v| vec![v.to_string()]).collect();
+            for (descending, expected) in [(false, ascending), (true, descending)] {
+                assert_eq!(
+                    sorted_indices(
+                        &rows,
+                        &SortState {
+                            column: 0,
+                            kind,
+                            descending
+                        }
+                    ),
+                    expected
+                );
+            }
+        }
+    }
 }
 
 /// Sort table rows by one column, in place.
@@ -319,7 +362,18 @@ pub fn sorted_indices(rows: &[Vec<String>], sort: &SortState) -> Vec<usize> {
     // `sort_by`, not `sort_unstable_by`, matching `sort_rows` — equal keys
     // must keep input order, or the mapping this returns disagrees with the
     // one the view drew for exactly the rows that tie.
-    order.sort_by(|&a, &b| sort.compare(&rows[a][sort.column], &rows[b][sort.column]));
+    let keys: Vec<_> = rows
+        .iter()
+        .map(|row| sort.numeric(&row[sort.column]))
+        .collect();
+    order.sort_by(|&a, &b| {
+        sort.compare_keys(
+            &rows[a][sort.column],
+            keys[a],
+            &rows[b][sort.column],
+            keys[b],
+        )
+    });
     order
 }
 
@@ -333,11 +387,13 @@ pub fn sorted_object_indices(
     let Some(column) = columns.get(sort.column) else {
         return (0..objects.len()).collect();
     };
-    let cells: Vec<Vec<String>> = objects
-        .iter()
-        .map(|obj| vec![(column.extract)(obj)])
-        .collect();
-    sorted_indices(&cells, &SortState { column: 0, ..*sort })
+    // Parse each numerical key once, rather than on every sort comparison.
+    // A flat key list also avoids allocating a one-cell row per resource.
+    let cells: Vec<String> = objects.iter().map(|obj| (column.extract)(obj)).collect();
+    let keys: Vec<_> = cells.iter().map(|cell| sort.numeric(cell)).collect();
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by(|&a, &b| sort.compare_keys(&cells[a], keys[a], &cells[b], keys[b]));
+    order
 }
 
 /// Compare two cell values numerically if both parse as `f64`, lexically
