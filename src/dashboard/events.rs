@@ -97,7 +97,12 @@ impl Events {
         }
         changed
     }
-    pub fn note(&self) -> String {
+    pub fn note_for(&self, target: &Identity) -> String {
+        // Selection can change during rendering, before the next subscription
+        // is armed. Never present the previous pod's event under the new pod.
+        if self.target.as_ref() != Some(target) {
+            return "Loading events for selected pod…".into();
+        }
         if let Some(error) = &self.error {
             return error.clone();
         }
@@ -122,6 +127,34 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rendered_event_never_belongs_to_a_previous_selection_or_uid() {
+        let previous = Identity {
+            namespace: "demo".into(),
+            name: "web".into(),
+            uid: Some("old".into()),
+        };
+        let current = Identity {
+            uid: Some("new".into()),
+            ..previous.clone()
+        };
+        let events = Events {
+            target: Some(previous.clone()),
+            rows: vec![EventRow {
+                kind: "Warning".into(),
+                reason: "Unhealthy".into(),
+                message: "old pod's failed probe".into(),
+                age: "1s".into(),
+                count: 1,
+            }],
+            error: None,
+            task: None,
+            reply: None,
+        };
+        assert!(events.note_for(&previous).contains("failed probe"));
+        assert!(!events.note_for(&current).contains("failed probe"));
+        assert!(events.note_for(&current).contains("Loading"));
+    }
     #[tokio::test]
     async fn changing_target_cancels_old_worker_and_discards_its_reply() {
         let client =

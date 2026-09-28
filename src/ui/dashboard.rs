@@ -428,7 +428,7 @@ fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
     }
     f.render_widget(
         Paragraph::new(ellipsis(
-            &dashboard.events.note(),
+            &dashboard.events.note_for(&pod::Identity::of(object)),
             sections[2].width as usize,
         ))
         .style(theme::muted_style()),
