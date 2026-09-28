@@ -141,9 +141,19 @@ pub fn render_table_with_data(
         ColumnSource::Builtin(cols) => cols.iter().map(|c| c.header.to_string()).collect(),
         ColumnSource::Server(t) => t.columns.iter().map(|c| c.name.clone()).collect(),
     };
-    let widths: Vec<Constraint> = match &source {
+    let mut widths: Vec<Constraint> = match &source {
         ColumnSource::Builtin(cols) => cols.iter().map(|c| c.width).collect(),
-        ColumnSource::Server(t) => vec![Constraint::Fill(1); t.columns.len()],
+        ColumnSource::Server(t) => t
+            .columns
+            .iter()
+            .map(|c| {
+                Constraint::Fill(if c.name.eq_ignore_ascii_case("name") {
+                    3
+                } else {
+                    1
+                })
+            })
+            .collect(),
     };
     // Row styling by phase works the same way regardless of source: find
     // whichever column is named "status" and look up its value there.
@@ -155,6 +165,31 @@ pub fn render_table_with_data(
         .iter()
         .position(|h| h.eq_ignore_ascii_case("status"));
 
+    // In a narrow split pane keep names readable. Sort state and hit zones
+    // still refer to original column indexes, including server printer columns.
+    let displayed: Vec<usize> = if area.width < 60 && headers.len() > 2 {
+        let name = headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case("name"))
+            .unwrap_or(0);
+        let secondary = status_idx
+            .or_else(|| headers.iter().position(|h| h.eq_ignore_ascii_case("ready")))
+            .unwrap_or(1);
+        widths = vec![Constraint::Fill(1), Constraint::Length(18)];
+        vec![name, secondary]
+    } else {
+        (0..headers.len()).collect()
+    };
+    let project = |cells: &[String]| {
+        let projected: Vec<String> = displayed
+            .iter()
+            .map(|i| cells.get(*i).cloned().unwrap_or_default())
+            .collect();
+        let projected_status =
+            status_idx.and_then(|i| displayed.iter().position(|column| *column == i));
+        styled_row(&projected, projected_status)
+    };
+
     // Objects/rows can shrink between frames (a pod is deleted, or a fresh
     // fetch lands with fewer rows), leaving `selected` past the end. Clamp
     // here so no caller has to remember to.
@@ -164,7 +199,13 @@ pub fn render_table_with_data(
     };
     view.selected = view.selected.min(total.saturating_sub(1));
 
-    let header = Row::new(headers.clone()).style(theme::header_style());
+    let header = Row::new(
+        displayed
+            .iter()
+            .map(|i| headers[*i].clone())
+            .collect::<Vec<_>>(),
+    )
+    .style(theme::header_style());
 
     // This view owns scrolling: compute how many data rows fit, advance the
     // offset by the least amount needed to keep the selection visible, then
@@ -198,14 +239,14 @@ pub fn render_table_with_data(
             sort_rows(&mut all_rows, sort);
             all_rows[window.clone()]
                 .iter()
-                .map(|cells| styled_row(cells, status_idx))
+                .map(|cells| project(cells))
                 .collect()
         }
         (ColumnSource::Builtin(cols), None) => objects[window.clone()]
             .iter()
             .map(|obj| {
                 let cells: Vec<String> = cols.iter().map(|c| (c.extract)(obj)).collect();
-                styled_row(&cells, status_idx)
+                project(&cells)
             })
             .collect(),
         (ColumnSource::Server(t), Some(sort)) => {
@@ -213,12 +254,12 @@ pub fn render_table_with_data(
             sort_table_rows(&mut all_rows, sort);
             all_rows[window.clone()]
                 .iter()
-                .map(|row| styled_row(&row.cells, status_idx))
+                .map(|row| project(&row.cells))
                 .collect()
         }
         (ColumnSource::Server(t), None) => t.rows[window.clone()]
             .iter()
-            .map(|row| styled_row(&row.cells, status_idx))
+            .map(|row| project(&row.cells))
             .collect(),
     };
     let row_count = rows.len();
@@ -268,7 +309,7 @@ pub fn render_table_with_data(
             .into_iter()
             .enumerate()
         {
-            hits.push(rect, 0, HitTarget::ColumnHeader(i));
+            hits.push(rect, 0, HitTarget::ColumnHeader(displayed[i]));
         }
     }
 
@@ -778,6 +819,15 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn compact_table_keeps_pod_identity_and_status_sort_target() {
+        let pods = vec![pod("web-6bd469df5c-5bd6t", "Running")];
+        let (screen, hits) = render(&pods, 53, 10);
+        assert!(screen.contains("web-6bd469df5c-5bd6t"));
+        assert!(screen.contains("Running"));
+        assert_eq!(hits.hit(40, 1), Some(&HitTarget::ColumnHeader(2)));
     }
 
     #[test]

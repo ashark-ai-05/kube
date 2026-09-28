@@ -58,6 +58,41 @@ fn main() {
     }
     report("100,000-line log search", samples, 50.);
     let mut store = ResourceStore::new();
+    for object in &objects {
+        store.apply(&gvk, &ar, watcher::Event::Apply((**object).clone()));
+    }
+    let mut samples = vec![];
+    for i in 0..500 {
+        let start = Instant::now();
+        // Work admitted by a bounded UI pass, while the log ring is full and
+        // the resource cache is changing. Includes a fresh cache snapshot.
+        for j in 0..256 {
+            logs.push(LogLine {
+                source: "demo/web/app".into(),
+                text: format!("request-completed {i} {j}"),
+            });
+        }
+        for j in 0..16 {
+            store.apply(
+                &gvk,
+                &ar,
+                watcher::Event::Apply((*objects[(i + j) % objects.len()]).clone()),
+            );
+        }
+        let current = store.objects(&gvk);
+        view.selected = i * 13;
+        hits.clear();
+        terminal
+            .draw(|f| render_table(f, f.area(), &current, &gvk, &mut view, &mut hits))
+            .unwrap();
+        std::hint::black_box(logs.visible(0, 40));
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report(
+        "UI batch with full log ring and changing 10,000-resource cache",
+        samples,
+        50.,
+    );
     let mut queued = 0;
     let start = Instant::now();
     for _ in 0..100_000 {

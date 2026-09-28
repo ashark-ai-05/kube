@@ -1,0 +1,59 @@
+name: Acceptance
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: acceptance-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: python3 scripts/terminal-smoke.py
+      - run: cargo bench --locked --bench responsiveness
+  kubernetes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KUBECONFIG: ${{ github.workspace }}/acceptance-kubeconfig.yaml
+      CLUSTER: kube-tui-acceptance
+      KIND_EXPERIMENTAL_PROVIDER: docker
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl -fsSLo kind.sha256 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+          echo "$(cut -d ' ' -f1 kind.sha256)  kind" | sha256sum --check
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
+          curl -fsSLo kubectl.sha256 https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl.sha256
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          chmod +x kind kubectl
+          sudo mv kind kubectl /usr/local/bin/
+      - run: bash scripts/dev-cluster.sh
+      - run: cargo test --locked --test integration_kind -- --ignored
+      - run: cargo build --release --locked
+      - run: python3 -m pip install -r scripts/requirements-test.txt
+      - run: python3 scripts/tui-cluster-smoke.py target/release/kube --stress
+      - if: always()
+        run: kind delete cluster --name kube-tui-acceptance

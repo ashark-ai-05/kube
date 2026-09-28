@@ -16,3 +16,7 @@
 *kubeconfig*
 admin.conf
 .kube/
+
+# Python terminal-test bytecode
+__pycache__/
+*.pyc

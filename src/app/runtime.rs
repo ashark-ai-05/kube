@@ -1861,6 +1861,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             filter_edit = None;
                         }
                         KeyCode::Enter => filter_edit = None,
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            filter_text.clear()
+                        }
                         KeyCode::Char(c) => filter_text.push(c),
                         KeyCode::Backspace => {
                             filter_text.pop();
@@ -2643,7 +2646,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     1,
                     area.width
                         .saturating_sub(pane.sidebar_width.min(area.width / 3) + 1),
-                    area.height.saturating_sub(1),
+                    area.height.saturating_sub(2),
                 );
                 let panel_area = if content.width >= 120 {
                     let panes = Layout::horizontal([
