@@ -129,6 +129,8 @@ pub fn parse(query: &str) -> Result<Option<Intent>, String> {
             | "show me logs"
             | "live logs"
             | "show live logs"
+            | "show current container output"
+            | "show current logs"
             | "previous logs"
             | "show previous logs"
             | "open logs"
@@ -171,6 +173,15 @@ pub fn parse(query: &str) -> Result<Option<Intent>, String> {
         {
             return Ok(Some(Intent::Cluster(name.into())));
         }
+    }
+    if matches!(
+        lower.as_str(),
+        "select every namespace"
+            | "select all namespaces"
+            | "use all namespaces"
+            | "use every namespace"
+    ) {
+        return Ok(Some(Intent::Namespace(Scope::All)));
     }
     for prefix in [
         "switch namespace ",
@@ -256,102 +267,226 @@ pub fn parse(query: &str) -> Result<Option<Intent>, String> {
     Ok(None)
 }
 
-/// Decode exactly one native FunctionGemma call, rejecting extra fields and unrequested scope.
+/// Closed JSON vocabulary shared with constrained native inference. Unknown or duplicate
+/// fields are errors, never ignored instructions or executable commands.
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase", deny_unknown_fields)]
+enum ModelAction {
+    Browse {
+        kind: String,
+        namespace: String,
+        attention: bool,
+    },
+    Inspect {
+        view: String,
+        previous: bool,
+    },
+    Namespace {
+        namespace: String,
+    },
+    Cluster {
+        context: String,
+    },
+    Reject,
+}
 pub fn decode(output: &str, query: &str) -> Result<Intent, String> {
     check_query(query)?;
-    let output = output
-        .trim()
-        .strip_suffix("<end_function_call>")
-        .unwrap_or(output.trim());
-    let body = output
-        .strip_prefix("<start_function_call>call:")
-        .ok_or("The model did not return a supported action. Rephrase the request.")?;
-    let (name, args) = body.split_once('{').ok_or("Invalid model action")?;
-    let args = args.strip_suffix('}').ok_or("Incomplete model action")?;
-    let mut params = std::collections::BTreeMap::new();
-    let mut remaining = args;
-    while !remaining.is_empty() {
-        let (key, value) = remaining
-            .split_once(":<escape>")
-            .ok_or("Invalid model argument")?;
-        let (value, tail) = value
-            .split_once("<escape>")
-            .ok_or("Incomplete model argument")?;
-        if params.insert(key, value).is_some() {
-            return Err("Duplicate model argument".into());
+    let action: ModelAction = serde_json::from_str(output)
+        .map_err(|_| "The model did not return one supported action. Rephrase the request.")?;
+    let lower = query.to_ascii_lowercase();
+    let words: Vec<_> = query
+        .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '?' | ',' | '.' | ':'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let all_requested = regex::Regex::new(r"\b(?:all|every|each)\s+(?:of the\s+)?namespaces?\b")
+        .unwrap()
+        .is_match(&lower);
+    let scope = |name: &str| -> Result<Scope, String> {
+        let scope = Scope::parse(name)?;
+        if all_requested != (scope == Scope::All) {
+            return Err("The model changed the requested namespace scope. Please rephrase.".into());
         }
-        remaining = if tail.is_empty() {
-            ""
-        } else {
-            tail.strip_prefix(',')
-                .ok_or("Invalid model argument separator")?
-        };
-    }
-    let allowed: &[&str] = match name {
-        "list_pods" => &["namespace", "health"],
-        "list_deployments" | "switch_namespace" => &["namespace"],
-        "switch_cluster" => &["context"],
-        "show_logs" | "show_previous_logs" | "show_events" | "inspect_workload" | "show_yaml" => {
-            &[]
+        if let Scope::Named(name) = &scope
+            && !words.contains(&name.as_str())
+        {
+            return Err(
+                "The model proposed a namespace you did not name. Please specify the namespace."
+                    .into(),
+            );
         }
-        _ => return Err("This request is outside the supported read-only actions.".into()),
+        Ok(scope)
     };
-    if params.keys().any(|k| !allowed.contains(k)) {
-        return Err("The model added an unsupported argument.".into());
-    }
-    let namespace = params.get("namespace").copied().unwrap_or("");
-    // An invented default namespace must never silently redirect a request.
-    if !namespace.is_empty()
-        && namespace != "*"
-        && !query
-            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '?' | ','))
-            .any(|word| word == namespace)
+    let intent = match action {
+        ModelAction::Browse {
+            kind,
+            namespace,
+            attention,
+        } => {
+            if ![
+                "Pod",
+                "Deployment",
+                "StatefulSet",
+                "DaemonSet",
+                "Job",
+                "Service",
+            ]
+            .contains(&kind.as_str())
+            {
+                return Err("Unsupported resource kind".into());
+            }
+            Intent::Browse {
+                kind,
+                scope: scope(&namespace)?,
+                attention,
+            }
+        }
+        ModelAction::Namespace { namespace } => Intent::Namespace(scope(&namespace)?),
+        ModelAction::Cluster { context } => {
+            if context.is_empty() || context.len() > 256 || !words.contains(&context.as_str()) {
+                return Err(
+                    "The model proposed a context you did not name. Use the cluster picker.".into(),
+                );
+            }
+            Intent::Cluster(context)
+        }
+        ModelAction::Inspect { view, previous } => {
+            let mode = match view.as_str() {
+                "logs" => Mode::Logs,
+                "overview" => Mode::Overview,
+                "yaml" => Mode::Yaml,
+                "events" => Mode::Events,
+                "metrics" => Mode::Metrics,
+                "related" => Mode::Related,
+                _ => return Err("Unsupported inspection view".into()),
+            };
+            if previous && mode != Mode::Logs {
+                return Err("Previous instances apply only to logs".into());
+            }
+            Intent::Inspect { mode, previous }
+        }
+        ModelAction::Reject => {
+            return Err("This request is outside the supported read-only navigation. Use the filters or Commands.".into());
+        }
+    };
+    validate_model_request(&intent, query)?;
+    if let Some(expected) = parse(query)?
+        && expected != intent
     {
         return Err(
-            "The model proposed a namespace you did not name. Please specify the namespace.".into(),
+            "The model changed a recognized request. Please use the built-in interpretation."
+                .into(),
         );
     }
-    let scope = Scope::parse(namespace)?;
-    Ok(match name {
-        "list_pods" | "list_deployments" => Intent::Browse {
-            kind: if name == "list_pods" {
-                "Pod"
-            } else {
-                "Deployment"
-            }
-            .into(),
-            scope,
-            attention: match params.get("health").copied().unwrap_or("all") {
-                "all" => false,
-                "unhealthy" => true,
-                _ => return Err("The model returned an unsupported health filter.".into()),
-            },
-        },
-        "switch_namespace" => Intent::Namespace(scope),
-        "switch_cluster" => {
-            let name = *params
-                .get("context")
-                .ok_or("The model did not name a cluster.")?;
-            if name.is_empty()
-                || name.len() > 256
-                || name
-                    .chars()
-                    .any(|c| c.is_control() || matches!(c, '<' | '>'))
+    Ok(intent)
+}
+// Schema validity does not prove that the model preserved the requested constraints.
+fn validate_model_request(intent: &Intent, query: &str) -> Result<(), String> {
+    let lower = query.to_ascii_lowercase();
+    let words: Vec<_> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let has = |word: &str| words.contains(&word);
+    let selected = has("this") || has("selected");
+    let compound = has("then")
+        || query.contains(';')
+        || (has("and")
+            && !(matches!(
+                intent,
+                Intent::Inspect {
+                    mode: Mode::Metrics,
+                    ..
+                }
+            ) && has("cpu")
+                && has("memory")
+                && selected));
+    if compound {
+        return Err("Ask for one navigation action at a time.".into());
+    }
+    if has("except") || has("excluding") || lower.contains("not in ") {
+        return Err(
+            "Namespace exclusions are not supported by Ask Kube. Use the namespace picker.".into(),
+        );
+    }
+    match intent {
+        Intent::Browse { scope, .. } => {
+            if [
+                "sort",
+                "sorted",
+                "oldest",
+                "newest",
+                "older",
+                "younger",
+                "restarts",
+                "cpu",
+                "memory",
+                "label",
+                "labels",
+                "named",
+                "contains",
+                "created",
+                "yesterday",
+                "exactly",
+                "related",
+                "manifest",
+                "logs",
+                "yaml",
+                "events",
+                "metrics",
+            ]
+            .iter()
+            .any(|word| has(word))
             {
-                return Err("Invalid cluster name".into());
+                return Err("The request includes an unsupported list condition or a different view. Use filters, sort, or inspect the selected resource.".into());
             }
-            Intent::Cluster(name.into())
+            if selected {
+                return Err("Select an inspection view for the current resource.".into());
+            }
+            if let Some(capture) =
+                regex::Regex::new(r"\b(?:in|within)\s+(?:namespace\s+)?([a-z0-9][a-z0-9-]*)")
+                    .unwrap()
+                    .captures(&lower)
+            {
+                let named = &capture[1];
+                if !["all", "every", "each", "the", "current", "this"].contains(&named)
+                    && !matches!(scope,Scope::Named(ns) if ns==named)
+                {
+                    return Err("The model omitted or changed the namespace you named.".into());
+                }
+            }
         }
-        _ => Intent::Inspect {
-            mode: match name {
-                "show_logs" | "show_previous_logs" => Mode::Logs,
-                "show_events" => Mode::Events,
-                "show_yaml" => Mode::Yaml,
-                _ => Mode::Overview,
-            },
-            previous: name == "show_previous_logs",
-        },
-    })
+        Intent::Inspect { mode, previous } => {
+            if !selected
+                && [
+                    "pod",
+                    "pods",
+                    "deployment",
+                    "deployments",
+                    "service",
+                    "services",
+                    "workload",
+                    "container",
+                    "for",
+                    "of",
+                    "from",
+                ]
+                .iter()
+                .any(|word| has(word))
+            {
+                return Err("Inspection targets the selection. Select a resource first and refer to this or selected resource.".into());
+            }
+            if *mode == Mode::Logs
+                && *previous
+                && !["previous", "prior", "before", "last", "earlier"]
+                    .iter()
+                    .any(|word| has(word))
+            {
+                return Err("The model requested previous logs without an earlier instance being requested.".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -394,27 +529,95 @@ mod tests {
         }
     }
     #[test]
-    fn invented_namespaces_and_extra_calls_fail_closed() {
-        assert!(
+    fn invented_scope_extra_fields_duplicate_fields_and_writes_fail_closed() {
+        for (output, query) in [
+            (
+                r#"{"action":"browse","kind":"Deployment","namespace":"default","attention":false}"#,
+                "bring up deployments",
+            ),
+            (
+                r#"{"action":"browse","kind":"Pod","namespace":"all","attention":false}"#,
+                "pods in all namespaces",
+            ),
+            (
+                r#"{"action":"inspect","view":"logs","previous":false,"shell":"kubectl delete pods"}"#,
+                "logs",
+            ),
+            (
+                r#"{"action":"inspect","view":"logs","view":"yaml","previous":false}"#,
+                "logs",
+            ),
+            (r#"{"action":"delete","name":"web"}"#, "inspect web"),
+            (
+                r#"{"action":"cluster","context":"invented"}"#,
+                "use cluster east",
+            ),
+            (
+                r#"{"action":"inspect","view":"events","previous":true}"#,
+                "events",
+            ),
+            (
+                r#"{"action":"inspect","view":"logs","previous":true}"#,
+                "show me logs",
+            ),
+            (r#"{"action":"reject"} {"action":"reject"}"#, "hello"),
+        ] {
+            assert!(decode(output, query).is_err(), "{query}: {output}");
+        }
+    }
+    #[test]
+    fn json_actions_preserve_model_navigation_scope_and_container_instance() {
+        assert_eq!(
             decode(
-                "<start_function_call>call:list_deployments{namespace:<escape>default<escape>}",
-                "show deployments"
+                r#"{"action":"browse","kind":"Service","namespace":"*","attention":false}"#,
+                "Please display services across every namespace"
             )
-            .is_err()
+            .unwrap(),
+            Intent::Browse {
+                kind: "Service".into(),
+                scope: Scope::All,
+                attention: false
+            }
         );
-        assert!(
+        assert_eq!(
             decode(
-                "<start_function_call>call:show_logs{}<start_function_call>call:show_yaml{}",
-                "logs"
+                r#"{"action":"inspect","view":"logs","previous":true}"#,
+                "I need output from the previous container instance of this pod"
             )
-            .is_err()
+            .unwrap(),
+            Intent::Inspect {
+                mode: Mode::Logs,
+                previous: true
+            }
         );
-        assert!(
+        assert_eq!(
             decode(
-                "<start_function_call>call:show_logs{shell:<escape>rm -rf<escape>}",
-                "logs"
+                r#"{"action":"cluster","context":"Team-East"}"#,
+                "Change context to Team-East"
             )
-            .is_err()
+            .unwrap(),
+            Intent::Cluster("Team-East".into())
         );
+    }
+
+    #[test]
+    fn model_cannot_drop_a_named_target_condition_or_second_action() {
+        let logs = r#"{"action":"inspect","view":"logs","previous":false}"#;
+        for query in [
+            "Show logs for pod payment-abc",
+            "Show this pod logs and YAML",
+        ] {
+            assert!(decode(logs, query).is_err());
+        }
+        let browse = r#"{"action":"browse","kind":"Pod","namespace":"","attention":false}"#;
+        for query in [
+            "Show pods in billing",
+            "Pods except kube-system",
+            "Show pods sorted by age",
+            "Pods with 3 restarts",
+            "Show pods then show logs",
+        ] {
+            assert!(decode(browse, query).is_err(), "{query}");
+        }
     }
 }

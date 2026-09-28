@@ -97,6 +97,19 @@ with tempfile.TemporaryDirectory(prefix='kube-ask-') as temp:
         expect('Open previous container logs')
         send('\x1b')
         expect('Observed Kubernetes state')
+        if os.environ.get('KUBE_TEST_LOCAL_MODEL'):
+            send(':ask I want the manifest of the selected deployment\r')
+            expect('local model available')
+            expect('Interpreting locally')
+            started=time.monotonic()
+            send('\x1b')
+            expect('Observed Kubernetes state')
+            assert time.monotonic()-started < 1.0, 'Local inference cancellation must not block the UI'
+            send(':ask I want the manifest of the selected deployment\r')
+            expect('Open yaml for the selected resource')
+            expect('Enter apply this action')
+            send('\r')
+            expect('apiVersion:')
         send('\x03')
         process.wait(timeout=5)
         assert process.returncode == 0

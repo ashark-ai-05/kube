@@ -1,0 +1,15 @@
+{
+  "model": {
+    "name": "FunctionGemma 270M Q8_0",
+    "source": "google/functiongemma-270m-it",
+    "url": "https://huggingface.co/ggml-org/functiongemma-270m-it-GGUF/resolve/2566ce14aedfc14fdd0de955ba67346425e67126/functiongemma-270m-it-q8_0.gguf",
+    "sha256": "83940d4dd9676710856f43523bed096164a595a96f6b34771610a03937de5270",
+    "bytes": 291557792,
+    "license": "https://ai.google.dev/gemma/terms"
+  },
+  "runtime": {
+    "version": "b11223",
+    "macos-arm64": {"file":"llama-b11223-bin-macos-arm64.tar.gz","sha256":"5bacea12237283699a196194b7f62a0e613438bd5feed694359ed6050492bb3e"},
+    "ubuntu-x64": {"file":"llama-b11223-bin-ubuntu-x64.tar.gz","sha256":"9ce07ebd35ccdbae598ef34d21607564c4a21956cf075409f82e4f4fe871ea5e"}
+  }
+}

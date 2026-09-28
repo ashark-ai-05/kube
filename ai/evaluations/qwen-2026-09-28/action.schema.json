@@ -1,0 +1,106 @@
+{
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "const": "browse"
+        },
+        "kind": {
+          "enum": [
+            "Pod",
+            "Deployment",
+            "StatefulSet",
+            "DaemonSet",
+            "Job",
+            "Service"
+          ]
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "attention": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action",
+        "kind",
+        "namespace",
+        "attention"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "const": "inspect"
+        },
+        "view": {
+          "enum": [
+            "logs",
+            "overview",
+            "yaml",
+            "events",
+            "metrics",
+            "related"
+          ]
+        },
+        "previous": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action",
+        "view",
+        "previous"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "const": "namespace"
+        },
+        "namespace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "namespace"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "const": "cluster"
+        },
+        "context": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "context"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "action": {
+          "const": "reject"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

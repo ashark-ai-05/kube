@@ -20,6 +20,11 @@ impl Bundle {
                     .ok()
                     .and_then(|p| p.parent().map(|p| p.join("ai")))
             })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json")).ok()?).ok()?;
+        if manifest["model"]["protocol"] != "kube-json-v1" {
+            return None;
+        }
         let bundle = Self {
             model: root.join("model.gguf"),
             server: root.join("runtime/llama-server"),
@@ -45,7 +50,7 @@ impl Bundle {
         let key: String = random.iter().map(|b| format!("{b:02x}")).collect();
         drop(listener);
         let mut child=Command::new(&self.server).args(["-m"]).arg(&self.model)
-            .args(["--host","127.0.0.1","--port",&port.to_string(),"--api-key",&key,"-c","2048","-np","1","-ngl","0","--device","none","--no-op-offload","--no-kv-offload","-t","2","--no-webui","--no-warmup","-b","256","-ub","128"])
+            .args(["--host","127.0.0.1","--port",&port.to_string(),"--api-key",&key,"-c","4096","-np","1","-ngl","0","--device","none","--no-op-offload","--no-kv-offload","-t","2","--no-webui","--no-warmup","--reasoning","off","--chat-template-kwargs",r#"{"enable_thinking":false}"#,"-b","256","-ub","128"])
             .env_clear().env("PATH","/usr/bin:/bin").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true)
             .spawn().map_err(|_|"Could not start the bundled local runtime. Check the AI package for your platform.")?;
         // Cold loading on slower machines shares the outer request deadline.
@@ -63,13 +68,8 @@ impl Bundle {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let prompt = format!(
-            "{}<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
-            include_str!("../../ai/prompt.txt"),
-            query
-        );
-        let body=serde_json::json!({"prompt":prompt,"temperature":0,"n_predict":128,"stop":["<end_function_call>","<start_function_response>","<end_of_turn>"],"cache_prompt":false}).to_string();
-        let (status, body) = request(port, &key, "POST", "/completion", body).await?;
+        let body = completion_body(query);
+        let (status, body) = request(port, &key, "POST", "/v1/chat/completions", body).await?;
         let _ = child.kill().await;
         let _ = child.wait().await;
         if status != 200 {
@@ -78,13 +78,22 @@ impl Bundle {
         let value: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| "Invalid local model response")?;
         decode(
-            value["content"]
+            value["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or("Empty local model response")?,
             query,
         )
     }
 }
+fn completion_body(query: &str) -> String {
+    // Property order guides constrained decoding: view must precede previous.
+    let schema = include_str!("../../ai/action.schema.json");
+    let messages=serde_json::json!([{"role":"system","content":include_str!("../../ai/prompt.txt")},{"role":"user","content":query}]).to_string();
+    format!(
+        r#"{{"messages":{messages},"temperature":0,"max_tokens":220,"response_format":{{"type":"json_schema","json_schema":{{"name":"kube_action","strict":true,"schema":{schema}}}}}}}"#
+    )
+}
+
 async fn request(
     port: u16,
     key: &str,
@@ -132,4 +141,18 @@ async fn request(
     })
     .await
     .map_err(|_| "Local inference timed out".to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn request_preserves_dependent_argument_order_and_escapes_user_text() {
+        let body = completion_body("Open \"this\" pod's logs");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["messages"][1]["content"], "Open \"this\" pod's logs");
+        assert_eq!(parsed["response_format"]["type"], "json_schema");
+        let schema = body.split("\"schema\":").nth(1).unwrap();
+        assert!(schema.find("\"view\"").unwrap() < schema.find("\"previous\"").unwrap());
+    }
 }

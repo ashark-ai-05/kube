@@ -2,7 +2,16 @@
 use kube_tui::assistant::{self, local::Bundle};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cases: serde_json::Value = serde_json::from_str(include_str!("../ai/eval.json"))?;
+    let args: Vec<_> = std::env::args().collect();
+    let path = args
+        .windows(2)
+        .find(|w| w[0] == "--cases")
+        .map(|w| w[1].as_str());
+    let source = match path {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => include_str!("../ai/eval.json").to_string(),
+    };
+    let cases: serde_json::Value = serde_json::from_str(&source)?;
     let model_only = std::env::args().any(|a| a == "--model-only");
     let model = Bundle::discover();
     let mut failed = 0;

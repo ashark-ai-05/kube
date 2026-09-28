@@ -49,7 +49,7 @@ def assemble(package, platform, cache):
     if destination.exists():
         raise ValueError(f'Refusing to overwrite an existing AI bundle: {destination}')
     model_path = download(model['url'], model['sha256'], cache)
-    if model_path.stat().st_size != model['bytes'] or model['bytes'] > 300_000_000:
+    if model_path.stat().st_size != model['bytes'] or model['bytes'] > 1_500_000_000:
         raise ValueError('Model exceeds its verified size budget')
     archive = download('https://github.com/ggml-org/llama.cpp/releases/download/' +
                        manifest['runtime']['version'] + '/' + runtime['file'], runtime['sha256'], cache)

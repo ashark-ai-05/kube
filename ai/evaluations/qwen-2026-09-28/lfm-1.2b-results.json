@@ -1,0 +1,167 @@
+[
+  {
+    "query": "Show failing pods in payments",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"payments\", \"attention\": true}",
+    "seconds": 1.838
+  },
+  {
+    "query": "List pods in all namespaces",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\", \"attention\": false}",
+    "seconds": 1.791
+  },
+  {
+    "query": "Show deployments",
+    "output": "{\"action\": \"browse\", \"kind\": \"Deployment\", \"namespace\": \"\", \"attention\": false}",
+    "seconds": 1.843
+  },
+  {
+    "query": "Show services in demo",
+    "output": "{\"action\": \"browse\", \"kind\": \"Service\", \"namespace\": \"demo\",\"attention\": true}",
+    "seconds": 1.837
+  },
+  {
+    "query": "Previous logs for this pod",
+    "output": "{\n  \"action\": \"inspect\",\n  \"view\": \"logs\",\n  \"previous\": true\n}",
+    "seconds": 1.812
+  },
+  {
+    "query": "Show me logs",
+    "output": "{\"action\": \"inspect\", \"view\": \"logs\",\"previous\": false}",
+    "seconds": 1.769
+  },
+  {
+    "query": "Why is this deployment stuck?",
+    "output": "{\n  \"action\": \"browse\",\n  \"kind\": \"Deployment\",\n  \"namespace\": \"\",\n  \"attention\": true\n}",
+    "seconds": 1.964
+  },
+  {
+    "query": "Show events",
+    "output": "{\"action\": \"inspect\", \"view\": \"events\",\"previous\": false}",
+    "seconds": 1.865
+  },
+  {
+    "query": "Show YAML",
+    "output": "{\"action\": \"inspect\", \"view\": \"logs\",\"previous\": false}",
+    "seconds": 1.84
+  },
+  {
+    "query": "Switch to staging",
+    "output": "{\"action\": \"cluster\", \"context\": \"staging\"}",
+    "seconds": 1.726
+  },
+  {
+    "query": "Switch namespace demo",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"demo\",\"attention\": true}",
+    "seconds": 1.87
+  },
+  {
+    "query": "please delete all pods",
+    "output": "{\"action\": \"reject\"}",
+    "seconds": 1.704
+  },
+  {
+    "query": "exec bash",
+    "output": "{\n  \"action\": \"browse\",\n  \"kind\": \"Pod\",\n  \"namespace\": \"\",\n  \"attention\": true\n}",
+    "seconds": 1.916
+  },
+  {
+    "query": "scale web to 4",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\", \"attention\": true}",
+    "seconds": 1.895
+  },
+  {
+    "query": "Which pods are using over 80 percent of their memory limit?",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": true}",
+    "seconds": 1.875
+  },
+  {
+    "query": "Show the five biggest pods by memory",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": true}",
+    "seconds": 1.867
+  },
+  {
+    "query": "List pods in pretrade sorted by restarts highest first",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"pretrade\", \"attention\": true}",
+    "seconds": 1.943
+  },
+  {
+    "query": "Show pods that restarted in the past 10 minutes",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": true}",
+    "seconds": 1.936
+  },
+  {
+    "query": "Find pods using more than 0.5 CPU cores",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\", \"attention\": true}",
+    "seconds": 1.935
+  },
+  {
+    "query": "Pods created in the last hour",
+    "output": "{\n  \"action\": \"browse\",\n  \"kind\": \"Pod\",\n  \"namespace\": \"\",\n  \"attention\": true\n}",
+    "seconds": 2.007
+  },
+  {
+    "query": "Sort pods by age, newest first",
+    "output": "{\"action\": \"reject\"}",
+    "seconds": 1.754
+  },
+  {
+    "query": "Show only pods whose names contain ingest",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\", \"attention\": true}",
+    "seconds": 1.879
+  },
+  {
+    "query": "Tell me a joke",
+    "output": "{\"action\": \"reject\"}",
+    "seconds": 1.71
+  },
+  {
+    "query": "Delete all pods in demo",
+    "output": "{\"action\": \"reject\"}",
+    "seconds": 1.694
+  },
+  {
+    "query": "Show logs for pod unrelated-name",
+    "output": "{\"action\": \"inspect\", \"view\": \"logs\",\"previous\": false}",
+    "seconds": 1.827
+  },
+  {
+    "query": "List services across every namespace",
+    "output": "{\"action\": \"browse\", \"kind\": \"Service\", \"namespace\": \"\", \"attention\": false}",
+    "seconds": 1.902
+  },
+  {
+    "query": "Switch namespace demo",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"demo\",\"attention\": true}",
+    "seconds": 1.871
+  },
+  {
+    "query": "Show deployments in payments",
+    "output": "{\"action\": \"browse\", \"kind\": \"Deployment\", \"namespace\": \"payments\", \"attention\": false}",
+    "seconds": 2.288
+  },
+  {
+    "query": "Show pods with at least 3 restarts",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\", \"attention\": true}",
+    "seconds": 1.87
+  },
+  {
+    "query": "Show pods with no restarts",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": true}",
+    "seconds": 1.856
+  },
+  {
+    "query": "Show pods not in kube-system",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"kube-system\", \"attention\": true}",
+    "seconds": 1.95
+  },
+  {
+    "query": "Show pods that are ready",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": false}",
+    "seconds": 1.88
+  },
+  {
+    "query": "Pods with CPU above 100m and memory above 80 percent of limit",
+    "output": "{\"action\": \"browse\", \"kind\": \"Pod\", \"namespace\": \"\",\n\"attention\": true}",
+    "seconds": 1.91
+  }
+]

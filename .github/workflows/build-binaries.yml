@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       include_ai:
-        description: 'Also package the optional offline local model (about 292 MB)'
+        description: 'Also package the optional offline local model (about 1.3 GB)'
         type: boolean
         default: false
   push:

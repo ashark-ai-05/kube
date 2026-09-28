@@ -1,9 +1,12 @@
-Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms
+Optional local AI bundle for kube
 
-The bundled model and any derivatives are subject to the attached Gemma Terms of Use, including the use restrictions in Section 3.2 and the incorporated Gemma Prohibited Use Policy. Copies are included in licenses/.
+Qwen3.5-2B pretrained model: Qwen Team / Alibaba Cloud, Apache License 2.0.
+Source: https://huggingface.co/Qwen/Qwen3.5-2B
+GGUF Q4_K_M conversion: https://huggingface.co/unsloth/Qwen3.5-2B-GGUF
+The distributed weights are a quantized conversion of the pretrained model.
+No training or fine-tuning is performed by this project.
+Model license: licenses/QWEN-APACHE-2.0.txt.
 
-Model: google/functiongemma-270m-it, converted and Q8_0 quantized by ggml-org/functiongemma-270m-it-GGUF at revision 2566ce14aedfc14fdd0de955ba67346425e67126. The upstream quantized weights are distributed unchanged by kube. Checksums and source URLs are recorded in manifest.json.
-
-Runtime: llama.cpp b11223. Its MIT license is included in licenses/LLAMA-LICENSE.txt. The upstream runtime is distributed unchanged.
-
-This is an experimental natural-language navigation aid. Review every proposed action. It does not provide autonomous Kubernetes administration or expert root-cause analysis.
+llama.cpp native CPU runtime: ggml-org contributors, MIT license.
+Runtime license: licenses/LLAMA-LICENSE.txt. The runtime archive also includes upstream notices.
+Exact revisions, downloads and SHA-256 checksums: manifest.json.
