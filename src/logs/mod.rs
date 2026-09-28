@@ -103,6 +103,31 @@ impl LogBuffer {
             .collect();
         Ok(())
     }
+    pub fn first_sequence(&self) -> u64 {
+        self.first
+    }
+    pub fn sequence(&self, index: usize, filtered: bool) -> Option<u64> {
+        if filtered {
+            self.matches.get(index).copied()
+        } else {
+            (index < self.lines.len()).then_some(self.first + index as u64)
+        }
+    }
+    pub fn position(&self, sequence: u64, filtered: bool) -> usize {
+        if filtered {
+            self.matches.partition_point(|id| *id < sequence)
+        } else {
+            sequence.saturating_sub(self.first) as usize
+        }
+    }
+    pub fn line(&self, sequence: u64) -> Option<&LogLine> {
+        sequence
+            .checked_sub(self.first)
+            .and_then(|i| self.lines.get(i as usize))
+    }
+    pub fn search_regex(&self) -> Option<&Regex> {
+        self.filter.as_ref()
+    }
     pub fn len(&self) -> usize {
         self.lines.len()
     }

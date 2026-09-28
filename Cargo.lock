@@ -1422,6 +1422,7 @@ dependencies = [
  "serde_norway",
  "thiserror 2.0.20",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

@@ -96,9 +96,83 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SourceOptions {
+    pub paths: Vec<std::path::PathBuf>,
+    pub context: Option<String>,
+}
+
+/// Keep source selection explicit; never rewrite the user's kubeconfig or its
+/// current-context, and never change process environment after Tokio starts.
+pub fn parse_startup_args(args: impl IntoIterator<Item = String>) -> (CliOutcome, SourceOptions) {
+    let mut source = SourceOptions::default();
+    let mut scope = vec![];
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--kubeconfig" || arg == "--context" {
+            let Some(value) = args.next().filter(|v| !v.is_empty() && !v.starts_with('-')) else {
+                return (
+                    CliOutcome::Error(format!("flag {arg} requires a value")),
+                    source,
+                );
+            };
+            if arg == "--kubeconfig" {
+                source.paths.push(value.into());
+            } else {
+                source.context = Some(value);
+            }
+        } else if let Some(value) = arg.strip_prefix("--kubeconfig=") {
+            if value.is_empty() {
+                return (
+                    CliOutcome::Error("--kubeconfig requires a path".into()),
+                    source,
+                );
+            }
+            source.paths.push(value.into());
+        } else if let Some(value) = arg.strip_prefix("--context=") {
+            if value.is_empty() {
+                return (
+                    CliOutcome::Error("--context requires a name".into()),
+                    source,
+                );
+            }
+            source.context = Some(value.into());
+        } else {
+            scope.push(arg);
+        }
+    }
+    (parse_args(scope), source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_flags_keep_paths_and_context_with_namespace_scope() {
+        let (scope, source) = parse_startup_args(
+            [
+                "--kubeconfig",
+                "/configs/team file.yaml",
+                "--kubeconfig=/configs/other.yaml",
+                "--context",
+                "east",
+                "-n",
+                "payments",
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(
+            scope,
+            CliOutcome::Run(NamespaceScope::One("payments".into()))
+        );
+        assert_eq!(source.paths.len(), 2);
+        assert_eq!(source.context.as_deref(), Some("east"));
+        assert!(matches!(
+            parse_startup_args(["--context", "-A"].map(str::to_string)).0,
+            CliOutcome::Error(_)
+        ));
+    }
 
     #[test]
     fn no_args_gives_from_context() {

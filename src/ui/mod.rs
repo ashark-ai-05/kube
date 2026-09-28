@@ -1,7 +1,9 @@
+pub mod chrome;
 pub mod command;
 pub mod geometry;
 pub mod hit;
 pub mod inspector;
+pub mod log_view;
 pub mod operations;
 pub mod preferences;
 pub mod ribbon;

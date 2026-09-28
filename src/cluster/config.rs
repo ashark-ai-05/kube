@@ -15,7 +15,7 @@ pub struct ContextInfo {
 /// Flatten a kubeconfig's contexts for display, resolving each one's auth
 /// method by name. Takes `&Kubeconfig` (rather than consuming it) so the
 /// auth lookup can borrow `auth_infos` while contexts are also read.
-fn flatten(kc: &Kubeconfig) -> Vec<ContextInfo> {
+pub fn flatten(kc: &Kubeconfig) -> Vec<ContextInfo> {
     let current = kc.current_context.clone().unwrap_or_default();
     kc.contexts
         .iter()
@@ -50,6 +50,38 @@ pub fn contexts_from_yaml(yaml: &str) -> anyhow::Result<Vec<ContextInfo>> {
 pub fn load_contexts() -> anyhow::Result<Vec<ContextInfo>> {
     let kc = Kubeconfig::read().context("reading kubeconfig")?;
     Ok(flatten(&kc))
+}
+
+/// Use the exact same source list as the connection, including --kubeconfig.
+pub fn load_contexts_from(
+    paths: &[std::path::PathBuf],
+    selected: Option<&str>,
+) -> anyhow::Result<Vec<ContextInfo>> {
+    let config = if paths.is_empty() {
+        Kubeconfig::read().context("reading kubeconfig")?
+    } else {
+        super::auth::merge_kubeconfigs(
+            paths
+                .iter()
+                .map(Kubeconfig::read_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?
+    };
+    let mut contexts = flatten(&config);
+    if let Some(name) = selected {
+        anyhow::ensure!(
+            contexts.iter().any(|c| c.name == name),
+            "Context '{name}' is not present in the selected kubeconfig"
+        );
+        for context in &mut contexts {
+            context.is_current = context.name == name;
+        }
+    } else if !contexts.iter().any(|c| c.is_current)
+        && let Some(context) = contexts.first_mut()
+    {
+        context.is_current = true;
+    }
+    Ok(contexts)
 }
 
 /// Build a client from the current context.
@@ -99,6 +131,30 @@ users:
   user:
     token: abcdef123456
 "#;
+
+    #[test]
+    fn explicit_files_merge_and_context_selection_does_not_rewrite_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "kube-contexts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let first = dir.join("team config.yaml");
+        let second = dir.join("other.yaml");
+        std::fs::write(&first, SAMPLE).unwrap();
+        std::fs::write(&second, SAMPLE.replace("prod-eu", "west")).unwrap();
+        let contexts = load_contexts_from(&[first.clone(), second], Some("west")).unwrap();
+        assert_eq!(contexts.len(), 4);
+        assert_eq!(contexts.iter().filter(|c| c.is_current).count(), 1);
+        assert_eq!(contexts.iter().find(|c| c.is_current).unwrap().name, "west");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), SAMPLE);
+        assert!(load_contexts_from(&[first], Some("missing")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parses_all_contexts() {

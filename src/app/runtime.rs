@@ -4,7 +4,9 @@ use crate::app::input::{Action, Focus, action_for, apply_selection};
 use crate::app::session::{
     Session, SessionEvent, SharedSession, is_deliberate_abort, restart_watch, switch_cluster,
 };
-use crate::cli::{CliOutcome, NamespaceScope, parse_args, should_hint_all_namespaces};
+use crate::cli::{
+    CliOutcome, NamespaceScope, SourceOptions, parse_startup_args, should_hint_all_namespaces,
+};
 use crate::cluster;
 use crate::cluster::discovery::{KindInfo, group_label_for};
 use crate::cluster::{
@@ -20,6 +22,7 @@ use crate::store::table::{
 };
 use crate::store::watch::StoreId;
 use crate::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
+use crate::ui::chrome::{HEADER_HEIGHT, Header, HeaderState};
 use crate::ui::hit::HitRegistry;
 use crate::ui::inspector::{Effect, Inspector, Mode};
 use crate::ui::ribbon::{render_ribbon, split_ribbon};
@@ -565,7 +568,36 @@ fn refresh_tree(
     // is what the sidebar's stability across restarts depends on, and making
     // it a property of this function rather than of its caller's input means
     // a caller that hands over unsorted kinds still gets a stable sidebar.
-    groups.sort_by(|a, b| a.label.cmp(&b.label));
+    // Everyday Kubernetes resources come before extension API groups.
+    let priority = |label: &str| match label {
+        "apps" => 0,
+        "core" => 1,
+        "batch" => 2,
+        "networking.k8s.io" => 3,
+        "storage.k8s.io" => 4,
+        "rbac.authorization.k8s.io" => 5,
+        _ => 6,
+    };
+    groups.sort_by(|a, b| {
+        priority(&a.label)
+            .cmp(&priority(&b.label))
+            .then(a.label.cmp(&b.label))
+    });
+    if let Some(core) = groups.iter_mut().find(|g| g.label == "core") {
+        core.kinds.sort_by_key(|k| match k.gvk.kind.as_str() {
+            "Pod" => 0,
+            "Service" => 1,
+            "Node" => 2,
+            "Namespace" => 3,
+            "ConfigMap" => 4,
+            "Secret" => 5,
+            "PersistentVolumeClaim" => 6,
+            "PersistentVolume" => 7,
+            "ServiceAccount" => 8,
+            "Event" => 9,
+            _ => 10,
+        });
+    }
 
     tree.groups = groups;
     restore_selection(tree, anchor);
@@ -852,14 +884,22 @@ fn render_frame(
     hits: &mut HitRegistry,
 ) {
     let full = f.area();
+    f.render_widget(
+        ratatui::widgets::Block::default().style(
+            ratatui::style::Style::default()
+                .bg(theme::INK)
+                .fg(theme::PAPER),
+        ),
+        full,
+    );
     let (ribbon_area, rest) = split_ribbon(full);
     render_ribbon(f, ribbon_area, Some(args.context_name), hits);
 
     let content = ratatui::layout::Rect::new(
         rest.x,
-        rest.y.saturating_add(1),
+        rest.y.saturating_add(HEADER_HEIGHT),
         rest.width,
-        rest.height.saturating_sub(1),
+        rest.height.saturating_sub(HEADER_HEIGHT),
     );
     let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(content);
     // The sidebar takes a fixed width and the table whatever is left. On a
@@ -1241,7 +1281,7 @@ fn spawn_refetch_wake(tx: mpsc::UnboundedSender<AppEvent>, after: Duration) {
 pub async fn run() -> anyhow::Result<()> {
     // Parse CLI arguments first, before any terminal setup.
     // This allows us to handle --help and errors cleanly to stdout/stderr.
-    let cli_outcome = parse_args(std::env::args().skip(1));
+    let (cli_outcome, source) = parse_startup_args(std::env::args().skip(1));
     match cli_outcome {
         CliOutcome::Help => {
             println!("Usage: kube [OPTIONS]");
@@ -1249,6 +1289,12 @@ pub async fn run() -> anyhow::Result<()> {
             println!("OPTIONS:");
             println!("  -n, --namespace <namespace>   Watch a specific namespace");
             println!("  -A, --all-namespaces          Watch all namespaces");
+            println!(
+                "      --kubeconfig <file>       Read cluster contexts from this file (repeatable)"
+            );
+            println!(
+                "      --context <name>          Start with this context; switch using the top bar"
+            );
             println!("  -h, --help                    Show this help message");
             std::process::exit(0);
         }
@@ -1258,13 +1304,13 @@ pub async fn run() -> anyhow::Result<()> {
         }
         CliOutcome::Run(scope) => {
             // Continue with the parsed scope
-            run_with_scope(scope).await?;
+            run_with_scope(scope, source).await?;
             Ok(())
         }
     }
 }
 
-async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
+async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> anyhow::Result<()> {
     // First: a panic anywhere below must still leave the terminal usable.
     install_panic_hook();
 
@@ -1277,13 +1323,24 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
     // missing, which is itself an unusual environment worth degrading
     // gracefully in rather than panicking over.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let opts = cluster::ConnectOptions {
-        kubeconfig_paths: cluster::kubeconfig_paths_from_env(
-            std::env::var("KUBECONFIG").ok().as_deref(),
-            std::path::Path::new(&home),
-        ),
+    let mut opts = cluster::ConnectOptions {
+        kubeconfig_paths: if source.paths.is_empty() {
+            cluster::kubeconfig_paths_from_env(
+                std::env::var("KUBECONFIG").ok().as_deref(),
+                std::path::Path::new(&home),
+            )
+        } else {
+            source.paths
+        },
+        context: source.context,
         ..Default::default()
     };
+    let contexts =
+        cluster::config::load_contexts_from(&opts.kubeconfig_paths, opts.context.as_deref())?;
+    opts.context = contexts
+        .iter()
+        .find(|c| c.is_current)
+        .map(|c| c.name.clone());
 
     // The terminal has not been touched yet, so on failure this prints
     // straight to stderr rather than corrupting an alternate screen — and,
@@ -1313,7 +1370,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         }
     };
 
-    let contexts = cluster::load_contexts().unwrap_or_default();
     let (startup_context_name, context_namespace, namespace_from_context) = contexts
         .iter()
         .find(|c| c.is_current)
@@ -1453,7 +1509,9 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
     }
     let mut palette = CommandBar::default();
+    let mut header = Header::default();
     let mut operations = Operations::new(tx.clone());
+    operations.kubeconfig_paths = opts.kubeconfig_paths.clone();
     let mut filter_text = String::new();
     let mut filter_edit: Option<String> = None;
     let mut dragging = false;
@@ -1850,8 +1908,75 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 needs_redraw = true;
                 continue;
             }
+            if !overlay.is_open()
+                && !palette.open
+                && filter_edit.is_none()
+                && let Some(panel) = &mut inspector
+                && !panel.editing()
+                && let Event::Key(k) = input
+                && matches!(k.code, KeyCode::Tab | KeyCode::BackTab)
+            {
+                if panel.maximized {
+                    panel.focused = true;
+                } else {
+                    let has_table = panel.mode != Mode::Logs
+                        && terminal_width
+                            .saturating_sub(pane.sidebar_width.min(terminal_width / 3) + 1)
+                            >= 120;
+                    let current = if panel.focused {
+                        2
+                    } else if pane_focus == Focus::Table && has_table {
+                        1
+                    } else {
+                        0
+                    };
+                    let next = if k.code == KeyCode::BackTab {
+                        (current + 2) % 3
+                    } else {
+                        (current + 1) % 3
+                    };
+                    let next = if next == 1 && !has_table {
+                        if k.code == KeyCode::BackTab { 0 } else { 2 }
+                    } else {
+                        next
+                    };
+                    let next = if next == 0 && pane.sidebar_width == 0 {
+                        if k.code == KeyCode::BackTab && has_table {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        next
+                    };
+                    panel.focused = next == 2;
+                    pane_focus = if next == 1 {
+                        Focus::Table
+                    } else {
+                        Focus::Sidebar
+                    };
+                }
+                needs_redraw = true;
+                continue;
+            }
             let mut command = None;
-            if palette.open {
+            if let Event::Key(k) = input
+                && k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                match k.code {
+                    KeyCode::Char('n') => command = Some("namespace".into()),
+                    KeyCode::Char('o') => command = Some("cluster".into()),
+                    KeyCode::Char('k') => {
+                        palette.start();
+                        needs_redraw = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if command.is_some() { /* Global context commands work from every pane. */
+            } else if palette.open {
                 command = palette.handle(input);
                 needs_redraw = true;
                 if command.is_none() {
@@ -1886,12 +2011,18 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
-                    KeyCode::Char(':') => {
+                    KeyCode::Char(':')
+                        if !overlay.is_open()
+                            && !inspector.as_ref().is_some_and(|p| p.editing()) =>
+                    {
                         palette.start();
                         needs_redraw = true;
                         continue;
                     }
-                    KeyCode::Char('?') => {
+                    KeyCode::Char('?')
+                        if !overlay.is_open()
+                            && !inspector.as_ref().is_some_and(|p| p.editing()) =>
+                    {
                         palette.help = true;
                         needs_redraw = true;
                         continue;
@@ -1924,13 +2055,16 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
             if let Event::Mouse(mouse) = input {
                 use crossterm::event::{MouseButton, MouseEventKind};
                 match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => {
-                        palette.start();
-                        needs_redraw = true;
-                        continue;
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse.row < HEADER_HEIGHT && !overlay.is_open() =>
+                    {
+                        command = header
+                            .command_at(mouse.column, mouse.row)
+                            .map(str::to_string);
                     }
                     MouseEventKind::Down(MouseButton::Left)
-                        if inspector.is_some()
+                        if !overlay.is_open()
+                            && inspector.is_some()
                             && inspector_divider.is_some_and(|x| mouse.column.abs_diff(x) <= 1) =>
                     {
                         drag_inspector = true;
@@ -1947,7 +2081,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         continue;
                     }
                     MouseEventKind::Down(MouseButton::Left)
-                        if mouse.column.abs_diff(pane.sidebar_width + 1) <= 1 =>
+                        if !overlay.is_open()
+                            && mouse.column.abs_diff(pane.sidebar_width + 1) <= 1 =>
                     {
                         dragging = true;
                         continue;
@@ -1982,6 +2117,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 let words: Vec<_> = command.split_whitespace().collect();
                 match words.first().copied().unwrap_or("") {
                     "help" => palette.help = true,
+                    "palette" => palette.start(),
                     "filter" => filter_edit = Some(filter_text.clone()),
                     "clear" => {
                         filter_text.clear();
@@ -2018,7 +2154,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         preferences_changed = true;
                     }
                     "cluster" => {
-                        inspector = None;
+                        palette.open = false;
+                        filter_edit = None;
                         overlay = Overlay::ClusterPicker(Picker {
                             title: "Clusters".into(),
                             items: cluster_picker_items(&entries),
@@ -2028,6 +2165,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                         });
                     }
                     "namespace" => {
+                        palette.open = false;
+                        filter_edit = None;
                         let client = client.clone();
                         let tx = tx.clone();
                         let store = StoreId::of(&store);
@@ -2035,7 +2174,6 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                             let result = list_namespaces(&client).await;
                             let _ = tx.send(AppEvent::NamespacesListed { store, result });
                         });
-                        inspector = None;
                         overlay = Overlay::NamespacePicker(Picker {
                             title: "Namespaces".into(),
                             items: namespace_picker_items(
@@ -2093,6 +2231,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                 &object,
                                 &context_name,
                                 words.get(1).copied(),
+                                &opts.kubeconfig_paths,
                             ) {
                                 Ok(mut command) => {
                                     input_supervisor.abort();
@@ -2126,7 +2265,20 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 needs_redraw = true;
                 continue;
             }
-            if let Some(panel) = &mut inspector {
+            if let Some(panel) = &mut inspector
+                && !overlay.is_open()
+                && let Event::Mouse(mouse) = input
+                && matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_))
+            {
+                panel.focused = panel.contains(mouse.column, mouse.row);
+            }
+            let inspector_receives = !overlay.is_open()
+                && inspector.as_ref().is_some_and(|panel| match input {
+                    Event::Mouse(mouse) => panel.contains(mouse.column, mouse.row),
+                    Event::Resize(_, _) => false,
+                    _ => panel.focused,
+                });
+            if inspector_receives && let Some(panel) = &mut inspector {
                 match panel.handle(input) {
                     Effect::Close => {
                         inspector = None;
@@ -2317,6 +2469,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                 view.offset = 0;
                                 view.sort = None;
                                 detail = None;
+                                inspector = None;
                                 last_click = None;
                                 // What later inputs in THIS batch compare
                                 // against, so a second sidebar click sees
@@ -2330,7 +2483,10 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                                 let _ = tx.send(AppEvent::Wake);
                             }
                         }
-                        Some(_) => {}
+                        Some(_) => {
+                            inspector = None;
+                            pane_focus = Focus::Table;
+                        }
                     }
                     needs_redraw = true;
                 }
@@ -2623,6 +2779,8 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
         term.draw(|f| {
             terminal_width = f.area().width;
             inspector_divider = None;
+            // Modal pickers paint once, after the inspector and top bar.
+            let mut base_overlay = Overlay::None;
             render_frame(
                 f,
                 FrameArgs {
@@ -2642,19 +2800,77 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 &mut view,
                 &mut tree,
                 &mut pane,
-                &mut overlay,
+                &mut base_overlay,
                 &mut hits,
             );
+            let area = f.area();
+            let sidebar_width = pane.sidebar_width.min(area.width / 3);
+            let sidebar_area = ratatui::layout::Rect::new(
+                1,
+                HEADER_HEIGHT,
+                sidebar_width,
+                area.height.saturating_sub(HEADER_HEIGHT + 1),
+            );
+            let inspector_focused = inspector.as_ref().is_some_and(|p| p.focused);
+            if !inspector.as_ref().is_some_and(|p| p.maximized) {
+                f.render_widget(
+                    ratatui::widgets::Block::bordered()
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .border_style(if !inspector_focused && pane_focus == Focus::Sidebar {
+                            theme::label_style()
+                        } else {
+                            theme::border_style()
+                        })
+                        .title(" Resources ")
+                        .title_bottom(ratatui::text::Line::styled(
+                            " Tab panes · Enter open ",
+                            theme::muted_style(),
+                        )),
+                    sidebar_area,
+                );
+            }
+            if inspector.is_none() {
+                let table_area = ratatui::layout::Rect::new(
+                    sidebar_width + 1,
+                    HEADER_HEIGHT,
+                    area.width.saturating_sub(sidebar_width + 1),
+                    area.height.saturating_sub(HEADER_HEIGHT + 1),
+                );
+                f.render_widget(
+                    ratatui::widgets::Block::bordered()
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .border_style(if pane_focus == Focus::Table {
+                            theme::label_style()
+                        } else {
+                            theme::border_style()
+                        })
+                        .title(format!(" {} ", active_kind.kind))
+                        .title_bottom(ratatui::text::Line::styled(
+                            " Enter inspect · l logs · / filter ",
+                            theme::muted_style(),
+                        )),
+                    table_area,
+                );
+            }
             if let Some(panel) = &mut inspector {
                 let area = f.area();
                 let content = ratatui::layout::Rect::new(
                     pane.sidebar_width.min(area.width / 3) + 1,
-                    1,
+                    HEADER_HEIGHT,
                     area.width
                         .saturating_sub(pane.sidebar_width.min(area.width / 3) + 1),
-                    area.height.saturating_sub(2),
+                    area.height.saturating_sub(HEADER_HEIGHT + 1),
                 );
-                let panel_area = if content.width >= 120 {
+                let panel_area = if panel.maximized {
+                    ratatui::layout::Rect::new(
+                        1,
+                        HEADER_HEIGHT,
+                        area.width.saturating_sub(1),
+                        area.height.saturating_sub(HEADER_HEIGHT + 1),
+                    )
+                } else if panel.mode == Mode::Logs {
+                    content
+                } else if content.width >= 120 {
                     let panes = Layout::horizontal([
                         Constraint::Percentage(100 - preferences.inspector),
                         Constraint::Percentage(preferences.inspector),
@@ -2677,29 +2893,26 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                 };
                 panel.render(f, panel_area);
             }
-            let full = f.area();
-            let toolbar = if filter_edit.is_some() {
-                format!(" / {}█  Enter apply · Esc cancel", filter_text)
-            } else {
-                format!(
-                    " kube  : commands  / filter  ? help  l logs  r related  [{}] {}  {}",
-                    if operations.writable {
-                        "WRITE"
-                    } else {
-                        "READ ONLY"
-                    },
-                    if filter_text.is_empty() {
-                        String::new()
-                    } else {
-                        format!("filter: {filter_text}")
-                    },
-                    operations.notice
-                )
-            };
-            f.render_widget(
-                ratatui::widgets::Paragraph::new(toolbar).style(theme::header_style()),
-                ratatui::layout::Rect::new(full.x, full.y, full.width, 1),
+            header.render(
+                f,
+                HeaderState {
+                    context: &context_name,
+                    namespace: scope,
+                    kind: &active_kind.kind,
+                    count: objects.len(),
+                    writable: operations.writable,
+                    filter: &filter_text,
+                    editing: filter_edit.is_some(),
+                    notice: &operations.notice,
+                },
             );
+            // Pickers are modal and must paint after every inspector/chrome pane.
+            if let Some(picker) = overlay.picker_mut() {
+                let mut area = centered(f.area(), 68, 65);
+                area.width = area.width.min(80);
+                area.x = f.area().width.saturating_sub(area.width) / 2;
+                render_picker(f, area, picker, &mut hits);
+            }
             if palette.open || palette.help {
                 palette.render(f);
             }
@@ -5071,7 +5284,7 @@ mod tests {
             let term = draw(None, &mut overlay, &mut tree);
             let text = screen(&term);
             assert!(
-                text.contains("Kinds"),
+                text.contains("Resources"),
                 "the sidebar's own frame must be on screen:\n{text}"
             );
             assert!(text.contains("Pod"), "and the kind it lists:\n{text}");

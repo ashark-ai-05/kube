@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 /// Render the sidebar tree and register a clickable zone for every visible row.
 ///
@@ -48,8 +48,10 @@ pub fn render_sidebar(
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().bg(theme::ABYSS).fg(theme::PAPER))
         .border_style(theme::border_style())
-        .title("Kinds");
+        .title(" Resources ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -75,7 +77,18 @@ pub fn render_sidebar(
             TreeRow::Group { group, .. } => {
                 let marker = if group.expanded { "▾" } else { "▸" };
                 Line::from(Span::styled(
-                    format!("{marker} {}", group.label),
+                    format!(
+                        "{marker} {}",
+                        match group.label.as_str() {
+                            "apps" => "Workloads",
+                            "core" => "Core resources",
+                            "batch" => "Jobs & schedules",
+                            "networking.k8s.io" => "Networking",
+                            "storage.k8s.io" => "Storage",
+                            "rbac.authorization.k8s.io" => "Access control",
+                            label => label,
+                        }
+                    ),
                     theme::label_style(),
                 ))
             }
@@ -109,7 +122,7 @@ pub fn render_sidebar(
                     }
                     KindAvailability::NotWatched => {
                         spans.push(Span::raw("  "));
-                        spans.push(Span::styled("not watched", theme::muted_style()));
+                        spans.push(Span::styled("·", theme::muted_style()));
                     }
                     KindAvailability::Watching => {
                         if let Some(count) = kind.count {
@@ -291,7 +304,7 @@ mod tests {
     fn each_visible_sidebar_row_registers_a_hit_zone_at_its_own_index() {
         let mut t = tree(&[("core", true, &["Pod", "Service"])]);
         let (text, hits) = render_to_string(&mut t, 24, 10);
-        for (row, expected) in [(0usize, "core"), (1, "Pod"), (2, "Service")] {
+        for (row, expected) in [(0usize, "Core resources"), (1, "Pod"), (2, "Service")] {
             let y = (row + 1) as u16; // border
             assert!(text.lines().nth(y as usize).unwrap().contains(expected));
             assert_eq!(hits.hit(2, y), Some(&HitTarget::TreeRow(row)));

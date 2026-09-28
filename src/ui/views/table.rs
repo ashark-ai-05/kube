@@ -12,7 +12,7 @@ use kube::api::{DynamicObject, GroupVersionKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Row, Table, TableState};
 use std::sync::Arc;
 
 pub struct TableView {
@@ -278,12 +278,15 @@ pub fn render_table_with_data(
         .header(header)
         .row_highlight_style(
             Style::default()
-                .fg(theme::INDIGO)
+                .fg(theme::PAPER)
+                .bg(theme::DUSK)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .style(Style::default().bg(theme::INK))
                 .border_style(theme::border_style())
                 .title(gvk.kind.clone()),
         );
@@ -336,11 +339,19 @@ pub fn render_table_with_data(
 /// Style one already-extracted row by its STATUS/Status cell, if it has
 /// one, falling back to plain body text otherwise.
 fn styled_row(cells: &[String], status_idx: Option<usize>) -> Row<'static> {
-    let style = status_idx
-        .and_then(|i| cells.get(i))
-        .map(|s| phase_style(s))
-        .unwrap_or_else(|| Style::default().fg(theme::PAPER));
-    Row::new(cells.to_vec()).style(style)
+    Row::new(
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                Cell::new(value.clone()).style(if Some(index) == status_idx {
+                    phase_style(value)
+                } else {
+                    theme::text_style()
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]

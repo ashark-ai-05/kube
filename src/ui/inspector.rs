@@ -1,5 +1,5 @@
 //! One cancellable investigation session, scoped to an exact object and cluster.
-use crate::ui::theme;
+use crate::ui::{log_view::LogView, theme};
 use crate::{
     app::event::AppEvent,
     cluster::{self, discovery::KindInfo, related},
@@ -66,13 +66,16 @@ pub struct Inspector {
     related: Vec<DynamicObject>,
     selected: usize,
     scroll: usize,
-    follow: bool,
+    pub log_view: LogView,
+    pub maximized: bool,
+    pub focused: bool,
+    search_error: Option<String>,
     containers: Vec<String>,
     pub status: String,
     editing: Option<Edit>,
     input: String,
     filter: String,
-    pretty: bool,
+
     area: Rect,
     body: Rect,
     tab_rects: Vec<Rect>,
@@ -114,13 +117,16 @@ impl Inspector {
             related: vec![],
             selected: 0,
             scroll: 0,
-            follow: true,
+            log_view: LogView::default(),
+            maximized: false,
+            focused: true,
+            search_error: None,
             containers: vec![],
             status: String::new(),
             editing: None,
             input: String::new(),
             filter: String::new(),
-            pretty: false,
+
             area: Rect::default(),
             body: Rect::default(),
             tab_rects: vec![],
@@ -167,7 +173,7 @@ impl Inspector {
             Mode::Logs => {
                 self.logs = LogBuffer::default();
                 let _ = self.logs.filter(&self.filter);
-                self.follow = true;
+                self.log_view.reset();
                 self.stream = Some(StreamSession::start(
                     self.client.clone(),
                     self.object.clone(),
@@ -219,7 +225,6 @@ impl Inspector {
             }
         }
         if let Some(stream) = &mut self.stream {
-            let before = self.logs.matching_added();
             for msg in stream.drain() {
                 changed = true;
                 match msg {
@@ -228,13 +233,26 @@ impl Inspector {
                     Message::Containers(c) => self.containers = c,
                 }
             }
-            if !self.follow {
-                self.scroll = self
-                    .scroll
-                    .saturating_add(self.logs.matching_added().saturating_sub(before) as usize);
-            }
         }
         changed
+    }
+    pub fn editing(&self) -> bool {
+        self.editing.is_some()
+    }
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        self.area.contains((column, row).into())
+    }
+    fn update_search(&mut self) {
+        match self.logs.filter(&self.input) {
+            Ok(()) => {
+                self.search_error = None;
+                self.log_view.selected_match = None;
+                if !self.input.is_empty() {
+                    self.log_view.jump_match(&self.logs, false, true);
+                }
+            }
+            Err(e) => self.search_error = Some(format!("Invalid regex: {e}")),
+        }
     }
     pub fn handle(&mut self, event: &Event) -> Effect {
         let mut code = None;
@@ -242,6 +260,20 @@ impl Inspector {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                     return Effect::Close;
+                }
+                if k.modifiers.contains(KeyModifiers::CONTROL) {
+                    if k.code == KeyCode::Char('f') && self.mode == Mode::Logs {
+                        self.editing = Some(Edit::Search);
+                        self.input = self.filter.clone();
+                        return Effect::None;
+                    }
+                    if k.code == KeyCode::Char('u') && self.editing.is_some() {
+                        self.input.clear();
+                        if matches!(self.editing, Some(Edit::Search)) {
+                            self.update_search();
+                        }
+                        return Effect::None;
+                    }
                 }
                 code = Some(k.code);
             }
@@ -286,12 +318,24 @@ impl Inspector {
         if let Some(edit) = self.editing {
             match code {
                 KeyCode::Esc => {
+                    if matches!(edit, Edit::Search) {
+                        let _ = self.logs.filter(&self.filter);
+                        self.search_error = None;
+                    }
                     self.editing = None;
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    if matches!(edit, Edit::Search) {
+                        self.update_search();
+                    }
                 }
-                KeyCode::Char(c) => self.input.push(c),
+                KeyCode::Char(c) => {
+                    self.input.push(c);
+                    if matches!(edit, Edit::Search) {
+                        self.update_search();
+                    }
+                }
                 KeyCode::Enter => {
                     let value = self.input.clone();
                     self.editing = None;
@@ -301,7 +345,10 @@ impl Inspector {
                                 self.filter = value;
                                 self.scroll = 0;
                             }
-                            Err(e) => self.status = format!("Invalid search: {e}"),
+                            Err(e) => {
+                                self.editing = Some(Edit::Search);
+                                self.search_error = Some(format!("Invalid regex: {e}"));
+                            }
                         },
                         Edit::Export => return Effect::Export(PathBuf::from(value)),
                         Edit::Since => match parse_duration(&value) {
@@ -318,7 +365,16 @@ impl Inspector {
             return Effect::None;
         }
         match code {
+            KeyCode::Esc if self.mode == Mode::Logs && !self.filter.is_empty() => {
+                self.filter.clear();
+                self.input.clear();
+                self.search_error = None;
+                let _ = self.logs.filter("");
+                self.log_view.filter_matches = false;
+                self.log_view.selected_match = None;
+            }
             KeyCode::Esc | KeyCode::Char('q') => return Effect::Close,
+            KeyCode::Char('z') => self.maximized = !self.maximized,
             KeyCode::Char(c @ '1'..='6') => {
                 self.mode = MODES[c as usize - '1' as usize];
                 self.load();
@@ -361,12 +417,28 @@ impl Inspector {
                 self.input = self.filter.clone();
             }
             KeyCode::Char(' ') | KeyCode::Char('f') if self.mode == Mode::Logs => {
-                self.follow = !self.follow;
-                if self.follow {
-                    self.scroll = 0;
-                }
+                self.log_view.toggle_follow();
             }
-            KeyCode::Char('j') if self.mode == Mode::Logs => self.pretty = !self.pretty,
+            KeyCode::Char('J') if self.mode == Mode::Logs => {
+                self.log_view.pretty = !self.log_view.pretty
+            }
+            KeyCode::Char('w') if self.mode == Mode::Logs => {
+                self.log_view.wrap = !self.log_view.wrap
+            }
+            KeyCode::Char('F') if self.mode == Mode::Logs => {
+                self.log_view.filter_matches = !self.log_view.filter_matches
+            }
+            KeyCode::Char('n' | 'N') if self.mode == Mode::Logs => {
+                self.log_view
+                    .jump_match(&self.logs, code == KeyCode::Char('N'), false)
+            }
+            KeyCode::Right if self.mode == Mode::Logs && !self.log_view.wrap => {
+                self.log_view.horizontal =
+                    (self.log_view.horizontal + 8).min(crate::logs::MAX_LINE_BYTES)
+            }
+            KeyCode::Left if self.mode == Mode::Logs && !self.log_view.wrap => {
+                self.log_view.horizontal = self.log_view.horizontal.saturating_sub(8)
+            }
             KeyCode::Char('e') => {
                 self.editing = Some(Edit::Export);
                 self.input = format!(
@@ -395,16 +467,15 @@ impl Inspector {
             KeyCode::Down | KeyCode::PageDown | KeyCode::Char('j') => {
                 self.move_by(if code == KeyCode::PageDown { 10 } else { 1 })
             }
+            KeyCode::End if self.mode == Mode::Logs => self.log_view.end(),
+            KeyCode::Home if self.mode == Mode::Logs => self.log_view.home(&self.logs),
+            KeyCode::Home => self.scroll = 0,
             KeyCode::End => {
-                self.follow = true;
-                self.scroll = 0;
-            }
-            KeyCode::Home => {
-                self.follow = false;
                 self.scroll = self
-                    .logs
-                    .matched()
-                    .saturating_sub(self.body.height as usize);
+                    .text
+                    .lines()
+                    .count()
+                    .saturating_sub(self.body.height as usize)
             }
             _ => {}
         }
@@ -412,14 +483,7 @@ impl Inspector {
     }
     fn move_by(&mut self, delta: i32) {
         if self.mode == Mode::Logs {
-            self.follow = false;
-            self.scroll = self
-                .scroll
-                .saturating_add_signed(-(delta as isize))
-                .min(self.logs.matched().saturating_sub(1));
-            if self.scroll == 0 {
-                self.follow = true;
-            }
+            self.log_view.scroll(&self.logs, delta);
         } else if self.mode == Mode::Related {
             self.selected = self
                 .selected
@@ -472,8 +536,13 @@ impl Inspector {
         f.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(theme::border_style())
-            .style(Style::default().bg(theme::ABYSS))
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(if self.focused {
+                theme::label_style()
+            } else {
+                theme::border_style()
+            })
+            .style(Style::default().bg(theme::INK))
             .title(format!(
                 " {} · {}/{} ",
                 related::kind(&self.object),
@@ -484,12 +553,13 @@ impl Inspector {
         f.render_widget(block, area);
         let rows = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(if self.mode == Mode::Logs { 1 } else { 0 }),
             Constraint::Fill(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(inner);
-        self.body = rows[1];
+        self.body = rows[2];
         self.tab_rects.clear();
         let mut x = rows[0].x;
         for (i, label) in LABELS.iter().enumerate() {
@@ -507,42 +577,74 @@ impl Inspector {
             );
             x += width;
         }
+        self.actions.clear();
         if self.mode == Mode::Logs {
-            let lines: Vec<Line> = self
-                .logs
-                .visible(self.scroll, rows[1].height as usize)
-                .into_iter()
-                .map(|line| {
-                    let body = if self.pretty {
-                        line.text
-                            .split_once(' ')
-                            .and_then(|(_, body)| {
-                                serde_json::from_str::<serde_json::Value>(body).ok()
-                            })
-                            .map(|v| serde_json::to_string(&v).unwrap_or_default())
-                            .unwrap_or_else(|| line.text.clone())
+            let query = if matches!(self.editing, Some(Edit::Search)) {
+                &self.input
+            } else {
+                &self.filter
+            };
+            let message = if let Some(error) = &self.search_error {
+                error.clone()
+            } else if query.is_empty() {
+                "Search logs…  / or Ctrl-F".into()
+            } else {
+                format!(
+                    "{}  · {} matches  · n next  N previous  · F {}",
+                    query,
+                    self.logs.matched(),
+                    if self.log_view.filter_matches {
+                        "show context"
                     } else {
-                        line.text.clone()
-                    };
-                    let style = if body.to_lowercase().contains("error") {
-                        Style::default().fg(theme::CORAL)
+                        "filter matches"
+                    }
+                )
+            };
+            f.render_widget(
+                Paragraph::new(format!(
+                    " ⌕ {message}{}",
+                    if matches!(self.editing, Some(Edit::Search)) {
+                        " ▏"
                     } else {
-                        theme::text_style()
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("{}  ", line.source), theme::muted_style()),
-                        Span::styled(body, style),
-                    ])
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), rows[1]);
+                        ""
+                    }
+                ))
+                .style(Style::default().bg(theme::ABYSS).fg(
+                    if self.search_error.is_some() {
+                        theme::CORAL
+                    } else {
+                        theme::PAPER
+                    },
+                )),
+                rows[1],
+            );
+            self.actions.push((rows[1], '/'));
+            let lines = self.log_view.rows(
+                &self.logs,
+                rows[2].width,
+                rows[2].height,
+                related::kind(&self.object) == "Pod",
+            );
+            if lines.is_empty() {
+                f.render_widget(
+                    Paragraph::new(if self.logs.is_empty() {
+                        "Waiting for log output…"
+                    } else {
+                        "No matching lines. Edit the search, or press F to show context."
+                    })
+                    .style(theme::muted_style()),
+                    rows[2],
+                );
+            } else {
+                f.render_widget(Paragraph::new(lines), rows[2]);
+            }
         } else if self.mode == Mode::Related {
             let lines: Vec<Line> = self
                 .related
                 .iter()
                 .enumerate()
                 .skip(self.scroll)
-                .take(rows[1].height as usize)
+                .take(rows[2].height as usize)
                 .map(|(i, o)| {
                     Line::styled(
                         format!(
@@ -565,14 +667,14 @@ impl Inspector {
                 } else {
                     lines
                 }),
-                rows[1],
+                rows[2],
             );
         } else {
             let lines: Vec<Line> = self
                 .text
                 .lines()
                 .skip(self.scroll)
-                .take(rows[1].height as usize)
+                .take(rows[2].height as usize)
                 .map(|s| {
                     let style = if self.mode == Mode::Yaml && s.trim_start().starts_with('#') {
                         theme::muted_style()
@@ -584,27 +686,35 @@ impl Inspector {
                     Line::styled(s.to_string(), style)
                 })
                 .collect();
-            f.render_widget(Paragraph::new(lines), rows[1]);
+            f.render_widget(Paragraph::new(lines), rows[2]);
         }
         let status = if self.mode == Mode::Logs {
             format!(
                 "{} · {} · {} lines · {:.1} MiB · {} evicted · {}",
-                if self.follow { "FOLLOW" } else { "PAUSED" },
+                if self.log_view.following() {
+                    "FOLLOW"
+                } else {
+                    "PAUSED"
+                },
                 self.options
                     .container
                     .as_deref()
                     .unwrap_or("all containers"),
-                self.logs.matched(),
+                self.logs.len(),
                 self.logs.bytes() as f64 / 1048576.,
                 self.logs.dropped,
-                self.status
+                if self.status.starts_with("Streaming ") {
+                    "Streaming"
+                } else {
+                    &self.status
+                }
             )
         } else {
             self.status.clone()
         };
-        f.render_widget(Paragraph::new(status).style(theme::muted_style()), rows[2]);
-        self.actions.clear();
-        let mut x = rows[3].x;
+        f.render_widget(Paragraph::new(status).style(theme::muted_style()), rows[3]);
+        let mut x = rows[4].x;
+        let mut action_y = rows[4].y;
         for (key, label) in if self.mode == Mode::Logs {
             vec![
                 ('f', "Follow"),
@@ -612,13 +722,37 @@ impl Inspector {
                 ('p', "Previous"),
                 ('s', "Since"),
                 ('/', "Search"),
-                ('j', "JSON"),
+                (
+                    'w',
+                    if self.log_view.wrap {
+                        "Wrap on"
+                    } else {
+                        "Wrap off"
+                    },
+                ),
+                ('J', "JSON"),
+                (
+                    'z',
+                    if self.maximized {
+                        "Restore"
+                    } else {
+                        "Maximize"
+                    },
+                ),
                 ('e', "Export"),
                 ('y', "Copy"),
                 ('q', "Close"),
             ]
         } else {
             vec![
+                (
+                    'z',
+                    if self.maximized {
+                        "Restore"
+                    } else {
+                        "Maximize"
+                    },
+                ),
                 ('l', "Logs"),
                 ('r', "Related"),
                 ('R', "Refresh"),
@@ -628,17 +762,30 @@ impl Inspector {
             ]
         } {
             let text = format!("{key} {label}  ");
+            if x + text.len() as u16 > rows[4].right() {
+                x = rows[4].x;
+                action_y += 1;
+            }
+            if action_y >= rows[4].bottom() {
+                break;
+            }
             let rect = Rect::new(
                 x,
-                rows[3].y,
-                (text.len() as u16).min(rows[3].right().saturating_sub(x)),
+                action_y,
+                (text.len() as u16).min(rows[4].right().saturating_sub(x)),
                 1,
             );
-            f.render_widget(Paragraph::new(text).style(theme::label_style()), rect);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(key.to_string(), theme::header_style().bg(theme::ABYSS)),
+                    Span::styled(format!(" {label}  "), theme::muted_style()),
+                ])),
+                rect,
+            );
             x += rect.width;
             self.actions.push((rect, key));
         }
-        if let Some(edit) = self.editing {
+        if let Some(edit) = self.editing.filter(|e| !matches!(e, Edit::Search)) {
             let label = match edit {
                 Edit::Search => "Search (literal or re:pattern)",
                 Edit::Export => "Export to new file",
@@ -650,7 +797,7 @@ impl Inspector {
                     self.input
                 ))
                 .style(theme::header_style()),
-                rows[3],
+                rows[4],
             );
         }
     }
@@ -789,7 +936,7 @@ mod tests {
             KeyCode::Char('f'),
             KeyModifiers::NONE,
         )));
-        assert!(!inspector.follow);
+        assert!(!inspector.log_view.following());
     }
     #[test]
     fn secret_yaml_and_export_do_not_expose_last_applied_credentials() {

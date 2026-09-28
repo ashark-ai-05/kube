@@ -106,7 +106,11 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, hits: &mut 
         .border_type(BorderType::Rounded)
         .border_style(theme::border_style())
         .title(Span::styled(title, theme::header_style()))
-        .style(Style::default().bg(theme::ABYSS));
+        .title_bottom(Line::styled(
+            " ↑↓ choose  Enter select  Esc back ",
+            theme::muted_style(),
+        ))
+        .style(Style::default().bg(theme::ABYSS).fg(theme::PAPER));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -117,7 +121,14 @@ pub fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, hits: &mut 
     // Filter line, then the list beneath it.
     let filter_line = Line::from(vec![
         Span::styled("\u{2315} ", theme::label_style()),
-        Span::styled(picker.filter.clone(), theme::text_style()),
+        Span::styled(
+            if picker.filter.is_empty() {
+                "Type to search namespaces or contexts…".into()
+            } else {
+                format!("{}▏", picker.filter)
+            },
+            theme::text_style(),
+        ),
     ]);
     f.render_widget(Paragraph::new(filter_line), Rect { height: 1, ..inner });
 

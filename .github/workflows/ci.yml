@@ -55,5 +55,6 @@ jobs:
       - run: cargo build --release --locked
       - run: python3 -m pip install -r scripts/requirements-test.txt
       - run: python3 scripts/tui-cluster-smoke.py target/release/kube --stress
+      - run: python3 scripts/tui-ux-smoke.py target/release/kube
       - if: always()
         run: kind delete cluster --name kube-tui-acceptance

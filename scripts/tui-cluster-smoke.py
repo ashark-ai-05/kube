@@ -44,8 +44,8 @@ screen = pyte.Screen(180, 45)
 stream = pyte.Stream(screen)
 decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 with tempfile.TemporaryDirectory(prefix='kube-ui-') as temp:
-    env = dict(os.environ, TERM='xterm-256color', XDG_CONFIG_HOME=temp)
-    process = subprocess.Popen([binary, '-n', 'demo'], stdin=slave, stdout=slave, stderr=slave, env=env)
+    env = dict(os.environ, TERM='xterm-256color', XDG_CONFIG_HOME=temp, KUBECONFIG=str(pathlib.Path(temp) / 'missing-config'))
+    process = subprocess.Popen([binary, '--kubeconfig', config, '-n', 'demo'], stdin=slave, stdout=slave, stderr=slave, env=env)
 
     def pump(seconds):
         until = time.monotonic() + seconds

@@ -29,6 +29,7 @@ struct Plan {
 }
 pub struct Operations {
     pub writable: bool,
+    pub kubeconfig_paths: Vec<std::path::PathBuf>,
     pub notice: String,
     pending: Option<Plan>,
     input: String,
@@ -51,6 +52,7 @@ impl Operations {
         let (tx, rx) = mpsc::channel(8);
         Self {
             writable: false,
+            kubeconfig_paths: vec![],
             notice: String::new(),
             pending: None,
             input: String::new(),
@@ -204,6 +206,9 @@ impl Operations {
             .namespace()
             .ok_or_else(|| anyhow::anyhow!("Pod namespace is missing"))?;
         let mut command = tokio::process::Command::new("kubectl");
+        if !self.kubeconfig_paths.is_empty() {
+            command.env("KUBECONFIG", std::env::join_paths(&self.kubeconfig_paths)?);
+        }
         command.args([
             "--context",
             context,
@@ -266,6 +271,7 @@ pub fn exec_command(
     object: &DynamicObject,
     context: &str,
     container: Option<&str>,
+    kubeconfig_paths: &[std::path::PathBuf],
 ) -> anyhow::Result<tokio::process::Command> {
     if related::kind(object) != "Pod" {
         anyhow::bail!("Select a Pod (Related → Pod) to open a shell");
@@ -291,6 +297,9 @@ pub fn exec_command(
         anyhow::bail!("Unknown container {container}");
     }
     let mut command = tokio::process::Command::new("kubectl");
+    if !kubeconfig_paths.is_empty() {
+        command.env("KUBECONFIG", std::env::join_paths(kubeconfig_paths)?);
+    }
     command
         .args([
             "--context",

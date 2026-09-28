@@ -7,6 +7,7 @@ use kube_tui::{
     store::watch::ResourceStore,
     ui::{
         hit::HitRegistry,
+        log_view::LogView,
         views::table::{TableView, render_table},
     },
 };
@@ -57,6 +58,35 @@ fn main() {
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
     report("100,000-line log search", samples, 50.);
+    let mut viewport = LogView::default();
+    let mut samples = vec![];
+    for _ in 0..500 {
+        viewport.scroll(&logs, -1);
+        let start = Instant::now();
+        std::hint::black_box(viewport.rows(&logs, 140, 40, true));
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report("Wrapped log navigation with active search", samples, 16.);
+    let mut long = LogBuffer::default();
+    for _ in 0..100 {
+        long.push(LogLine {
+            source: "demo/web/app".into(),
+            text: "request-completed ".repeat(3500),
+        });
+    }
+    long.filter("completed").unwrap();
+    let mut samples = vec![];
+    viewport.reset();
+    for i in 0..100 {
+        let start = Instant::now();
+        std::hint::black_box(viewport.rows(&long, if i % 2 == 0 { 80 } else { 140 }, 40, true));
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report(
+        "64 KiB log record reflow with highlighted search",
+        samples,
+        16.,
+    );
     let mut store = ResourceStore::new();
     for object in &objects {
         store.apply(&gvk, &ar, watcher::Event::Apply((**object).clone()));

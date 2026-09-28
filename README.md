@@ -7,13 +7,17 @@ cargo install --path . --locked
 kube                   # current kubeconfig context and namespace
 kube -n payments       # one namespace
 kube -A                # all namespaces
+kube --kubeconfig ~/clusters.yaml  # your multi-cluster YAML file
+kube --kubeconfig ~/clusters.yaml --context production
 ```
 
-Uses `KUBECONFIG` or `~/.kube/config`. No agent or service needs installing in the cluster. Normal browsing needs only the Kubernetes API. Exec and port-forward use `kubectl` on PATH. CPU/memory inspection uses metrics-server when available.
+Uses `KUBECONFIG` or `~/.kube/config` by default. `--kubeconfig PATH` overrides that source; repeat the flag to merge files. The cluster picker lists the file’s **contexts** (cluster + credentials + optional namespace). Switching contexts does not modify the file or its `current-context`. Exec and port-forward use the same selected configuration. No agent or service needs installing in the cluster. Normal browsing needs only the Kubernetes API. Exec and port-forward use `kubectl` on PATH. CPU/memory inspection uses metrics-server when available.
 
 ## Investigate
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
+
+Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Copy/export retain full metadata.
 
 Logs aggregate up to 16 pod/container streams, include source labels and timestamps, and follow replacement pods. Choose a container, inspect previous-container logs, search literal text or `re:patterns`, pause/follow, choose a time window, and export the filtered buffer. Kubernetes only exposes retained container logs; this is not a historical logging backend. Reconnect deduplication is best effort for identical timestamps.
 
@@ -21,14 +25,16 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 
 | Key | Action |
 | --- | --- |
-| `:` or click the top bar | Searchable command palette |
+| `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |
 | `/` | Fuzzy resource filter; combine with `label:app=api` or `label:tier!=batch` |
-| `Tab`, arrows, `j`/`k` | Focus and navigation |
+| `Tab` / `Shift-Tab`, arrows, `j`/`k` | Switch pane and navigate |
 | `Enter`, double-click | Inspect selection |
-| `c` / `n` | Cluster / namespace picker |
+| `Ctrl-O` / `Ctrl-N`, or click top-bar selectors | Cluster / namespace picker from any pane |
+| `c` / `n` in resource browser | Cluster / namespace picker |
 | `l` / `r` | Logs / related resources |
-| `1`–`6`, `Tab` in inspector | Inspector tabs |
+| `1`–`6`, or click inspector tabs | Inspector views |
+| `z` in inspector | Maximize / restore |
 | `[` / `]`, `b` | Resize / collapse sidebar |
 | Drag pane divider | Resize sidebar or inspector |
 | `m` | Toggle mouse capture for native terminal copying |
@@ -36,7 +42,7 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | `Esc` / `q` | Close inspector or quit |
 | `Ctrl-C` | Quit |
 
-Inspector actions are clickable. Logs: `f` pause/follow, `c` cycle containers, `p` previous instance, `s` time window, `/` search, `j` JSON display, `e` export, `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).
+Inspector actions are clickable. Logs: `w` wrap on/off; `←`/`→` pan unwrapped lines; `/` or `Ctrl-F` search; `n`/`N` next/previous matching line; `F` matching lines/context; `Ctrl-U` clear an editing query; `Esc` cancel editing or clear a committed search; `Home` oldest retained line; `End` live tail; `f` pause/follow; `c` cycle containers; `p` previous instance; `s` time window; `J` pretty JSON; `e` export; `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).
 
 ## Operations
 
@@ -76,6 +82,9 @@ python3 -m pip install -r scripts/requirements-test.txt
 python3 scripts/tui-cluster-smoke.py
 cargo build --release --locked
 python3 scripts/tui-cluster-smoke.py target/release/kube --stress
+python3 scripts/tui-ux-smoke.py target/release/kube
 ```
 
 This creates a `demo` namespace, nginx deployment and restricted ServiceAccount. Tests create/delete their own fixture resources. CI runs unit/render/terminal tests on Linux and macOS and Kubernetes acceptance on Linux. The binary workflow produces Linux x86-64 and macOS ARM64 archives with checksums on version tags or manual dispatch.
+
+The visual design takes cues from [Ratatui’s app showcase](https://ratatui.rs/showcase/apps/): visible keyboard actions, distinct pane focus, compact metadata, and a dedicated reading area. Set `KUBE_UI_CAPTURE_DIR` when running the UX smoke test to save terminal-cell snapshots for visual review.
