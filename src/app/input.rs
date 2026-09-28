@@ -74,7 +74,7 @@ pub enum Action {
 ///
 /// `focus` is an explicit parameter rather than state this function tracks
 /// itself. Which pane has input changes what almost every key means — `Esc`
-/// closes a picker instead of quitting, every character (including `j`, `k`,
+/// closes a picker and is harmless at the root, every character (including `j`, `k`,
 /// `c`, `n`, `q`) becomes filter text instead of navigation, `j` moves the
 /// sidebar rather than the table — so the caller, which owns that state,
 /// passes it in rather than reinterpreting a stateless mapper's output after
@@ -198,7 +198,7 @@ fn key_action(code: KeyCode, focus: Focus) -> Action {
             KeyCode::Tab => Action::ToggleFocus,
             KeyCode::Char('c') => Action::OpenClusterPicker,
             KeyCode::Char('n') => Action::OpenNamespacePicker,
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('q') => Action::Quit,
             _ => Action::None,
         },
         Focus::Table => match code {
@@ -218,7 +218,7 @@ fn key_action(code: KeyCode, focus: Focus) -> Action {
             }
             KeyCode::Char('c') => Action::OpenClusterPicker,
             KeyCode::Char('n') => Action::OpenNamespacePicker,
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('q') => Action::Quit,
             _ => Action::None,
         },
     }
@@ -395,15 +395,19 @@ mod tests {
     }
 
     #[test]
-    fn q_and_esc_quit() {
+    fn quit_is_explicit_and_repeated_escape_is_harmless_at_the_root() {
         assert_eq!(
             action_for(&key(KeyCode::Char('q')), &registry(), Focus::Table),
             Action::Quit
         );
-        assert_eq!(
-            action_for(&key(KeyCode::Esc), &registry(), Focus::Table),
-            Action::Quit
-        );
+        for focus in [Focus::Table, Focus::Sidebar] {
+            for _ in 0..5 {
+                assert_eq!(
+                    action_for(&key(KeyCode::Esc), &registry(), focus),
+                    Action::None
+                );
+            }
+        }
     }
 
     #[test]

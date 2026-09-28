@@ -49,7 +49,8 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | Drag pane divider | Resize sidebar or inspector |
 | `m` | Toggle mouse capture for native terminal copying |
 | `Ctrl-U` in resource filter | Clear query |
-| `Esc` / `q` | Close inspector or quit |
+| `Esc` | Close or go back; does nothing at the root |
+| `q` | Close inspector; quit from the resource browser |
 | `Ctrl-C` | Quit |
 
 Inspector actions are clickable. Logs: `v` fold/expand repeated messages and stack frames; `w` wrap on/off; `←`/`→` pan unwrapped lines; `/` or `Ctrl-F` search; `n`/`N` next/previous matching line; `F` matching lines/context; `Ctrl-U` clear an editing query; `Esc` cancel editing or clear a committed search; `Home` oldest retained line; `End` live tail; `f` pause/follow; `c` cycle containers; `p` previous instance; `s` time window; `J` pretty JSON; `e` export; `y` clipboard. Exports create a new file and never overwrite an existing file. Clipboard uses `pbcopy` on macOS or `xclip` on Linux. Pane sizes and mouse preference are saved to `$XDG_CONFIG_HOME/kube/preferences.json` (normally `~/.config/kube/preferences.json`).

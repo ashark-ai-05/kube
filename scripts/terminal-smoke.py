@@ -46,6 +46,12 @@ users:
                     output += os.read(master, 65536)
             assert b'\x1b[?1049h' in output, f'UI did not enter alternate screen: {output[-500:]!r}'
             time.sleep(.15)
+            for _ in range(4):
+                os.write(master, b'\x1b')
+                time.sleep(.12)
+                while select.select([master], [], [], .02)[0]:
+                    output += os.read(master, 65536)
+                assert process.poll() is None, 'Repeated Esc unexpectedly exited the app'
             if shutdown == 'q':
                 os.write(master, b'q')
             else:
@@ -61,7 +67,7 @@ users:
             assert termios.tcgetattr(slave) == before, 'terminal settings were not restored'
             assert b'\x1b[?1049l' in output, 'alternate screen was not restored'
             assert b'\x1b[?1000l' in output, 'mouse capture was not released'
-            print(f'PASS: {shutdown} restores terminal settings, screen and mouse')
+            print(f'PASS: repeated Esc stays open; {shutdown} restores terminal settings, screen and mouse')
         finally:
             if process.poll() is None:
                 process.kill()
