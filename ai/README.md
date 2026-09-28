@@ -13,11 +13,13 @@ Only the typed query and fixed action definitions are sent to the local worker. 
 Local validation on 2026-09-28:
 
 - The **shipped common-phrase path** passed all 14 evaluation cases, including scope, previous logs, diagnosis navigation and mutation rejection.
-- The actual packaged model successfully produced a validated previous-log action in the ignored integration test. With startup warmup disabled, that test completed in 1.42 seconds locally. No GPU was used. A separate final run completed in 1.40 seconds with measured peak worker RSS of 697.5 MiB; the worker exited afterward. These are local measurements, not a guarantee on other CPUs.
+- The actual packaged model successfully produced a validated previous-log action in the ignored integration test. The final CPU-only run completed in 1.06 seconds with measured peak worker RSS of 706.3 MiB; the worker exited afterward. Device, operation and KV-cache GPU offloading are explicitly disabled. These are local measurements, not a guarantee on other CPUs.
 - The **raw unfine-tuned model** passed only 7/14 cases after output validation and the mutation guard (4/11 read/navigation cases). Accepted mistakes included interpreting “all namespaces” as the literal namespace `all`; other responses invented namespaces or malformed arguments. Raw evaluation deliberately exits nonzero. It is **not an accuracy acceptance pass**.
 - A few-shot prompt trial did not improve the aggregate score and regressed previous-log selection; that trial is not shipped.
 
 For that reason, model output is labelled **experimental**, never auto-applied, and is not used to generate diagnostic claims. The current release is useful for the supported built-in phrases; arbitrary natural language remains an experimental aid. Domain fine-tuning and a larger held-out paraphrase suite are required before removing that label. Model size is not evidence of accuracy, and grammar/schema validity is not evidence of correct interpretation.
+
+Cold startup shares the full 30-second request deadline. An earlier eight-second startup cutoff failed on the macOS release runner even though local and Linux checks passed; that separate cutoff has been removed. Cancellation still drops and kills the worker immediately.
 
 ```sh
 cargo run --locked --example assistant-eval

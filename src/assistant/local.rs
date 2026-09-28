@@ -45,11 +45,12 @@ impl Bundle {
         let key: String = random.iter().map(|b| format!("{b:02x}")).collect();
         drop(listener);
         let mut child=Command::new(&self.server).args(["-m"]).arg(&self.model)
-            .args(["--host","127.0.0.1","--port",&port.to_string(),"--api-key",&key,"-c","2048","-np","1","-ngl","0","-t","2","--no-webui","--no-warmup","-b","256","-ub","128"])
+            .args(["--host","127.0.0.1","--port",&port.to_string(),"--api-key",&key,"-c","2048","-np","1","-ngl","0","--device","none","--no-op-offload","--no-kv-offload","-t","2","--no-webui","--no-warmup","-b","256","-ub","128"])
             .env_clear().env("PATH","/usr/bin:/bin").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true)
             .spawn().map_err(|_|"Could not start the bundled local runtime. Check the AI package for your platform.")?;
-        let mut ready = false;
-        for _ in 0..160 {
+        // Cold loading on slower machines shares the outer request deadline.
+        // A separate short startup cutoff can reject a healthy worker before it loads.
+        loop {
             if child
                 .try_wait()
                 .map_err(|_| "Could not check local runtime")?
@@ -58,13 +59,9 @@ impl Bundle {
                 return Err("The bundled local runtime exited while loading.".into());
             }
             if let Ok((200, _)) = request(port, &key, "GET", "/health", String::new()).await {
-                ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if !ready {
-            return Err("The local model did not become ready.".into());
         }
         let prompt = format!(
             "{}<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
