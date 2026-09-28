@@ -41,3 +41,9 @@ Added Linux/macOS formatting, Clippy, unit tests, PTY cleanup and benchmark chec
 Release PTY acceptance measured **508 ms** to the first populated view and **8.8 ms p95** from a keypress to rendered follow/pause state with a fixture producing approximately 10,000 lines/second (50 samples, local kind, pre-authenticated context). The load fixture is deleted afterward. Cached rendering and mixed resource/log batch budgets are enforced by the synthetic benchmark; the live load test enforces a 50 ms input budget. Authentication, remote network latency and terminal performance can change user-observed results.
 
 Rendered-screen review also keeps the context/namespace footer visible with the inspector open and uses compact name/status columns in narrow panes. Regression coverage now includes 529 unit/render/input tests.
+
+## Final cache race check
+
+Passed 530 unit/render/input tests and Clippy after rejecting late Table responses for evicted kinds or superseded requests. This prevents slow API replies from repopulating caches outside the eight-kind retention policy. Table notifications also use the existing coalescing gate.
+
+The release smoke/load check after this fix passed: first populated view **504 ms**, key-to-render **10.1 ms p95**. The preceding delivery commit (`ceae1a5`) also passed all three [remote Acceptance jobs](https://github.com/ashark-ai-05/kube/actions/runs/36365155447): Linux, macOS and the isolated Kubernetes workflow.

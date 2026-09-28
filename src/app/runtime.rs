@@ -1054,10 +1054,9 @@ fn spawn_discovery_and_watches(
 /// Ask the API server for the active kind's own columns, kubectl-style.
 ///
 /// Writes the answer straight into the store it was issued against, keyed by
-/// the kind it was issued for, and only then wakes the loop. A reply for a
-/// kind the user has since left updates that kind's (unread) entry; a reply
-/// for a cluster the user has since left updates a store nobody reads. Both
-/// are harmless by construction rather than by timing.
+/// the kind and request timestamp it was issued for, and only then wakes the
+/// loop. Evicted kinds and superseded requests reject late replies. Replies
+/// from a previous cluster only address its old, detached store.
 fn spawn_table_fetch(
     client: Client,
     resource: ApiResource,
@@ -1065,6 +1064,7 @@ fn spawn_table_fetch(
     gvk: GroupVersionKind,
     store: crate::store::watch::SharedStore,
     tx: mpsc::UnboundedSender<AppEvent>,
+    issued: Instant,
 ) {
     tokio::spawn(async move {
         let api: Api<DynamicObject> = match namespace.as_deref() {
@@ -1074,8 +1074,13 @@ fn spawn_table_fetch(
         let url = api.resource_url().to_string();
         match fetch_table(&client, &url).await {
             Ok(data) => {
-                store.write().await.set_table_data(gvk.clone(), data);
-                let _ = tx.send(AppEvent::StoreChanged { gvk });
+                if store
+                    .write()
+                    .await
+                    .finish_table_fetch(gvk.clone(), issued, data)
+                {
+                    let _ = tx.send(AppEvent::StoreChanged { gvk });
+                }
             }
             Err(e) => {
                 // Not fatal: `column_source` falls back to the builtin
@@ -1760,6 +1765,7 @@ async fn run_with_scope(cli_scope: NamespaceScope) -> anyhow::Result<()> {
                     active_kind.clone(),
                     store.clone(),
                     tx.clone(),
+                    now,
                 );
             }
         } else if let Some(changed) = snapshot.last_change

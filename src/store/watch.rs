@@ -195,6 +195,20 @@ impl ResourceStore {
         self.tables.insert(gvk, table);
     }
 
+    /// A slow reply must not resurrect an evicted kind or replace a newer fetch.
+    pub fn finish_table_fetch(
+        &mut self,
+        gvk: GroupVersionKind,
+        issued: Instant,
+        table: TableData,
+    ) -> bool {
+        if self.last_table_fetch(&gvk) != Some(issued) {
+            return false;
+        }
+        self.set_table_data(gvk.clone(), table);
+        self.notify_once(&gvk)
+    }
+
     /// `None` until a fetch for this kind has completed. The render path
     /// must treat that exactly like any other kind with no data yet —
     /// falling back to the builtin column registry (`store::columns::
@@ -507,6 +521,22 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         })))
+    }
+
+    #[test]
+    fn delayed_table_reply_cannot_restore_evicted_cache_or_replace_newer_data() {
+        let mut store = ResourceStore::new();
+        let kind = pod_gvk();
+        let old = Instant::now();
+        store.note_table_fetch(kind.clone(), old);
+        store.evict(&kind);
+        assert!(!store.finish_table_fetch(kind.clone(), old, TableData::default()));
+        assert!(store.table_data(&kind).is_none());
+        let new = old + std::time::Duration::from_secs(1);
+        store.note_table_fetch(kind.clone(), new);
+        assert!(!store.finish_table_fetch(kind.clone(), old, TableData::default()));
+        assert!(store.finish_table_fetch(kind.clone(), new, TableData::default()));
+        assert!(store.table_data(&kind).is_some());
     }
 
     #[test]
