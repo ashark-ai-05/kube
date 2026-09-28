@@ -135,6 +135,11 @@ impl Inspector {
         s.load();
         s
     }
+    pub fn previous_logs(&mut self) {
+        self.mode = Mode::Logs;
+        self.options.previous = true;
+        self.load();
+    }
     pub fn replace(&mut self, object: DynamicObject) {
         self.object = object;
         self.mode = Mode::Overview;
@@ -553,7 +558,11 @@ impl Inspector {
         f.render_widget(block, area);
         let rows = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(if self.mode == Mode::Logs { 1 } else { 0 }),
+            Constraint::Length(match self.mode {
+                Mode::Logs => 1,
+                Mode::Overview => 4,
+                _ => 0,
+            }),
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(2),
@@ -569,7 +578,9 @@ impl Inspector {
             self.tab_rects.push(rect);
             f.render_widget(
                 Paragraph::new(text).style(if self.mode == MODES[i] {
-                    theme::header_style().add_modifier(Modifier::REVERSED)
+                    theme::label_style()
+                        .bg(theme::SURFACE)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     theme::muted_style()
                 }),
@@ -670,6 +681,39 @@ impl Inspector {
                 rows[2],
             );
         } else {
+            if self.mode == Mode::Overview {
+                use crate::ui::workspace::{Health, health, health_style};
+                let value = health(&self.object);
+                let label = match value {
+                    Health::Ready => "READY",
+                    Health::Attention => "NEEDS ATTENTION",
+                    Health::Completed => "COMPLETED",
+                    Health::Unknown => "READINESS UNKNOWN",
+                };
+                let owner = self
+                    .object
+                    .metadata
+                    .owner_references
+                    .as_ref()
+                    .and_then(|o| o.first())
+                    .map(|o| format!("{} / {}", o.kind, o.name))
+                    .unwrap_or_else(|| "No controller owner".into());
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                format!(" {label} "),
+                                health_style(value).bg(theme::SURFACE),
+                            ),
+                            Span::styled("  Observed Kubernetes state", theme::muted_style()),
+                        ]),
+                        Line::styled(format!(" ↑ {owner}"), theme::muted_style()),
+                        Line::styled(" 3 Events  →  4 Logs  →  5 Related", theme::label_style()),
+                    ])
+                    .style(Style::default().bg(theme::ABYSS)),
+                    rows[1],
+                );
+            }
             let lines: Vec<Line> = self
                 .text
                 .lines()
@@ -686,7 +730,10 @@ impl Inspector {
                     Line::styled(s.to_string(), style)
                 })
                 .collect();
-            f.render_widget(Paragraph::new(lines), rows[2]);
+            f.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                rows[2],
+            );
         }
         let status = if self.mode == Mode::Logs {
             format!(

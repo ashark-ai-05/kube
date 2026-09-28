@@ -8,6 +8,11 @@ use ratatui::{
 };
 
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("home", "Fleet radar: pod health in the current scope"),
+    ("browse", "Focus studio: browse current resources"),
+    ("resources", "Toggle the complete API resource catalog"),
+    ("kind Pod", "Browse pods"),
+    ("kind Deployment", "Browse deployments"),
     ("logs", "Live logs for the selected pod or workload"),
     ("related", "Explore owners, pods, services and storage"),
     ("overview", "Readiness, rollout and container diagnostics"),
@@ -104,11 +109,9 @@ impl CommandBar {
                 }
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Enter => {
-                    let dynamic = self
-                        .query
-                        .split_whitespace()
-                        .next()
-                        .is_some_and(|v| matches!(v, "scale" | "forward" | "exec"));
+                    let dynamic = self.query.split_whitespace().next().is_some_and(|v| {
+                        matches!(v, "scale" | "forward" | "exec" | "kind" | "ask")
+                    });
                     let command = if dynamic {
                         self.query.clone()
                     } else {

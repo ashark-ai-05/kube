@@ -104,8 +104,12 @@ try:
         resize(150, 40)
         process = subprocess.Popen([binary, '--kubeconfig', str(selected_file), '--context', chosen['name'], '-n', 'demo'],
                                    stdin=slave, stdout=slave, stderr=slave, env=env)
+        expect('Fleet radar', 30)
+        assert 'RESTARTS' not in text(), 'Dashboard must clear underlying table'
+        capture('fleet-radar')
+        send('\x1bOR')
         expect('web-', 30)
-        expect('Core resources')
+        expect('WORKSPACE')
         capture('resources')
         click(screen.display[0].index('ns:') + 2, 0)
         expect('Namespaces')
@@ -178,7 +182,7 @@ try:
         resize(150, 40)
         send('z\t')
         # Tab moved focus to the sidebar; return to the active Pod list by click.
-        pod_row = next(i for i, row in enumerate(screen.display) if '» Pod' in row)
+        pod_row = next(i for i, row in enumerate(screen.display) if '▤  Pods' in row)
         click(5, pod_row)
         expect('Enter inspect')
         assert 'Search logs' not in text(), 'Sidebar activation did not return to resources'

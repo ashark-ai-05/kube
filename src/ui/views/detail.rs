@@ -102,6 +102,7 @@ impl DetailTab {
 /// an unchanged object on every frame.
 pub struct DetailPane {
     pub sidebar_width: u16,
+    pub catalog: bool,
     pub tab: DetailTab,
     pub yaml_scroll: u16,
     pub events_scroll: u16,
@@ -118,6 +119,7 @@ impl DetailPane {
     pub fn new() -> Self {
         Self {
             sidebar_width: 28,
+            catalog: true,
             tab: DetailTab::Overview,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -636,6 +638,7 @@ mod tests {
         let obj = pod_with_status();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -669,6 +672,7 @@ mod tests {
         let obj = pod_with_status();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: active,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -962,6 +966,7 @@ mod tests {
         let obj = pod_with_status();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 0,
@@ -1018,6 +1023,7 @@ mod tests {
         let obj = pod_with_status();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 9999,
@@ -1047,6 +1053,7 @@ mod tests {
         let obj = pod_with_status();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: DetailTab::Events,
             yaml_scroll: 0,
             events_scroll: 9999,
@@ -1249,6 +1256,7 @@ mod tests {
         let mut hits = HitRegistry::new();
         let mut pane = DetailPane {
             sidebar_width: 28,
+            catalog: true,
             tab: DetailTab::Yaml,
             yaml_scroll: 9999,
             events_scroll: 0,

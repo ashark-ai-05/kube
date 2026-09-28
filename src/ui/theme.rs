@@ -9,6 +9,8 @@ pub const PERIWINKLE: Color = Color::Rgb(0x8F, 0xA0, 0xFF);
 pub const TEAL: Color = Color::Rgb(0x4F, 0xD6, 0xC9);
 pub const VIOLET: Color = Color::Rgb(0xA7, 0x8B, 0xFA);
 
+pub const SURFACE: Color = Color::Rgb(0x21, 0x30, 0x3C);
+
 // Text.
 pub const PAPER: Color = Color::Rgb(0xE4, 0xE8, 0xF0);
 pub const MIST: Color = Color::Rgb(0x8A, 0x93, 0xA6);

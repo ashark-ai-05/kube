@@ -65,6 +65,8 @@ with tempfile.TemporaryDirectory(prefix='kube-ui-') as temp:
 
     try:
         start = time.monotonic()
+        expect('Fleet radar', 20)
+        send('\x1bOR')
         expect('web-', 20)
         populated_ms = (time.monotonic() - start) * 1000
         print(f'First populated view: {populated_ms:.0f} ms', flush=True)

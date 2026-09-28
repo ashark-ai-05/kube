@@ -5,7 +5,7 @@ use ratatui::{
     style::{Modifier, Style},
     widgets::{Block, Paragraph},
 };
-pub const HEADER_HEIGHT: u16 = 2;
+pub const HEADER_HEIGHT: u16 = 3;
 #[derive(Default)]
 pub struct Header {
     buttons: Vec<(Rect, &'static str)>,
@@ -19,6 +19,7 @@ pub struct HeaderState<'a> {
     pub filter: &'a str,
     pub editing: bool,
     pub notice: &'a str,
+    pub home: bool,
 }
 impl Header {
     pub fn command_at(&self, x: u16, y: u16) -> Option<&'static str> {
@@ -133,5 +134,31 @@ impl Header {
             cells[3],
         );
         self.buttons.push((cells[3], "help"));
+        if area.height > 2 {
+            let labels = [
+                (" F2 Fleet radar ", "home"),
+                (" F3 Focus studio ", "browse"),
+                (" ^R Resources ", "resources"),
+            ];
+            let mut x = 1;
+            for (label, command) in labels {
+                let width = (label.len() as u16).min(area.width.saturating_sub(x));
+                let rect = Rect::new(x, 2, width, 1);
+                let active =
+                    (command == "home" && state.home) || (command == "browse" && !state.home);
+                f.render_widget(
+                    Paragraph::new(label).style(if active {
+                        theme::label_style().bg(theme::SURFACE)
+                    } else if command == "ask" {
+                        Style::default().fg(theme::VIOLET)
+                    } else {
+                        theme::muted_style()
+                    }),
+                    rect,
+                );
+                self.buttons.push((rect, command));
+                x += width + 1;
+            }
+        }
     }
 }

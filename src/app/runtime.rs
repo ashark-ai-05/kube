@@ -911,7 +911,9 @@ fn render_frame(
         Constraint::Fill(1),
     ])
     .split(chunks[0]);
-    render_sidebar(f, body[0], tree, hits, args.gvk);
+    if pane.catalog {
+        render_sidebar(f, body[0], tree, hits, args.gvk);
+    }
     render_table_with_data(
         f,
         body[1],
@@ -1504,6 +1506,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     let mut preferences = Preferences::load();
     let mut preferences_changed = false;
     let mut pane = DetailPane::new();
+    pane.catalog = false;
+    let mut workspace = crate::ui::workspace::Workspace::default();
+    let mut workspace_store = None;
     pane.sidebar_width = preferences.sidebar;
     if !preferences.mouse {
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
@@ -1718,6 +1723,10 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
         // switch cannot show the previous cluster's health over this
         // cluster's (empty) object list, nor one kind's count beside
         // another's availability.
+        if workspace_store != Some(StoreId::of(&store)) {
+            workspace.recent.clear();
+            workspace_store = Some(StoreId::of(&store));
+        }
         let mut snapshot = store_snapshot(&store, &active_kind, &kinds).await;
         if !filter_text.is_empty() {
             snapshot
@@ -1967,6 +1976,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 match k.code {
                     KeyCode::Char('n') => command = Some("namespace".into()),
                     KeyCode::Char('o') => command = Some("cluster".into()),
+                    KeyCode::Char('r') if !overlay.is_open() && !palette.open => {
+                        command = Some("resources".into())
+                    }
                     KeyCode::Char('k') => {
                         palette.start();
                         needs_redraw = true;
@@ -2011,6 +2023,8 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
+                    KeyCode::F(2) if !overlay.is_open() => command = Some("home".into()),
+                    KeyCode::F(3) if !overlay.is_open() => command = Some("browse".into()),
                     KeyCode::Char(':')
                         if !overlay.is_open()
                             && !inspector.as_ref().is_some_and(|p| p.editing()) =>
@@ -2028,6 +2042,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         continue;
                     }
                     KeyCode::Char('/') if inspector.is_none() && !overlay.is_open() => {
+                        workspace.home = false;
                         filter_edit = Some(filter_text.clone());
                         needs_redraw = true;
                         continue;
@@ -2101,6 +2116,79 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     _ => {}
                 }
             }
+            if !overlay.is_open() && !palette.open && filter_edit.is_none() {
+                if let Event::Mouse(m) = input
+                    && m.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                    && let Some(c) = workspace.command_at(m.column, m.row)
+                {
+                    command = Some(c);
+                }
+                if command.is_none()
+                    && let Event::Key(k) = input
+                    && k.kind == KeyEventKind::Press
+                    && !inspector.as_ref().is_some_and(|p| p.focused)
+                {
+                    if pane_focus == Focus::Sidebar && !workspace.catalog {
+                        let nav = workspace.nav_commands();
+                        match k.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                workspace.selected = (workspace.selected + 1).min(nav.len() - 1)
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                workspace.selected = workspace.selected.saturating_sub(1)
+                            }
+                            KeyCode::Enter => command = nav.get(workspace.selected).cloned(),
+                            _ => {}
+                        }
+                        if matches!(
+                            k.code,
+                            KeyCode::Down | KeyCode::Up | KeyCode::Char('j' | 'k')
+                        ) {
+                            needs_redraw = true;
+                            continue;
+                        }
+                    } else if workspace.home && inspector.is_none() {
+                        let issues: Vec<_> = objects
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, o)| {
+                                crate::ui::workspace::health(o)
+                                    == crate::ui::workspace::Health::Attention
+                            })
+                            .collect();
+                        match k.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                workspace.issue =
+                                    (workspace.issue + 1).min(issues.len().saturating_sub(1))
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                workspace.issue = workspace.issue.saturating_sub(1)
+                            }
+                            KeyCode::Enter => {
+                                command = issues
+                                    .get(workspace.issue)
+                                    .map(|(i, _)| format!("inspect {i}"))
+                            }
+                            KeyCode::Char('/') => {
+                                workspace.home = false;
+                                filter_edit = Some(filter_text.clone());
+                            }
+                            _ => {}
+                        }
+                        if matches!(
+                            k.code,
+                            KeyCode::Down | KeyCode::Up | KeyCode::Char('j' | 'k') | KeyCode::Enter
+                        ) && command.is_none()
+                        {
+                            needs_redraw = true;
+                            continue;
+                        }
+                    }
+                }
+            }
             if let Some(command) = command {
                 let selected = inspector.as_ref().map(|p| p.object.clone()).or_else(|| {
                     selected_object(
@@ -2116,6 +2204,72 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 });
                 let words: Vec<_> = command.split_whitespace().collect();
                 match words.first().copied().unwrap_or("") {
+                    "home" | "browse" | "kind" => {
+                        let desired = if words[0] == "home" {
+                            "Pod"
+                        } else if words[0] == "kind" {
+                            words.get(1).copied().unwrap_or("Pod")
+                        } else {
+                            &active_kind.kind
+                        };
+                        if let Some(kind) = kinds
+                            .iter()
+                            .find(|k| k.gvk.kind == desired)
+                            .map(|k| k.gvk.clone())
+                            .or_else(|| (desired == active_kind.kind).then(|| active_kind.clone()))
+                        {
+                            session.lock().await.active_kind = kind.clone();
+                            active_kind_now = kind;
+                            view.selected = 0;
+                            view.offset = 0;
+                            view.sort = None;
+                            reset_selection = true;
+                            inspector = None;
+                            detail = None;
+                            last_click = None;
+                            filter_text.clear();
+                            workspace.home = words[0] == "home";
+                            pane_focus = Focus::Table;
+                        } else {
+                            operations.notice =
+                                format!("{desired} is not available in this cluster");
+                        }
+                    }
+                    "resources" => {
+                        workspace.catalog = !workspace.catalog;
+                        pane.catalog = workspace.catalog;
+                        pane.sidebar_width = pane.sidebar_width.max(26);
+                        pane_focus = Focus::Sidebar;
+                        if let Some(panel) = &mut inspector {
+                            panel.focused = false;
+                        }
+                    }
+                    "recent" | "inspect" => {
+                        let index = words.get(1).and_then(|n| n.parse::<usize>().ok());
+                        let object = index.and_then(|i| {
+                            if words[0] == "recent" {
+                                workspace.recent.get(i).cloned()
+                            } else {
+                                objects.get(i).map(|o| (**o).clone())
+                            }
+                        });
+                        if let Some(object) = object {
+                            let kind = crate::cluster::related::gvk(&object);
+                            if kinds.iter().any(|k| k.gvk == kind) {
+                                session.lock().await.active_kind = kind.clone();
+                                active_kind_now = kind;
+                            }
+                            workspace.remember(&object);
+                            inspector = Some(Inspector::new(
+                                object,
+                                Mode::Overview,
+                                client.clone(),
+                                kinds.clone(),
+                                tx.clone(),
+                            ));
+                            inspector_store = Some(StoreId::of(&store));
+                        }
+                    }
                     "help" => palette.help = true,
                     "palette" => palette.start(),
                     "filter" => filter_edit = Some(filter_text.clone()),
@@ -2188,6 +2342,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     }
                     "overview" | "yaml" | "events" | "logs" | "related" | "metrics" => {
                         if let Some(object) = selected {
+                            workspace.remember(&object);
                             let mode = match words[0] {
                                 "yaml" => Mode::Yaml,
                                 "events" => Mode::Events,
@@ -2428,6 +2583,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         tree.selected = i;
                         pane_focus = Focus::Sidebar;
                     }
+                    workspace.home = false;
                     match tree.selected_kind().map(|k| k.gvk.clone()) {
                         None => {
                             let row = tree.selected;
@@ -2762,6 +2918,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             detail = None;
         }
         if let Some(obj) = detail_object.as_ref() {
+            workspace.remember(obj);
             inspector = Some(Inspector::new(
                 (**obj).clone(),
                 Mode::Overview,
@@ -2776,7 +2933,15 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             Some(d) => (d.events.as_slice(), d.events_error.as_deref()),
             None => (&[][..], None),
         };
+        if let Some(panel) = &inspector
+            && workspace.recent.first().is_none_or(|o| {
+                o.uid() != panel.object.uid() || o.name_any() != panel.object.name_any()
+            })
+        {
+            workspace.remember(&panel.object);
+        }
         term.draw(|f| {
+            workspace.clear_hits();
             terminal_width = f.area().width;
             inspector_divider = None;
             // Modal pickers paint once, after the inspector and top bar.
@@ -2812,7 +2977,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 area.height.saturating_sub(HEADER_HEIGHT + 1),
             );
             let inspector_focused = inspector.as_ref().is_some_and(|p| p.focused);
-            if !inspector.as_ref().is_some_and(|p| p.maximized) {
+            if !inspector.as_ref().is_some_and(|p| p.maximized) && workspace.catalog {
                 f.render_widget(
                     ratatui::widgets::Block::bordered()
                         .border_type(ratatui::widgets::BorderType::Rounded)
@@ -2851,6 +3016,25 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         )),
                     table_area,
                 );
+            }
+            if !inspector.as_ref().is_some_and(|p| p.maximized) && !workspace.catalog {
+                hits.push(sidebar_area, 0, crate::ui::HitTarget::Background);
+                workspace.render_rail(
+                    f,
+                    sidebar_area,
+                    &active_kind,
+                    !inspector_focused && pane_focus == Focus::Sidebar,
+                );
+            }
+            if workspace.home && inspector.is_none() {
+                let home_area = ratatui::layout::Rect::new(
+                    sidebar_width + 1,
+                    HEADER_HEIGHT,
+                    area.width.saturating_sub(sidebar_width + 1),
+                    area.height.saturating_sub(HEADER_HEIGHT + 1),
+                );
+                hits.push(home_area, 0, crate::ui::HitTarget::Background);
+                workspace.render_home(f, home_area, objects, status);
             }
             if let Some(panel) = &mut inspector {
                 let area = f.area();
@@ -2904,6 +3088,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     filter: &filter_text,
                     editing: filter_edit.is_some(),
                     notice: &operations.notice,
+                    home: workspace.home && inspector.is_none(),
                 },
             );
             // Pickers are modal and must paint after every inspector/chrome pane.

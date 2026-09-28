@@ -13,6 +13,12 @@ kube --kubeconfig ~/clusters.yaml --context production
 
 Uses `KUBECONFIG` or `~/.kube/config` by default. `--kubeconfig PATH` overrides that source; repeat the flag to merge files. The cluster picker lists the file’s **contexts** (cluster + credentials + optional namespace). Switching contexts does not modify the file or its `current-context`. Exec and port-forward use the same selected configuration. No agent or service needs installing in the cluster. Normal browsing needs only the Kubernetes API. Exec and port-forward use `kubectl` on PATH. CPU/memory inspection uses metrics-server when available.
 
+## Workspace
+
+Fleet radar opens with readiness counts, a pod attention queue and namespace signals for the selected scope. Counts come from the current watch; it does not query every cluster. Running pods without readiness evidence are shown as unknown.
+
+`F2` opens Fleet radar. `F3` opens Focus studio, the resource browser. The compact rail contains common workloads and recent investigations; `Ctrl-R` or **All resources** opens the full discovered API catalog, including CRDs. `Tab` moves between the rail, resource list and inspector. The inspector adds readiness and owner context with direct Events, Logs and Related tabs. Cluster and namespace selectors stay visible throughout.
+
 ## Investigate
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
@@ -25,6 +31,8 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 
 | Key | Action |
 | --- | --- |
+| `F2` / `F3` | Fleet radar / Focus studio |
+| `Ctrl-R` / All resources | Toggle the complete API resource catalog |
 | `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |
 | `/` | Fuzzy resource filter; combine with `label:app=api` or `label:tier!=batch` |
