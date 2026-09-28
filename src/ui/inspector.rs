@@ -433,6 +433,9 @@ impl Inspector {
             KeyCode::Char('F') if self.mode == Mode::Logs => {
                 self.log_view.filter_matches = !self.log_view.filter_matches
             }
+            KeyCode::Char('v') if self.mode == Mode::Logs => {
+                self.log_view.fold = !self.log_view.fold
+            }
             KeyCode::Char('n' | 'N') if self.mode == Mode::Logs => {
                 self.log_view
                     .jump_match(&self.logs, code == KeyCode::Char('N'), false)
@@ -775,6 +778,14 @@ impl Inspector {
                         "Wrap on"
                     } else {
                         "Wrap off"
+                    },
+                ),
+                (
+                    'v',
+                    if self.log_view.fold {
+                        "Fold on"
+                    } else {
+                        "Fold off"
                     },
                 ),
                 ('J', "JSON"),

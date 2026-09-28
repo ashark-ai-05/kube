@@ -24,7 +24,32 @@ pub fn safe_text(text: &str) -> String {
         .collect()
 }
 
+#[derive(Clone, Debug)]
+struct FoldGroup {
+    first: u64,
+    last: u64,
+    stack: bool,
+}
+/// Strip the Kubernetes timestamp only; repeated messages retain their full text in the ring.
+pub fn message_body(text: &str) -> &str {
+    text.split_once(' ')
+        .filter(|(head, _)| {
+            head.is_ascii() && head.len() >= 20 && head.as_bytes().get(10) == Some(&b'T')
+        })
+        .map(|(_, body)| body)
+        .unwrap_or(text)
+}
+fn stack_frame(text: &str) -> bool {
+    let body = message_body(text).trim_start();
+    body.strip_prefix("at ")
+        .is_some_and(|frame| frame.contains('(') && frame.ends_with(')'))
+        || body
+            .strip_prefix("... ")
+            .and_then(|s| s.strip_suffix(" more"))
+            .is_some_and(|count| count.parse::<u32>().is_ok())
+}
 pub struct LogBuffer {
+    folds: VecDeque<FoldGroup>,
     lines: VecDeque<LogLine>,
     matches: VecDeque<u64>,
     first: u64,
@@ -45,6 +70,7 @@ impl LogBuffer {
     pub fn new(max_lines: usize, max_bytes: usize) -> Self {
         Self {
             lines: VecDeque::new(),
+            folds: VecDeque::new(),
             matches: VecDeque::new(),
             first: 0,
             next: 0,
@@ -67,6 +93,21 @@ impl LogBuffer {
             return;
         }
         line.text = safe_text(&line.text);
+        let stack = stack_frame(&line.text);
+        let merge = self.lines.back().is_some_and(|previous| {
+            previous.source == line.source
+                && ((stack && stack_frame(&previous.text))
+                    || message_body(&previous.text) == message_body(&line.text))
+        });
+        if merge && let Some(group) = self.folds.back_mut() {
+            group.last = self.next;
+        } else {
+            self.folds.push_back(FoldGroup {
+                first: self.next,
+                last: self.next,
+                stack,
+            });
+        }
         if self.accepts(&line) {
             self.matching_added += 1;
             self.matches.push_back(self.next);
@@ -80,6 +121,16 @@ impl LogBuffer {
                 self.first += 1;
                 self.dropped += 1;
             }
+        }
+        while self
+            .folds
+            .front()
+            .is_some_and(|group| group.last < self.first)
+        {
+            self.folds.pop_front();
+        }
+        if let Some(group) = self.folds.front_mut() {
+            group.first = group.first.max(self.first);
         }
         while self.matches.front().is_some_and(|seq| *seq < self.first) {
             self.matches.pop_front();
@@ -102,6 +153,26 @@ impl LogBuffer {
             .map(|(i, _)| self.first + i as u64)
             .collect();
         Ok(())
+    }
+    pub fn folded_len(&self) -> usize {
+        self.folds.len()
+    }
+    pub fn folded_sequence(&self, index: usize) -> Option<u64> {
+        self.folds.get(index).map(|g| g.first)
+    }
+    pub fn folded_position(&self, sequence: u64) -> usize {
+        self.folds.partition_point(|g| g.last < sequence)
+    }
+    pub fn fold_summary(&self, sequence: u64) -> Option<String> {
+        let group = self.folds.get(self.folded_position(sequence))?;
+        let count = group.last - group.first + 1;
+        (count > 1).then(|| {
+            if group.stack {
+                format!("↳ {} more stack frames · v expand", count - 1)
+            } else {
+                format!("↳ {count} repeated entries · v expand")
+            }
+        })
     }
     pub fn first_sequence(&self) -> u64 {
         self.first

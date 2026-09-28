@@ -30,7 +30,7 @@ fixture = {
     'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name, 'namespace': 'demo'},
     'spec': {'restartPolicy': 'Never', 'containers': [{
         'name': 'payments', 'image': 'nginx:alpine',
-        'command': ['sh', '-c', 'printf "%s\\n" "$MESSAGE" "context-before" "error: timeout?" "context-after" "error: retry?"; sleep 3600'],
+        'command': ['sh', '-c', 'printf "%s\\n" "$MESSAGE" "context-before" "error: timeout?" "context-after" "error: retry?" " at first.fn(Main.java:1)" " at hidden.fn(Main.java:2)" " at last.fn(Main.java:3)" "retrying request" "retrying request"; sleep 3600'],
         'env': [{'name': 'MESSAGE', 'value': message}],
     }]},
 }
@@ -138,6 +138,11 @@ try:
         send('l')
         expect('TAIL-VISIBLE', 60)
         expect('Wrap on')
+        expect('2 more stack frames')
+        expect('2 repeated entries')
+        send('v')
+        expect('hidden.fn')
+        send('v')
         capture('logs-wrapped')
         send('\x1b[H')
         expect('BEGIN-LONG')

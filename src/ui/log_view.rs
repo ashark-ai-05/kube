@@ -27,6 +27,7 @@ struct Record {
 
 pub struct LogView {
     pub wrap: bool,
+    pub fold: bool,
     pub filter_matches: bool,
     pub pretty: bool,
     pub horizontal: usize,
@@ -43,6 +44,7 @@ impl Default for LogView {
     fn default() -> Self {
         Self {
             wrap: true,
+            fold: true,
             filter_matches: false,
             pretty: false,
             horizontal: 0,
@@ -78,12 +80,41 @@ impl LogView {
         };
     }
     pub fn home(&mut self, logs: &LogBuffer) {
-        self.anchor = logs
-            .sequence(0, self.filter_matches)
+        self.anchor = self
+            .sequence(logs, 0)
             .map(|sequence| Anchor { sequence, row: 0 });
     }
+    fn grouped(&self, logs: &LogBuffer) -> bool {
+        self.fold && logs.search_regex().is_none() && !self.filter_matches
+    }
+    fn sequence(&self, logs: &LogBuffer, index: usize) -> Option<u64> {
+        if self.grouped(logs) {
+            logs.folded_sequence(index)
+        } else {
+            logs.sequence(index, self.filter_matches)
+        }
+    }
+    fn position(&self, logs: &LogBuffer, sequence: u64) -> usize {
+        if self.grouped(logs) {
+            logs.folded_position(sequence)
+        } else {
+            logs.position(sequence, self.filter_matches)
+        }
+    }
+    fn summary(&self, logs: &LogBuffer, sequence: u64) -> Option<String> {
+        if self.grouped(logs) {
+            logs.fold_summary(sequence)
+        } else {
+            None
+        }
+    }
+    fn row_count(&mut self, logs: &LogBuffer, sequence: u64) -> usize {
+        self.record(logs, sequence).rows.len() + usize::from(self.summary(logs, sequence).is_some())
+    }
     fn count(&self, logs: &LogBuffer) -> usize {
-        if self.filter_matches {
+        if self.grouped(logs) {
+            logs.folded_len()
+        } else if self.filter_matches {
             logs.matched()
         } else {
             logs.len()
@@ -115,8 +146,8 @@ impl LogView {
     fn tail(&mut self, logs: &LogBuffer) -> Option<Anchor> {
         let mut remaining = self.height.max(1);
         for index in (0..self.count(logs)).rev() {
-            let sequence = logs.sequence(index, self.filter_matches)?;
-            let count = self.record(logs, sequence).rows.len();
+            let sequence = self.sequence(logs, index)?;
+            let count = self.row_count(logs, sequence);
             if count >= remaining {
                 return Some(Anchor {
                     sequence,
@@ -125,18 +156,18 @@ impl LogView {
             }
             remaining -= count;
         }
-        logs.sequence(0, self.filter_matches)
+        self.sequence(logs, 0)
             .map(|sequence| Anchor { sequence, row: 0 })
     }
     fn normalize(&mut self, logs: &LogBuffer, anchor: Anchor) -> Option<(usize, Anchor)> {
-        let index = logs
-            .position(anchor.sequence, self.filter_matches)
+        let index = self
+            .position(logs, anchor.sequence)
             .min(self.count(logs).checked_sub(1)?);
-        let sequence = logs.sequence(index, self.filter_matches)?;
+        let sequence = self.sequence(logs, index)?;
         let row = if sequence == anchor.sequence {
             anchor
                 .row
-                .min(self.record(logs, sequence).rows.len().saturating_sub(1))
+                .min(self.row_count(logs, sequence).saturating_sub(1))
         } else {
             0
         };
@@ -154,21 +185,17 @@ impl LogView {
                     current.row -= 1;
                 } else if index > 0 {
                     index -= 1;
-                    current.sequence = logs.sequence(index, self.filter_matches).unwrap();
-                    current.row = self
-                        .record(logs, current.sequence)
-                        .rows
-                        .len()
-                        .saturating_sub(1);
+                    current.sequence = self.sequence(logs, index).unwrap();
+                    current.row = self.row_count(logs, current.sequence).saturating_sub(1);
                 }
             } else {
-                let count = self.record(logs, current.sequence).rows.len();
+                let count = self.row_count(logs, current.sequence);
                 if current.row + 1 < count {
                     current.row += 1;
                 } else if index + 1 < self.count(logs) {
                     index += 1;
                     current = Anchor {
-                        sequence: logs.sequence(index, self.filter_matches).unwrap(),
+                        sequence: self.sequence(logs, index).unwrap(),
                         row: 0,
                     };
                 }
@@ -236,7 +263,7 @@ impl LogView {
         let mut row = current.row;
         let mut result = Vec::with_capacity(self.height);
         while result.len() < self.height {
-            let Some(sequence) = logs.sequence(index, self.filter_matches) else {
+            let Some(sequence) = self.sequence(logs, index) else {
                 break;
             };
             let record = self.record(logs, sequence);
@@ -267,6 +294,14 @@ impl LogView {
                 };
                 spans.extend(highlight(&record.text, range, &matches, record.style));
                 result.push(Line::from(spans));
+            }
+            if result.len() < self.height
+                && let Some(summary) = self.summary(logs, sequence)
+            {
+                result.push(Line::styled(
+                    format!("{}{}", " ".repeat(record.gutter), summary),
+                    theme::muted_style(),
+                ));
             }
             row = 0;
             index += 1;
@@ -543,5 +578,52 @@ mod tests {
         assert!(start.contains("12:34:56"));
         view.horizontal = 20;
         assert!(plain(&view.rows(&logs, 35, 5, true)).contains("tail-token"));
+    }
+    #[test]
+    fn folding_preserves_raw_records_and_search_expands_hidden_frames() {
+        let mut logs = LogBuffer::default();
+        for text in [
+            "error: timeout",
+            " at first.fn(Main.java:1)",
+            " at hidden.fn(Main.java:2)",
+            " at last.fn(Main.java:3)",
+            "retry",
+            "retry",
+        ] {
+            logs.push(line(text));
+        }
+        let mut view = LogView::default();
+        let folded = plain(&view.rows(&logs, 100, 20, true));
+        assert!(folded.contains("2 more stack frames"));
+        assert!(folded.contains("2 repeated entries"));
+        assert!(!folded.contains("hidden.fn"));
+        assert_eq!(logs.matching().count(), 6);
+        logs.filter("hidden.fn").unwrap();
+        view.jump_match(&logs, false, true);
+        assert!(plain(&view.rows(&logs, 100, 20, true)).contains("hidden.fn"));
+        logs.filter("").unwrap();
+        view.fold = false;
+        view.home(&logs);
+        assert!(plain(&view.rows(&logs, 100, 20, true)).contains("last.fn"));
+    }
+    #[test]
+    fn folded_groups_survive_ring_eviction_and_respect_container_boundaries() {
+        let mut logs = LogBuffer::new(3, 1024);
+        for n in 0..20 {
+            logs.push(line(&format!("2026-09-28T12:34:{n:02}Z retry")));
+        }
+        assert_eq!(logs.folded_len(), 1);
+        assert_eq!(logs.folded_sequence(0), Some(17));
+        assert!(logs.fold_summary(17).unwrap().contains("3 repeated"));
+        let mut view = LogView::default();
+        view.home(&logs);
+        view.scroll(&logs, 1);
+        assert!(plain(&view.rows(&logs, 100, 1, true)).contains("3 repeated"));
+        logs.push(LogLine {
+            source: "another/app".into(),
+            text: "retry".into(),
+        });
+        assert_eq!(logs.folded_len(), 2);
+        assert!(!plain(&view.rows(&logs, 100, 20, true)).is_empty());
     }
 }
