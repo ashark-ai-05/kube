@@ -1,18 +1,12 @@
 use crate::store::table::TableData;
 use chrono::{DateTime, Utc};
 use kube::api::{DynamicObject, GroupVersionKind, ResourceExt};
-
-/// Relative width hint for a builtin column (GUI tables ignore exact pixels).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnWidth {
-    Fill(u16),
-    Length(u16),
-}
+use ratatui::layout::Constraint;
 
 /// One table column: a header plus a pure extraction from an object.
 pub struct Column {
     pub header: &'static str,
-    pub width: ColumnWidth,
+    pub width: Constraint,
     pub extract: fn(&DynamicObject) -> String,
 }
 
@@ -90,27 +84,27 @@ pub fn columns_for(gvk: &GroupVersionKind) -> Vec<Column> {
         return vec![
             Column {
                 header: "NAME",
-                width: ColumnWidth::Fill(2),
+                width: Constraint::Fill(2),
                 extract: extract_name,
             },
             Column {
                 header: "READY",
-                width: ColumnWidth::Length(7),
+                width: Constraint::Length(7),
                 extract: pod_ready,
             },
             Column {
                 header: "STATUS",
-                width: ColumnWidth::Length(14),
+                width: Constraint::Length(14),
                 extract: pod_phase,
             },
             Column {
                 header: "RESTARTS",
-                width: ColumnWidth::Length(9),
+                width: Constraint::Length(9),
                 extract: pod_restarts,
             },
             Column {
                 header: "AGE",
-                width: ColumnWidth::Length(6),
+                width: Constraint::Length(6),
                 extract: extract_age,
             },
         ];
@@ -118,12 +112,12 @@ pub fn columns_for(gvk: &GroupVersionKind) -> Vec<Column> {
     vec![
         Column {
             header: "NAME",
-            width: ColumnWidth::Fill(1),
+            width: Constraint::Fill(1),
             extract: extract_name,
         },
         Column {
             header: "AGE",
-            width: ColumnWidth::Length(6),
+            width: Constraint::Length(6),
             extract: extract_age,
         },
     ]

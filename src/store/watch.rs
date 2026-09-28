@@ -5,6 +5,7 @@ use crate::store::rbac::{WatchFailure, classify};
 use crate::store::table::TableData;
 use futures::{Stream, StreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher;
 use kube::{Api, Client};
 use std::collections::HashMap;
@@ -414,7 +415,7 @@ pub fn spawn_watch(
             None => Api::all_with(client, &ar),
         };
 
-        let stream = watcher::watcher(api, watcher::Config::default());
+        let stream = watcher::watcher(api, watcher::Config::default()).default_backoff();
         futures::pin_mut!(stream);
         drive_watch(stream, gvk, ar, namespace, store, tx).await;
     })

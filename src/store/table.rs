@@ -269,7 +269,7 @@ pub async fn fetch_table(client: &Client, resource_url: &str) -> anyhow::Result<
         .context("building the list request")?;
     req.headers_mut().insert(
         http::header::ACCEPT,
-        http::HeaderValue::from_static("application/json;as=Table;v=1;g=meta.k8s.io"),
+        http::HeaderValue::from_static("application/json;as=Table;v=v1;g=meta.k8s.io"),
     );
     // `ListParams`/`Request::list` (kube-core 4.2) has no field for this —
     // checked `kube-core-4.2.0/src/params.rs`'s `ListParams` and its
