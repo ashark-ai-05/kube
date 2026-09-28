@@ -100,6 +100,7 @@ where
 pub struct SourceOptions {
     pub paths: Vec<std::path::PathBuf>,
     pub context: Option<String>,
+    pub groups: Option<std::path::PathBuf>,
 }
 
 /// Keep source selection explicit; never rewrite the user's kubeconfig or its
@@ -109,7 +110,7 @@ pub fn parse_startup_args(args: impl IntoIterator<Item = String>) -> (CliOutcome
     let mut scope = vec![];
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--kubeconfig" || arg == "--context" {
+        if arg == "--kubeconfig" || arg == "--context" || arg == "--groups" {
             let Some(value) = args.next().filter(|v| !v.is_empty() && !v.starts_with('-')) else {
                 return (
                     CliOutcome::Error(format!("flag {arg} requires a value")),
@@ -118,9 +119,16 @@ pub fn parse_startup_args(args: impl IntoIterator<Item = String>) -> (CliOutcome
             };
             if arg == "--kubeconfig" {
                 source.paths.push(value.into());
+            } else if arg == "--groups" {
+                source.groups = Some(value.into());
             } else {
                 source.context = Some(value);
             }
+        } else if let Some(value) = arg.strip_prefix("--groups=") {
+            if value.is_empty() {
+                return (CliOutcome::Error("--groups requires a path".into()), source);
+            }
+            source.groups = Some(value.into());
         } else if let Some(value) = arg.strip_prefix("--kubeconfig=") {
             if value.is_empty() {
                 return (
@@ -174,6 +182,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn groups_file_coexists_with_context_and_rejects_missing_paths() {
+        for flag in [
+            vec!["--groups", "team groups.yaml"],
+            vec!["--groups=team groups.yaml"],
+        ] {
+            let (out, source) = parse_startup_args(
+                flag.into_iter()
+                    .chain(["--context", "west", "-A"])
+                    .map(str::to_string),
+            );
+            assert_eq!(out, CliOutcome::Run(NamespaceScope::All));
+            assert_eq!(source.groups.unwrap().to_str(), Some("team groups.yaml"));
+            assert_eq!(source.context.as_deref(), Some("west"));
+        }
+        for flags in [
+            vec!["--groups"],
+            vec!["--groups="],
+            vec!["--groups", "--context"],
+        ] {
+            assert!(matches!(
+                parse_startup_args(flags.into_iter().map(str::to_string)).0,
+                CliOutcome::Error(_)
+            ));
+        }
+    }
     #[test]
     fn no_args_gives_from_context() {
         let args: Vec<&str> = vec![];

@@ -1,5 +1,6 @@
 pub mod chrome;
 pub mod command;
+pub mod dashboard;
 pub mod geometry;
 pub mod hit;
 pub mod inspector;

@@ -22,7 +22,7 @@ fn report(name: &str, mut values: Vec<f64>, budget: f64) {
 fn main() {
     let ar = ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&());
     let gvk = GroupVersionKind::gvk("", "v1", "Pod");
-    let objects:Vec<_>=(0..10_000).map(|i|{let mut p=DynamicObject::new(&format!("pod-{i:05}"),&ar).within("demo");p.data=serde_json::json!({"status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0}]},"spec":{"containers":[{"name":"app"}]}});Arc::new(p)}).collect();
+    let objects:Vec<_>=(0..10_000).map(|i|{let mut p=DynamicObject::new(&format!("pod-{i:05}"),&ar).within("demo");p.metadata.creation_timestamp = Some(serde_json::from_value(serde_json::json!((chrono::Utc::now()-chrono::Duration::seconds((i*3571%10000000) as i64)).to_rfc3339())).unwrap());p.metadata.labels=Some(std::collections::BTreeMap::from([("app".into(),format!("app-{}",i%50))]));p.data=serde_json::json!({"status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":i*7919%25}]},"spec":{"containers":[{"name":"app"}]}});Arc::new(p)}).collect();
     let mut terminal = Terminal::new(TestBackend::new(160, 45)).unwrap();
     let mut view = TableView::new();
     let mut hits = HitRegistry::new();
@@ -37,7 +37,43 @@ fn main() {
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
     report("10,000-resource cached navigation", samples, 16.);
+    for header in ["Restarts", "Age", "Name"] {
+        let column = view
+            .headers
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(header))
+            .unwrap();
+        view.sort = Some(kube_tui::store::table::SortState {
+            column,
+            descending: true,
+            kind: kube_tui::store::table::SortKind::for_header(header),
+        });
+        let mut samples = vec![];
+        for i in 0..100 {
+            view.selected = i * 7;
+            hits.clear();
+            let start = Instant::now();
+            terminal
+                .draw(|f| render_table(f, f.area(), &objects, &gvk, &mut view, &mut hits))
+                .unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        report(&format!("10,000-resource {header} sorting"), samples, 16.);
+    }
+    view.sort = None;
     let mut workspace = kube_tui::ui::workspace::Workspace::default();
+    for pod in &objects {
+        workspace.dashboard.metrics.latest.insert(
+            ("demo".into(), pod.metadata.name.clone().unwrap()),
+            kube_tui::dashboard::metrics::PodUsage {
+                usage: kube_tui::dashboard::metrics::Usage {
+                    cpu_milli: 5.,
+                    memory_bytes: 1048576.,
+                },
+                timestamp: chrono::Utc::now(),
+            },
+        );
+    }
     let mut samples = vec![];
     for _ in 0..100 {
         let start = Instant::now();

@@ -18,7 +18,7 @@ use crate::store::events::{EventRow, fetch_events};
 use crate::store::multi::KindAvailability;
 use crate::store::table::{
     SortState, TABLE_REFETCH_DEBOUNCE, TableData, fetch_table, refetch_is_due, row_identity,
-    sort_table_rows, sorted_indices,
+    sort_table_rows, sorted_object_indices,
 };
 use crate::store::watch::StoreId;
 use crate::terminal::{RealTerminal, TerminalGuard, install_panic_hook};
@@ -657,11 +657,7 @@ fn selected_object(
             let index = match sort {
                 Some(sort) => {
                     let columns = columns_for(gvk);
-                    let cells: Vec<Vec<String>> = objects
-                        .iter()
-                        .map(|obj| columns.iter().map(|c| (c.extract)(obj)).collect())
-                        .collect();
-                    *sorted_indices(&cells, sort).get(selected)?
+                    *sorted_object_indices(objects, &columns, sort).get(selected)?
                 }
                 None => selected,
             };
@@ -1359,6 +1355,7 @@ pub async fn run() -> anyhow::Result<()> {
                 "      --context <name>          Start with this context; switch using the top bar"
             );
             println!("  -h, --help                    Show this help message");
+            println!("      --groups <file>           Custom pod grouping YAML");
             std::process::exit(0);
         }
         CliOutcome::Error(msg) => {
@@ -1376,6 +1373,7 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> anyhow::Result<()> {
     // First: a panic anywhere below must still leave the terminal usable.
     install_panic_hook();
+    let group_config = crate::dashboard::groups::GroupConfig::load(source.groups.as_deref())?;
 
     // Corporate kubeconfigs are routinely split across several files joined by
     // KUBECONFIG; `cluster::connect()` only ever reads the default location, so
@@ -1569,6 +1567,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     let mut pane = DetailPane::new();
     pane.catalog = false;
     let mut workspace = crate::ui::workspace::Workspace::default();
+    workspace.dashboard.config = group_config;
     let mut workspace_store = None;
     pane.sidebar_width = preferences.sidebar;
     if !preferences.mouse {
@@ -1789,13 +1788,23 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
         needs_redraw |= assistant.drain();
         if workspace_store != Some(StoreId::of(&store)) {
             workspace.recent.clear();
+            workspace.dashboard.reset_scope();
             workspace_store = Some(StoreId::of(&store));
         }
         let mut snapshot = store_snapshot(&store, &active_kind, &kinds).await;
-        if !filter_text.is_empty() {
-            snapshot
-                .objects
-                .retain(|obj| matches_resource(&filter_text, obj));
+        needs_redraw |= workspace.dashboard.metrics.drain();
+        if !filter_text.is_empty()
+            || (active_kind.kind == "Pod" && workspace.dashboard.active_group.is_some())
+        {
+            snapshot.objects.retain(|obj| {
+                matches_resource(&filter_text, obj)
+                    && (active_kind.kind != "Pod"
+                        || workspace
+                            .dashboard
+                            .active_group
+                            .as_ref()
+                            .is_none_or(|key| workspace.dashboard.config.key(obj) == *key))
+            });
             let visible: HashSet<_> = snapshot
                 .objects
                 .iter()
@@ -2019,6 +2028,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                                 detail = None;
                                 workspace.home = false;
                                 pane_focus = Focus::Table;
+                                workspace.dashboard.active_group = None;
                                 operations.notice = "Applied read-only navigation".into();
                             } else {
                                 operations.notice =
@@ -2205,6 +2215,13 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 match key.code {
                     KeyCode::F(2) if !overlay.is_open() => command = Some("home".into()),
                     KeyCode::F(3) if !overlay.is_open() => command = Some("browse".into()),
+                    KeyCode::Esc
+                        if inspector.is_none()
+                            && !overlay.is_open()
+                            && workspace.dashboard.active_group.is_some() =>
+                    {
+                        command = Some("home".into())
+                    }
                     KeyCode::Char(':')
                         if !overlay.is_open()
                             && !inspector.as_ref().is_some_and(|p| p.editing()) =>
@@ -2344,17 +2361,46 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             })
                             .collect();
                         match k.code {
+                            KeyCode::Char('g') => {
+                                workspace.dashboard.issues_focus = false;
+                                needs_redraw = true;
+                                continue;
+                            }
+                            KeyCode::Char('a') => {
+                                workspace.dashboard.issues_focus = true;
+                                needs_redraw = true;
+                                continue;
+                            }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                workspace.issue =
-                                    (workspace.issue + 1).min(issues.len().saturating_sub(1))
+                                if workspace.dashboard.issues_focus {
+                                    workspace.issue =
+                                        (workspace.issue + 1).min(issues.len().saturating_sub(1));
+                                } else {
+                                    workspace.dashboard.selected = (workspace.dashboard.selected
+                                        + 1)
+                                    .min(workspace.dashboard.groups.len().saturating_sub(1));
+                                }
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                workspace.issue = workspace.issue.saturating_sub(1)
+                                if workspace.dashboard.issues_focus {
+                                    workspace.issue = workspace.issue.saturating_sub(1);
+                                } else {
+                                    workspace.dashboard.selected =
+                                        workspace.dashboard.selected.saturating_sub(1);
+                                }
                             }
                             KeyCode::Enter => {
-                                command = issues
-                                    .get(workspace.issue)
-                                    .map(|(i, _)| format!("inspect {i}"))
+                                command = if !workspace.dashboard.issues_focus {
+                                    workspace
+                                        .dashboard
+                                        .groups
+                                        .get(workspace.dashboard.selected)
+                                        .map(|_| format!("group {}", workspace.dashboard.selected))
+                                } else {
+                                    issues
+                                        .get(workspace.issue)
+                                        .map(|(i, _)| format!("inspect {i}"))
+                                };
                             }
                             KeyCode::Char('/') => {
                                 workspace.home = false;
@@ -2389,6 +2435,10 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 let words: Vec<_> = command.split_whitespace().collect();
                 match words.first().copied().unwrap_or("") {
                     "home" | "browse" | "kind" => {
+                        if workspace.dashboard.active_group.is_some() {
+                            operations.notice.clear();
+                        }
+                        workspace.dashboard.active_group = None;
                         let desired = if words[0] == "home" {
                             "Pod"
                         } else if words[0] == "kind" {
@@ -2426,6 +2476,29 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         pane_focus = Focus::Sidebar;
                         if let Some(panel) = &mut inspector {
                             panel.focused = false;
+                        }
+                    }
+                    "focus-groups" => workspace.dashboard.issues_focus = false,
+                    "focus-issues" => workspace.dashboard.issues_focus = true,
+                    "group" => {
+                        if let Some(group) = words
+                            .get(1)
+                            .and_then(|i| i.parse::<usize>().ok())
+                            .and_then(|i| workspace.dashboard.groups.get(i))
+                        {
+                            workspace.dashboard.active_group = Some(group.key.clone());
+                            operations.notice =
+                                format!("Group: {} · Esc back to dashboard", group.key.name);
+                            let kind = crate::app::session::default_kind();
+                            session.lock().await.active_kind = kind.clone();
+                            active_kind_now = kind;
+                            workspace.home = false;
+                            filter_text.clear();
+                            view.selected = 0;
+                            view.offset = 0;
+                            view.sort = None;
+                            reset_selection = true;
+                            pane_focus = Focus::Table;
                         }
                     }
                     "recent" | "inspect" => {
@@ -2485,6 +2558,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                     "palette" => palette.start(),
                     "filter" => filter_edit = Some(filter_text.clone()),
                     "clear" => {
+                        workspace.dashboard.active_group = None;
                         filter_text.clear();
                         view.selected = 0;
                         reset_selection = true;
@@ -2795,6 +2869,7 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 // expand a group, or make a kind active — so one arm serves
                 // both and they cannot drift apart.
                 Action::SelectTreeRow(_) | Action::ActivateTreeRow => {
+                    workspace.dashboard.active_group = None;
                     if let Action::SelectTreeRow(i) = action {
                         tree.selected = i;
                         pane_focus = Focus::Sidebar;
@@ -3003,6 +3078,12 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
         if quit {
             break;
         }
+        workspace.dashboard.metrics.set_active(
+            workspace.home && inspector.is_none() && connecting_name.is_none(),
+            client.clone(),
+            namespace.clone(),
+            tx.clone(),
+        );
         if active_kind_now == active_kind && !reset_selection {
             selected_anchor = selected_object(
                 objects,
@@ -3127,7 +3208,13 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         } else {
                             theme::border_style()
                         })
-                        .title(format!(" {} ", active_kind.kind))
+                        .title(match &workspace.dashboard.active_group {
+                            Some(group) => format!(
+                                " {} · {} / {} ",
+                                active_kind.kind, group.namespace, group.name
+                            ),
+                            None => format!(" {} ", active_kind.kind),
+                        })
                         .title_bottom(ratatui::text::Line::styled(
                             " Enter inspect · l logs · / filter · s sort ",
                             theme::muted_style(),
@@ -3289,11 +3376,7 @@ fn index_for_identity(
         .position(|o| o.namespace() == identity.0 && o.name_any() == identity.1)?;
     if let Some(sort) = sort {
         let cols = columns_for(gvk);
-        let cells: Vec<Vec<String>> = objects
-            .iter()
-            .map(|o| cols.iter().map(|c| (c.extract)(o)).collect())
-            .collect();
-        return sorted_indices(&cells, sort)
+        return sorted_object_indices(objects, &cols, sort)
             .iter()
             .position(|i| *i == index);
     }

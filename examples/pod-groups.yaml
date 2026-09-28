@@ -1,0 +1,22 @@
+# Run: kube --groups examples/pod-groups.yaml
+# First matching rule wins. Fields in one rule are combined with AND.
+# Unmatched pods use app.kubernetes.io/name, then app, then their controller owner.
+# Identically named groups in different namespaces remain separate.
+version: 1
+groups:
+  - name: Web services
+    namespace: demo
+    selector:
+      matchLabels:
+        app: web
+  - name: Background workers
+    selector:
+      matchExpressions:
+        - key: app.kubernetes.io/component
+          operator: In
+          values: [worker, consumer]
+  - name: Data ingestion
+    namespace: pretrade
+    namePrefix: crisp-
+    # Optional regex is compiled once at startup.
+    nameRegex: '(ingest|extract)'

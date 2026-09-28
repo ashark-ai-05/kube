@@ -21,13 +21,21 @@ Fleet radar opens with readiness counts, a pod attention queue and namespace sig
 
 ![Focus studio with wrapped and folded logs](docs/images/focus-studio.png)
 
+## Pod groups and live dashboard
+
+Fleet radar (`F2`) groups pods by `app.kubernetes.io/name`, then `app`, then their controller owner. Pods without those fields appear as Ungrouped. Namespaces remain separate. Each group shows readiness, restarts, node count and measured CPU/memory. Select with arrows and Enter, or click a group, to browse only its pods; Esc returns to the dashboard. `g` focuses groups, `a` focuses the attention queue, and `F3` returns to the full resource list. The selected group's grouping source and node names appear below the cards.
+
+CPU and memory charts use the current namespace scope and refresh every five seconds while the dashboard is visible. They keep up to 60 local samples; switching namespace or cluster clears history and cancels old requests. Install metrics-server and grant list access to `pods.metrics.k8s.io` to see usage. Missing, denied or stale measurements are labelled unavailable; partial coverage shows the measured pod count. These charts are session history, not Prometheus or historical monitoring. Inspect an individual pod's Metrics tab for its container usage.
+
+Override grouping with `kube --groups /path/to/groups.yaml`, or save a file at `$XDG_CONFIG_HOME/kube/groups.yaml` (normally `~/.config/kube/groups.yaml`). See [examples/pod-groups.yaml](examples/pod-groups.yaml). Rules support namespace, Kubernetes label selectors, name prefixes and regexes. All conditions within a rule must match; the first matching rule wins, followed by the default labels/owner fallback. Files are validated before entering the terminal UI.
+
 ## Investigate
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
 
 Structured JSON logs open in a message view with explicit severity badges and compact timestamps. Click a record or press Enter to expand its JSON details; J toggles formatted JSON and o toggles the original record. Search automatically reveals full records so hidden metadata stays searchable; exports preserve the originals. Repeated single-container source labels move to the toolbar.
 
-Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Consecutive repeated messages and Java-style stack frames collapse into expandable groups (`v` toggles folding). Search automatically expands groups, and copy/export retain every raw record. Copy/export retain full metadata.
+Logs open in a wide reading pane; `z` expands the inspector across the terminal. Long messages wrap by default, including Unicode and long JSON fields. Search highlights matching text while keeping surrounding lines visible; `F` switches to matching lines only. Compact timestamps and container labels leave room for the actual message. Consecutive repeated messages and Java-style stack frames collapse into expandable groups (`v` toggles folding). Search automatically expands groups, and copy/export retain every raw record.
 
 Logs aggregate up to 16 pod/container streams, include source labels and timestamps, and follow replacement pods. Choose a container, inspect previous-container logs, search literal text or `re:patterns`, pause/follow, choose a time window, and export the filtered buffer. Kubernetes only exposes retained container logs; this is not a historical logging backend. Reconnect deduplication is best effort for identical timestamps.
 
@@ -36,6 +44,7 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | Key | Action |
 | --- | --- |
 | `F2` / `F3` | Fleet radar / Focus studio |
+| `g` / `a` on Fleet radar | Focus pod groups / attention queue |
 | `Ctrl-R` / All resources | Toggle the complete API resource catalog |
 | `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |
@@ -124,6 +133,8 @@ python3 scripts/tui-cluster-smoke.py
 cargo build --release --locked
 python3 scripts/tui-cluster-smoke.py target/release/kube --stress
 python3 scripts/tui-ux-smoke.py target/release/kube
+bash scripts/dev-metrics.sh  # disposable kind fixture only
+python3 scripts/dashboard-smoke.py target/release/kube
 ```
 
 This creates a `demo` namespace, nginx deployment and restricted ServiceAccount. Tests create/delete their own fixture resources. CI runs unit/render/terminal tests on Linux and macOS and Kubernetes acceptance on Linux. The binary workflow produces Linux x86-64 and macOS ARM64 archives with checksums on version tags or manual dispatch.

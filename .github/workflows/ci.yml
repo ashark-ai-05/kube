@@ -58,5 +58,7 @@ jobs:
       - run: python3 scripts/tui-cluster-smoke.py target/release/kube --stress
       - run: python3 scripts/tui-ux-smoke.py target/release/kube
       - run: python3 scripts/assistant-smoke.py target/release/kube
+      - run: bash scripts/dev-metrics.sh
+      - run: python3 scripts/dashboard-smoke.py target/release/kube
       - if: always()
         run: kind delete cluster --name kube-tui-acceptance

@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod cluster;
+pub mod dashboard;
 pub mod logs;
 pub mod store;
 pub mod terminal;

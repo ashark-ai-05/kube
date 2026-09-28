@@ -1,5 +1,5 @@
 use crate::store::columns::{ColumnSource, column_source};
-use crate::store::table::{SortState, TableData, sort_rows, sort_table_rows};
+use crate::store::table::{SortState, TableData, sort_table_rows, sorted_object_indices};
 use crate::ui::geometry::column_offsets;
 use crate::ui::hit::{HitRegistry, HitTarget};
 use crate::ui::scroll;
@@ -319,30 +319,21 @@ pub fn render_table_with_data(
     view.offset = scroll_offset(view.selected, view.offset, rows_visible);
     let window = visible_window(view.offset, area.height, total);
 
-    // Sorting needs a full ordering before "the visible window" means
-    // anything, so it is the one case allowed to cost O(total) rather than
-    // O(viewport) — unavoidable for any sort, not a regression of Task 4's
-    // guarantee, which only ever covered the unsorted path (still exercised
-    // by `render_table`/`only_visible_rows_are_formatted` below, where
-    // `view.sort` stays `None`).
-    //
-    // `Server` rows sort through `sort_table_rows`, not `sort_rows`: a
-    // `TableRow` bundles its cells with the identity of the object it
-    // displays (`store::table::TableRow`), and `sort_table_rows` reorders
-    // that whole bundle so identity always moves with its cells. `Builtin`
-    // rows have no separate identity to carry — the cells ARE extracted
-    // from `objects` in this exact call, in this exact order — so they stay
-    // on the plain `sort_rows`/`Vec<Vec<String>>` path.
+    // Sorting extracts only the requested key across the full list. Format the
+    // other builtin cells only for visible rows. Server rows already carry
+    // their cells and identity together; both paths retain stable tie ordering.
     let rows: Vec<Row> = match (&source, &view.sort) {
         (ColumnSource::Builtin(cols), Some(sort)) => {
-            let mut all_rows: Vec<Vec<String>> = objects
+            let order = sorted_object_indices(objects, cols, sort);
+            order[window.clone()]
                 .iter()
-                .map(|obj| cols.iter().map(|c| (c.extract)(obj)).collect())
-                .collect();
-            sort_rows(&mut all_rows, sort);
-            all_rows[window.clone()]
-                .iter()
-                .map(|cells| project(cells))
+                .map(|&index| {
+                    let cells: Vec<_> = cols
+                        .iter()
+                        .map(|column| (column.extract)(&objects[index]))
+                        .collect();
+                    project(&cells)
+                })
                 .collect()
         }
         (ColumnSource::Builtin(cols), None) => objects[window.clone()]

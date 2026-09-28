@@ -9,12 +9,11 @@ use kube::{
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::Style,
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph},
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
@@ -83,6 +82,9 @@ pub fn health(object: &DynamicObject) -> Health {
     Health::Unknown
 }
 pub fn reason(object: &DynamicObject) -> String {
+    if object.metadata.deletion_timestamp.is_some() {
+        return "Terminating".into();
+    }
     for key in ["initContainerStatuses", "containerStatuses"] {
         if let Some(cs) = object.data["status"][key].as_array() {
             for c in cs {
@@ -113,11 +115,13 @@ pub struct Workspace {
     pub selected: usize,
     pub issue: usize,
     pub recent: Vec<DynamicObject>,
-    buttons: Vec<(Rect, String)>,
+    pub(crate) buttons: Vec<(Rect, String)>,
+    pub dashboard: crate::dashboard::Dashboard,
 }
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            dashboard: crate::dashboard::Dashboard::default(),
             home: true,
             catalog: false,
             selected: 0,
@@ -260,171 +264,7 @@ impl Workspace {
         objects: &[Arc<DynamicObject>],
         status: WatchStatus,
     ) {
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().style(Style::default().bg(theme::INK)),
-            area,
-        );
-        let inner = Rect::new(
-            area.x + 2,
-            area.y + 1,
-            area.width.saturating_sub(4),
-            area.height.saturating_sub(2),
-        );
-        let rows = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Fill(1),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled("Fleet radar", theme::header_style()),
-                Line::styled(
-                    "Live signals from pods in the selected cluster and namespace",
-                    theme::muted_style(),
-                ),
-            ]),
-            rows[0],
-        );
-        let mut counts = [0usize; 4];
-        let mut issues = Vec::new();
-        let mut namespaces = BTreeMap::<&str, (usize, usize)>::new();
-        for (index, object) in objects.iter().enumerate() {
-            let value = health(object);
-            counts[match value {
-                Health::Ready => 0,
-                Health::Attention => 1,
-                Health::Completed => 2,
-                Health::Unknown => 3,
-            }] += 1;
-            if value == Health::Attention {
-                issues.push((index, object));
-            }
-            let entry = namespaces
-                .entry(object.metadata.namespace.as_deref().unwrap_or(""))
-                .or_default();
-            entry.0 += 1;
-            entry.1 += usize::from(value == Health::Attention);
-        }
-        let cards = Layout::horizontal([Constraint::Fill(1); 4])
-            .spacing(1)
-            .split(rows[1]);
-        for (i, (label, color)) in [
-            ("READY", theme::TEAL),
-            ("NEEDS ATTENTION", theme::CORAL),
-            ("COMPLETED", theme::MIST),
-            ("UNKNOWN", theme::AMBER),
-        ]
-        .iter()
-        .enumerate()
-        {
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(
-                        format!(" {}", counts[i]),
-                        Style::default().fg(*color).bold(),
-                    ),
-                    Line::styled(format!(" {label}"), theme::muted_style()),
-                ])
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(*color))
-                        .style(Style::default().bg(theme::ABYSS)),
-                ),
-                cards[i],
-            );
-        }
-        let columns = Layout::horizontal(if area.width >= 90 {
-            vec![Constraint::Percentage(62), Constraint::Percentage(38)]
-        } else {
-            vec![Constraint::Percentage(100), Constraint::Length(0)]
-        })
-        .spacing(3)
-        .split(rows[2]);
-        self.issue = self.issue.min(issues.len().saturating_sub(1));
-        let mut lines = vec![
-            Line::styled("ATTENTION QUEUE", theme::muted_style()),
-            Line::from(""),
-        ];
-        if issues.is_empty() {
-            lines.push(Line::styled(
-                if matches!(status, WatchStatus::Synced) {
-                    "No pod issues in this watched scope."
-                } else {
-                    "Waiting for a healthy watch; counts may be incomplete."
-                },
-                theme::label_style(),
-            ));
-        }
-        let visible = (columns[0].height.saturating_sub(2) / 3).max(1) as usize;
-        let start = self.issue.saturating_sub(visible - 1);
-        for (n, (index, object)) in issues.iter().enumerate().skip(start).take(visible) {
-            let y = columns[0].y + lines.len() as u16;
-            let style = if n == self.issue {
-                theme::text_style().bg(theme::SURFACE)
-            } else {
-                theme::text_style()
-            };
-            lines.push(Line::styled(
-                ellipsis(
-                    &format!(
-                        "{} {}",
-                        if n == self.issue { "›" } else { " " },
-                        object.name_any()
-                    ),
-                    columns[0].width as usize,
-                ),
-                style,
-            ));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}", reason(object)),
-                    theme::phase_style(&reason(object)),
-                ),
-                Span::styled(
-                    format!(" · {}", object.namespace().unwrap_or_default()),
-                    theme::muted_style(),
-                ),
-            ]));
-            lines.push(Line::from(""));
-            self.buttons.push((
-                Rect::new(columns[0].x, y, columns[0].width, 2),
-                format!("inspect {index}"),
-            ));
-        }
-        f.render_widget(Paragraph::new(lines), columns[0]);
-        let mut lines = vec![
-            Line::styled("NAMESPACE SIGNALS", theme::muted_style()),
-            Line::from(""),
-        ];
-        for (name, (total, bad)) in namespaces
-            .iter()
-            .take(columns[1].height.saturating_sub(4) as usize / 2)
-        {
-            lines.push(Line::styled(
-                ellipsis(name, columns[1].width as usize),
-                theme::text_style(),
-            ));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "▰".repeat((*total).min(18)),
-                    if *bad > 0 {
-                        theme::phase_style("Pending")
-                    } else {
-                        theme::label_style()
-                    },
-                ),
-                Span::styled(
-                    format!(" {total} pods · {bad} issues"),
-                    theme::muted_style(),
-                ),
-            ]));
-        }
-        f.render_widget(Paragraph::new(lines), columns[1]);
-        f.render_widget(Paragraph::new("↑/↓ choose issue · Enter investigate · F3 resource browser\nCounts reflect the current pod watch; other clusters are not queried.").style(theme::muted_style()).wrap(Wrap{trim:false}),rows[3]);
+        crate::ui::dashboard::render(f, area, objects, status, self);
     }
 }
 #[cfg(test)]

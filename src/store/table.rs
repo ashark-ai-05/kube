@@ -323,6 +323,23 @@ pub fn sorted_indices(rows: &[Vec<String>], sort: &SortState) -> Vec<usize> {
     order
 }
 
+/// Sort only the requested builtin column. Other cells are formatted for visible
+/// rows only; selection uses this same order so ties retain resource identity.
+pub fn sorted_object_indices(
+    objects: &[std::sync::Arc<kube::api::DynamicObject>],
+    columns: &[crate::store::columns::Column],
+    sort: &SortState,
+) -> Vec<usize> {
+    let Some(column) = columns.get(sort.column) else {
+        return (0..objects.len()).collect();
+    };
+    let cells: Vec<Vec<String>> = objects
+        .iter()
+        .map(|obj| vec![(column.extract)(obj)])
+        .collect();
+    sorted_indices(&cells, &SortState { column: 0, ..*sort })
+}
+
 /// Compare two cell values numerically if both parse as `f64`, lexically
 /// otherwise.
 /// As `sort_rows`, but for `TableData`'s own row type: sorts the whole
