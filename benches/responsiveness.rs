@@ -110,6 +110,45 @@ fn main() {
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
     report("10,000-pod monitor metric refresh", samples, 50.);
+    workspace.dashboard.search = "restarts>3 cpu>=5m age>10m label:app".into();
+    let mut samples = vec![];
+    for i in 0..100 {
+        workspace
+            .dashboard
+            .move_selection(if i % 2 == 0 { 1 } else { -1 });
+        let start = Instant::now();
+        workspace.clear_hits();
+        terminal
+            .draw(|f| {
+                workspace.render_home(
+                    f,
+                    f.area(),
+                    &objects,
+                    kube_tui::app::event::WatchStatus::Synced,
+                )
+            })
+            .unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report("10,000-pod combined-query navigation", samples, 16.);
+    let mut samples = vec![];
+    for i in 0..100 {
+        workspace.dashboard.search = format!("restarts>{} cpu>=5m age>10m label:app", i % 4);
+        let start = Instant::now();
+        workspace.clear_hits();
+        terminal
+            .draw(|f| {
+                workspace.render_home(
+                    f,
+                    f.area(),
+                    &objects,
+                    kube_tui::app::event::WatchStatus::Synced,
+                )
+            })
+            .unwrap();
+        samples.push(start.elapsed().as_secs_f64() * 1000.);
+    }
+    report("10,000-pod combined-query editing", samples, 16.);
     let mut logs = LogBuffer::default();
     let start = Instant::now();
     for i in 0..100_000 {

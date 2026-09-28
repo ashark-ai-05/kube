@@ -24,6 +24,20 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("namespace", "Choose namespace"),
     ("filter", "Filter resources by name or label:key=value"),
     (
+        "views",
+        "Pod monitor: open a saved view in the current scope",
+    ),
+    (
+        "save-view",
+        "Pod monitor: save query, columns and sorting by name",
+    ),
+    ("delete-view", "Delete a named local pod view"),
+    ("columns", "Pod monitor: choose visible columns"),
+    (
+        "troubleshoot",
+        "Pod monitor: show evidence for the selected pod",
+    ),
+    (
         "sort",
         "Sort resources by name, age, restarts or another column",
     ),
@@ -115,7 +129,17 @@ impl CommandBar {
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Enter => {
                     let dynamic = self.query.split_whitespace().next().is_some_and(|v| {
-                        matches!(v, "scale" | "forward" | "exec" | "kind" | "ask")
+                        matches!(
+                            v,
+                            "scale"
+                                | "forward"
+                                | "exec"
+                                | "kind"
+                                | "ask"
+                                | "save-view"
+                                | "delete-view"
+                                | "filter"
+                        )
                     });
                     let command = if dynamic {
                         self.query.clone()
@@ -153,7 +177,7 @@ impl CommandBar {
         ])
         .split(inner);
         if self.help {
-            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter · s sort resources\nCtrl-O cluster · Ctrl-N namespace · click top bar\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · v fold/expand · ←/→ pan when unwrapped\nEnter/click record details · J JSON · o original\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
+            f.render_widget(Paragraph::new("Tab focus · ↑/↓ or j/k navigate · Enter inspect\n: / Ctrl-K commands · / filter · s sort resources\nCtrl-O cluster · Ctrl-N namespace · click top bar\nPod monitor: v saved views · S save · C columns · t troubleshoot\nQueries: restarts>3 ready=false cpu>500m memory>80% label:app=api\nl logs · r related · 1–6 inspector tabs\n[ / ] resize sidebar · b toggle sidebar · drag pane divider\nm mouse capture · Shift+drag terminal text selection\nLogs: f follow/pause · c container · p previous · s time window\n/ or Ctrl-F search · n/N next/previous match · F filter\nw wrap · v fold/expand · ←/→ pan when unwrapped\nEnter/click record details · J JSON · o original\nz maximize · Home/End oldest/live · e export · y copy\nEsc close/back · q quit · Ctrl-C quit\n\nWrites start disabled. :write enables confirmations;\n:readonly disables them. Each mutation shows its exact target.\nExec and port-forward require kubectl on PATH.").style(theme::text_style()),inner);
             return;
         }
         f.render_widget(

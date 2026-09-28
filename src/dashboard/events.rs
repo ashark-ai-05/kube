@@ -22,6 +22,13 @@ impl Drop for Events {
     }
 }
 impl Events {
+    pub fn rows_for(&self, target: &Identity) -> &[EventRow] {
+        if self.target.as_ref() == Some(target) {
+            &self.rows
+        } else {
+            &[]
+        }
+    }
     pub fn set_target(
         &mut self,
         target: Option<Identity>,
@@ -145,6 +152,7 @@ mod tests {
                 reason: "Unhealthy".into(),
                 message: "old pod's failed probe".into(),
                 age: "1s".into(),
+                timestamp: None,
                 count: 1,
             }],
             error: None,

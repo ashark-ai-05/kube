@@ -36,6 +36,7 @@ pub struct EventRow {
     pub reason: String,
     pub message: String,
     pub age: String,
+    pub timestamp: Option<String>,
     pub count: i32,
 }
 
@@ -54,33 +55,25 @@ pub fn field_selector_for(name: &str, namespace: Option<&str>) -> String {
     }
 }
 
-/// Compact age for one event, preferring the most recently-updated
-/// timestamp available.
-///
-/// Precedence: `event_time` (the modern field; when the events.k8s.io API
-/// path populated it, it IS the most recent occurrence by construction) →
-/// `last_timestamp` (what `kubectl get events` shows for a legacy-path
-/// event: the most recent occurrence of a repeating event) →
-/// `first_timestamp` (better than nothing). Falling back to
-/// `first_timestamp` ahead of `last_timestamp` would make a repeating event
-/// look stale — exactly the wrong direction for the tab someone opens to
-/// find out if something is still failing right now.
-///
-/// An event with none of the three timestamps set renders `"?"`, never a
-/// fabricated `"0s"` — a wrong age is worse than an honest unknown here,
-/// since `"0s"` reads as "just happened," the opposite of "we don't know."
+/// Most recent observed occurrence, including repeating event series.
+fn event_timestamp(event: &Event) -> Option<k8s_openapi::jiff::Timestamp> {
+    [
+        event
+            .series
+            .as_ref()
+            .and_then(|s| s.last_observed_time.as_ref().map(|t| t.0)),
+        event.event_time.as_ref().map(|t| t.0),
+        event.last_timestamp.as_ref().map(|t| t.0),
+        event.first_timestamp.as_ref().map(|t| t.0),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
 fn event_age(event: &Event, now: DateTime<Utc>) -> String {
-    let ts = event
-        .event_time
-        .as_ref()
-        .map(|t| t.0)
-        .or_else(|| event.last_timestamp.as_ref().map(|t| t.0))
-        .or_else(|| event.first_timestamp.as_ref().map(|t| t.0));
-
-    match ts {
-        Some(t) => format_age(&format!("{t}"), now),
-        None => "?".to_string(),
-    }
+    event_timestamp(event)
+        .map(|t| format_age(&t.to_string(), now))
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Format raw `Event`s into display-ready rows. Pure and synchronous —
@@ -94,10 +87,16 @@ pub fn event_rows(events: &[Event], now: DateTime<Utc>) -> Vec<EventRow> {
             reason: e.reason.clone().unwrap_or_default(),
             message: e.message.clone().unwrap_or_default(),
             age: event_age(e, now),
+            timestamp: event_timestamp(e).map(|t| t.to_string()),
             // Kubernetes omits `count` on a singleton (never-repeated) event
             // rather than sending 1 explicitly, so an absent count means it
             // happened once, not zero times.
-            count: e.count.unwrap_or(1),
+            count: e
+                .series
+                .as_ref()
+                .and_then(|s| s.count)
+                .or(e.count)
+                .unwrap_or(1),
         })
         .collect()
 }
@@ -332,6 +331,19 @@ mod tests {
         e.count = Some(7);
         let rows = event_rows(&[e], now());
         assert_eq!(rows[0].count, 7);
+    }
+    #[test]
+    fn repeating_event_series_uses_last_observation_and_count() {
+        let mut event = event_with_times(hours_ago(5), hours_ago(3));
+        event.event_time = Some(MicroTime(jiff_ts(hours_ago(4))));
+        event.series = Some(k8s_openapi::api::core::v1::EventSeries {
+            count: Some(8),
+            last_observed_time: Some(MicroTime(jiff_ts(hours_ago(1)))),
+        });
+        let rows = event_rows(&[event], now());
+        assert_eq!(rows[0].age, "1h");
+        assert_eq!(rows[0].count, 8);
+        assert_eq!(rows[0].timestamp.as_deref(), Some("2026-08-25T11:00:00Z"));
     }
 
     #[test]

@@ -1,6 +1,9 @@
 pub mod events;
+pub mod evidence;
 pub mod metrics;
 pub mod pod;
+pub mod query;
+pub mod views;
 use kube::api::DynamicObject;
 use metrics::{MetricsFeed, Usage};
 use pod::{Budget, Filter, Identity, Sort};
@@ -10,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone)]
 pub struct Row {
     pub object: Arc<DynamicObject>,
     pub usage: Option<Usage>,
@@ -39,14 +43,23 @@ pub struct Dashboard {
     pub descending: bool,
     pub containers: bool,
     pub details: bool,
+    pub columns: Vec<views::Column>,
+    pub troubleshoot: bool,
+    pub evidence_selected: usize,
+    pub evidence_scroll: u16,
+    pub findings: Vec<evidence::Finding>,
     pub history: VecDeque<Option<Usage>>,
     sampled_revision: u64,
     history_key: Option<Identity>,
     pub list_height: usize,
     source: Vec<Arc<DynamicObject>>,
+    facts: Vec<Row>,
     view_key: Option<ViewKey>,
     refreshed: Option<Instant>,
     counts: [usize; 4],
+    query_text: String,
+    query: Result<query::Query, String>,
+    pub missing_metrics: usize,
 }
 impl Default for Dashboard {
     fn default() -> Self {
@@ -62,20 +75,31 @@ impl Default for Dashboard {
             descending: false,
             containers: false,
             details: true,
+            columns: views::Column::ALL.to_vec(),
+            troubleshoot: false,
+            evidence_selected: 0,
+            evidence_scroll: 0,
+            findings: vec![],
             history: VecDeque::new(),
             sampled_revision: 0,
             history_key: None,
             list_height: 10,
             source: vec![],
+            facts: vec![],
             view_key: None,
             refreshed: None,
             counts: [0; 4],
+            query_text: String::new(),
+            query: Ok(query::Query::default()),
+            missing_metrics: 0,
         }
     }
 }
 impl Dashboard {
     pub fn reset_scope(&mut self) {
+        let columns = self.columns.clone();
         *self = Self::default();
+        self.columns = columns;
     }
     pub fn selected_pod(&self) -> Option<&Arc<DynamicObject>> {
         self.rows.get(self.selected).map(|r| &r.object)
@@ -89,14 +113,16 @@ impl Dashboard {
     }
     pub fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
-        self.selected = 0;
-        self.anchor = None;
     }
     pub fn set_sort(&mut self, sort: Sort, descending: bool) {
         self.sort = sort;
         self.descending = descending;
     }
     pub fn refresh(&mut self, objects: &[Arc<DynamicObject>]) -> [usize; 4] {
+        if self.query_text != self.search {
+            self.query = query::Query::parse(&self.search);
+            self.query_text = self.search.clone();
+        }
         let key = ViewKey {
             filter: self.filter,
             search: self.search.clone(),
@@ -104,9 +130,12 @@ impl Dashboard {
             descending: self.descending,
             revision: self.metrics.revision,
         };
-        // Watches replace immutable Arc objects. Key navigation can reuse derived
-        // facts while updates, scope, filters, metrics and age ticks invalidate them.
-        if self.view_key.as_ref() == Some(&key)
+        // Query edits reuse pod facts; watch/metric changes and the one-second
+        // age tick rebuild them. Navigation also reuses the filtered row order.
+        let facts_current = self
+            .view_key
+            .as_ref()
+            .is_some_and(|old| old.revision == key.revision)
             && self
                 .refreshed
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
@@ -115,42 +144,52 @@ impl Dashboard {
                 .source
                 .iter()
                 .zip(objects)
-                .all(|(a, b)| Arc::ptr_eq(a, b))
-        {
+                .all(|(a, b)| Arc::ptr_eq(a, b));
+        if facts_current && self.view_key.as_ref() == Some(&key) {
             self.sample_selection();
             return self.counts;
         }
-        self.source = objects.to_vec();
-        self.view_key = Some(key);
-        self.refreshed = Some(Instant::now());
-        let mut counts = [0; 4];
-        let filters = [
-            Filter::All,
-            Filter::NotReady,
-            Filter::Restarts,
-            Filter::HighMemory,
-        ];
-        self.rows = objects
-            .iter()
-            .filter_map(|object| {
-                let usage = self.metrics.usage(object);
-                let budget = Budget::of(object);
-                for (i, filter) in filters.iter().enumerate() {
-                    counts[i] += usize::from(filter.matches(object, usage, budget));
-                }
-                if !self.filter.matches(object, usage, budget)
-                    || !crate::ui::command::matches_resource(&self.search, object)
-                {
-                    return None;
-                }
-                Some(Row {
-                    object: object.clone(),
-                    usage,
-                    budget,
-                    restarts: pod::restarts(object),
-                    age: pod::age_seconds(object),
+        if !facts_current {
+            self.source = objects.to_vec();
+            self.refreshed = Some(Instant::now());
+            self.counts = [0; 4];
+            self.missing_metrics = 0;
+            let filters = [
+                Filter::All,
+                Filter::NotReady,
+                Filter::Restarts,
+                Filter::HighMemory,
+            ];
+            self.facts = objects
+                .iter()
+                .map(|object| {
+                    let usage = self.metrics.usage(object);
+                    let budget = Budget::of(object);
+                    self.missing_metrics += usize::from(usage.is_none());
+                    for (i, filter) in filters.iter().enumerate() {
+                        self.counts[i] += usize::from(filter.matches(object, usage, budget));
+                    }
+                    Row {
+                        object: object.clone(),
+                        usage,
+                        budget,
+                        restarts: pod::restarts(object),
+                        age: pod::age_seconds(object),
+                    }
                 })
+                .collect();
+        }
+        self.view_key = Some(key);
+        self.rows = self
+            .facts
+            .iter()
+            .filter(|row| {
+                self.filter.matches(&row.object, row.usage, row.budget)
+                    && self.query.as_ref().is_ok_and(|q| {
+                        q.matches(&row.object, row.usage, row.budget, row.restarts, row.age)
+                    })
             })
+            .cloned()
             .collect();
         let sort = self.sort;
         let descending = self.descending;
@@ -191,13 +230,22 @@ impl Dashboard {
             })
             .unwrap_or(self.selected)
             .min(self.rows.len().saturating_sub(1));
-        self.anchor = self.selected_pod().map(|o| Identity::of(o));
-        self.counts = counts;
+        if let Some(object) = self.selected_pod() {
+            self.anchor = Some(Identity::of(object));
+        }
         self.sample_selection();
-        counts
+        self.counts
+    }
+    pub fn query_error(&self) -> Option<&str> {
+        self.query.as_ref().err().map(String::as_str)
+    }
+    pub fn needs_metrics(&self) -> bool {
+        self.query.as_ref().is_ok_and(|q| q.needs_metrics) || self.filter == Filter::HighMemory
     }
     fn sample_selection(&mut self) {
         if self.history_key != self.anchor {
+            self.evidence_selected = 0;
+            self.evidence_scroll = 0;
             self.history.clear();
             self.history_key = self.anchor.clone();
             self.sampled_revision = u64::MAX;
@@ -226,6 +274,37 @@ mod tests {
             "spec":{"containers":[{"name":"app","resources":{"limits":{"memory":"100Mi"}}}]},
             "status":{"phase":"Running","conditions":[{"type":"Ready","status":if ready{"True"}else{"False"}}],"containerStatuses":[{"name":"app","ready":ready,"restartCount":restarts}]}
         })).unwrap())
+    }
+    #[test]
+    fn changing_queries_preserves_matching_selection_and_rejects_incomplete_input() {
+        let pods = vec![
+            pod("one", "demo", "one", 1, false),
+            pod("two", "demo", "two", 5, false),
+        ];
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&pods);
+        dashboard.move_selection(1);
+        dashboard.search = "restarts>0 ready=false".into();
+        dashboard.refresh(&pods);
+        assert_eq!(
+            dashboard.selected_pod().unwrap().metadata.uid.as_deref(),
+            Some("two")
+        );
+        dashboard.search = "restarts>".into();
+        dashboard.refresh(&pods);
+        assert!(dashboard.rows.is_empty());
+        assert!(dashboard.query_error().is_some());
+        dashboard.search = "restarts>3".into();
+        dashboard.refresh(&pods);
+        assert_eq!(
+            dashboard.selected_pod().unwrap().metadata.uid.as_deref(),
+            Some("two")
+        );
+        dashboard.search = "cpu<1m".into();
+        dashboard.refresh(&pods);
+        assert!(dashboard.rows.is_empty());
+        assert_eq!(dashboard.missing_metrics, 2);
+        assert!(dashboard.needs_metrics());
     }
 
     #[test]

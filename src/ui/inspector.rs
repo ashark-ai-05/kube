@@ -140,6 +140,12 @@ impl Inspector {
         self.options.previous = true;
         self.load();
     }
+    pub fn container_logs(&mut self, container: String, previous: bool) {
+        self.mode = Mode::Logs;
+        self.options.container = Some(container);
+        self.options.previous = previous;
+        self.load();
+    }
     pub fn replace(&mut self, object: DynamicObject) {
         self.object = object;
         self.mode = Mode::Overview;

@@ -532,7 +532,7 @@ fn wrapped_row_count(text: &str, width: u16) -> u16 {
 /// line/row count. `lines` is whatever already-split logical lines the
 /// caller has (YAML's `\n`-delimited lines; Events' one-line-per-event
 /// text), since `Paragraph` wraps each of those independently.
-fn total_wrapped_rows<'a>(lines: impl Iterator<Item = &'a str>, width: u16) -> u16 {
+pub(crate) fn total_wrapped_rows<'a>(lines: impl Iterator<Item = &'a str>, width: u16) -> u16 {
     let mut total: u32 = 0;
     for line in lines {
         total = total.saturating_add(u32::from(wrapped_row_count(line, width)));
@@ -880,6 +880,7 @@ mod tests {
             reason: "Scheduled".to_string(),
             message: "pod scheduled onto node-7".to_string(),
             age: "5m".to_string(),
+            timestamp: None,
             count: 1,
         }
     }
@@ -890,6 +891,7 @@ mod tests {
             reason: "BackOff".to_string(),
             message: "back-off restarting failed container".to_string(),
             age: "1m".to_string(),
+            timestamp: None,
             count: 5,
         }
     }
@@ -1015,6 +1017,7 @@ mod tests {
                 reason: format!("Reason{i}"),
                 message: "m".to_string(),
                 age: "1m".to_string(),
+                timestamp: None,
                 count: 1,
             })
             .collect();
@@ -1098,6 +1101,7 @@ mod tests {
                 reason: format!("Reason{i}"),
                 message: "word ".repeat(10),
                 age: "1m".to_string(),
+                timestamp: None,
                 count: 1,
             })
             .collect();

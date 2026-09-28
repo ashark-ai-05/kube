@@ -22,6 +22,8 @@ pub enum Overlay {
     ClusterPicker(Picker),
     NamespacePicker(Picker),
     SortPicker(Picker),
+    PodViews(Picker),
+    PodColumns(Picker),
 }
 
 impl Overlay {
@@ -36,9 +38,11 @@ impl Overlay {
     pub fn picker(&self) -> Option<&Picker> {
         match self {
             Overlay::None => None,
-            Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) | Overlay::SortPicker(p) => {
-                Some(p)
-            }
+            Overlay::ClusterPicker(p)
+            | Overlay::NamespacePicker(p)
+            | Overlay::SortPicker(p)
+            | Overlay::PodViews(p)
+            | Overlay::PodColumns(p) => Some(p),
         }
     }
 
@@ -47,9 +51,11 @@ impl Overlay {
     pub fn picker_mut(&mut self) -> Option<&mut Picker> {
         match self {
             Overlay::None => None,
-            Overlay::ClusterPicker(p) | Overlay::NamespacePicker(p) | Overlay::SortPicker(p) => {
-                Some(p)
-            }
+            Overlay::ClusterPicker(p)
+            | Overlay::NamespacePicker(p)
+            | Overlay::SortPicker(p)
+            | Overlay::PodViews(p)
+            | Overlay::PodColumns(p) => Some(p),
         }
     }
 }

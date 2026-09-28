@@ -334,6 +334,7 @@ mod tests {
                 reason: reason.to_string(),
                 message: String::new(),
                 age: "1m".to_string(),
+                timestamp: None,
                 count: 1,
             }]),
         }

@@ -40,9 +40,13 @@ pub fn render(
     );
     let dashboard = &mut workspace.dashboard;
     let counts = dashboard.refresh(objects);
+    if dashboard.troubleshoot {
+        crate::ui::evidence::render(f, inner, workspace);
+        return;
+    }
     let compact = inner.height < 28;
     let sections = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Min(4),
         Constraint::Length(if !dashboard.details {
@@ -62,15 +66,56 @@ pub fn render(
         "watch incomplete"
     };
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("POD MONITOR  ", theme::header_style()),
-            Span::styled(
-                format!("{} pods · {status_label}", objects.len()),
-                theme::muted_style(),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("POD MONITOR  ", theme::header_style()),
+                Span::styled(
+                    format!(
+                        "{}/{} pods · {status_label}",
+                        dashboard.rows.len(),
+                        objects.len()
+                    ),
+                    theme::muted_style(),
+                ),
+            ]),
+            Line::styled(
+                if let Some(error) = dashboard.query_error() {
+                    format!("Filter error: {error}")
+                } else if dashboard.needs_metrics() && dashboard.missing_metrics > 0 {
+                    format!(
+                        "{} pods have unavailable metrics · memory % = usage / limit",
+                        dashboard.missing_metrics
+                    )
+                } else {
+                    "/ Filter · v Views · S Save · C Columns · t Troubleshoot".into()
+                },
+                if dashboard.query_error().is_some() {
+                    Style::default().fg(theme::CORAL)
+                } else {
+                    theme::muted_style()
+                },
             ),
-        ])),
+        ]),
         sections[0],
     );
+    if dashboard.query_error().is_none()
+        && !(dashboard.needs_metrics() && dashboard.missing_metrics > 0)
+    {
+        for (x, width, command) in [
+            (0, 8, "filter"),
+            (11, 7, "views"),
+            (21, 6, "save-view"),
+            (30, 9, "columns"),
+            (42, 14, "troubleshoot"),
+        ] {
+            if x + width <= sections[0].width {
+                workspace.buttons.push((
+                    Rect::new(sections[0].x + x, sections[0].y + 1, width, 1),
+                    command.into(),
+                ));
+            }
+        }
+    }
     let filters = [
         Filter::All,
         Filter::NotReady,
@@ -113,31 +158,36 @@ pub fn render(
             .buttons
             .push((tiles[i], format!("pod-filter {}", filter.key())));
     }
-    let wide = inner.width >= 100;
     let medium = inner.width >= 70;
-    let mut headers = vec!["Name", "Ready", "Restarts", "Age", "CPU", "Memory"];
-    let mut widths = vec![
-        Constraint::Fill(3),
-        Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(5),
-        Constraint::Length(9),
-        Constraint::Length(if medium { 17 } else { 10 }),
-    ];
-    if medium {
-        headers.push("Status");
-        widths.push(Constraint::Length(16));
+    use crate::dashboard::views::Column;
+    let lengths = [18, 7, 10, 5, 9, if medium { 17 } else { 10 }, 16, 18];
+    let mut columns = crate::dashboard::views::normalized(&dashboard.columns);
+    for optional in [
+        Column::Node,
+        Column::Status,
+        Column::Age,
+        Column::Ready,
+        Column::Memory,
+        Column::Cpu,
+        Column::Restarts,
+    ] {
+        let required: u16 = columns.iter().map(|c| lengths[c.index()] + 1).sum();
+        if required + 2 <= inner.width {
+            break;
+        }
+        columns.retain(|c| *c != optional);
     }
-    if wide {
-        headers.push("Node");
-        widths.push(Constraint::Fill(1));
-    }
-    if !medium {
-        headers.remove(3);
-        widths.remove(3);
-        headers.remove(1);
-        widths.remove(1);
-    }
+    let headers: Vec<_> = columns.iter().map(|c| c.label()).collect();
+    let widths: Vec<_> = columns
+        .iter()
+        .map(|c| {
+            if *c == Column::Name {
+                Constraint::Fill(1)
+            } else {
+                Constraint::Length(lengths[c.index()])
+            }
+        })
+        .collect();
     let cell_rects = Layout::horizontal(widths.clone()).spacing(1).split(Rect {
         x: sections[2].x + 2,
         width: sections[2].width.saturating_sub(2),
@@ -239,13 +289,6 @@ pub fn render(
                         .to_string(),
                 ),
             ];
-            let indices: Vec<usize> = if wide {
-                (0..8).collect()
-            } else if medium {
-                (0..7).collect()
-            } else {
-                vec![0, 2, 4, 5]
-            };
             workspace.buttons.push((
                 Rect::new(
                     sections[2].x,
@@ -256,9 +299,9 @@ pub fn render(
                 format!("pod-select {i}"),
             ));
             Row::new(
-                indices
-                    .into_iter()
-                    .map(|i| all[i].clone())
+                columns
+                    .iter()
+                    .map(|c| all[c.index()].clone())
                     .collect::<Vec<_>>(),
             )
         })
@@ -579,5 +622,38 @@ mod tests {
     fn gaps_are_not_zero_measurements() {
         assert_eq!(trend(&[Some(0.), None, Some(2.)], 3), "▁·█");
         assert_eq!(trend(&[Some(1.), None], 1), "·");
+    }
+    #[test]
+    fn invalid_queries_and_missing_metrics_are_visible_in_small_and_large_views() {
+        for (width, height) in [(150, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut workspace = Workspace::default();
+            workspace.dashboard.search = "cpu>".into();
+            terminal
+                .draw(|f| render(f, f.area(), &objects(), WatchStatus::Synced, &mut workspace))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("Filter error:"));
+            assert!(workspace.dashboard.selected_pod().is_none());
+            workspace.dashboard.search = "cpu>=0m".into();
+            terminal
+                .draw(|f| render(f, f.area(), &objects(), WatchStatus::Synced, &mut workspace))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("unavailable metrics"));
+            assert!(workspace.dashboard.selected_pod().is_none());
+        }
     }
 }

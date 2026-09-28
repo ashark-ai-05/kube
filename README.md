@@ -33,6 +33,31 @@ Usage refreshes every five seconds while the monitor is visible and retains up t
 
 ![Flat pod monitor with selected-pod metrics](docs/images/pod-monitor.png)
 
+### Queries and saved views
+
+In Pod monitor, `/` edits an AND-combined query. Plain words still fuzzy-match pod names/namespaces. Examples:
+
+```text
+restarts>3 ready=false label:app=payments
+cpu>=500m memory>128Mi age<2h
+memory>80% namespace=payments
+status=CrashLoopBackOff label:tier!=batch
+```
+
+Numeric comparisons support `=`, `!=`, `>`, `>=`, `<` and `<=`. CPU uses cores or millicores (`0.5` or `500m`); memory uses Kubernetes quantities (`128Mi`, `1Gi`). Memory percentages are usage divided by the pod's limit; `memory/limit>80%` is an explicit equivalent. Ages use durations such as `30s`, `10m`, `2h` or `2d3h`. Readiness is `ready=true`, `ready=false` or `ready=unknown`; unknown readiness is not false. Name, namespace, node and status support exact `=` / `!=`. Label presence (`label:app`) and equality/inequality remain supported.
+
+Invalid conditions display a filter error and produce no actionable rows. Missing or stale metrics do not satisfy comparisons, including `cpu!=0`; unavailable limits never satisfy a percentage condition. Queries combine with the four quick filters. `0` clears both. Matching pod selections survive sorting, query edits and watch refreshes. These predicates run locally over the current watched scope; a namespace predicate does not change or broaden that scope.
+
+Press **S** (or `:save-view NAME`) to save a named query with its quick filter, sort direction and columns. **v** / `:views` opens saved views; **C** / `:columns` toggles columns with Enter. Names always remain visible, and optional columns hide responsively on narrow terminals. `:delete-view NAME` removes a local saved view; saving the same name updates it. Views use the current cluster and namespace. Column preferences and up to 50 views are saved atomically in `$XDG_CONFIG_HOME/kube/views.json` (normally `~/.config/kube/views.json`), with no credentials or resource contents. Invalid files are preserved and reported rather than overwritten.
+
+### Troubleshooting evidence
+
+Select a pod and press **t** / `:troubleshoot`. The evidence view combines current waiting/termination states, previous container termination reasons and exit codes, pod conditions (including scheduling/readiness failures), and up to 32 events scoped to that pod's UID. Warnings appear first. Every finding identifies its Kubernetes source and recorded timestamp; missing timestamps remain unknown. Repeating events use their latest recorded observation and series count. Findings describe observations, including resolved conditions, rather than claim a root cause.
+
+Use arrows or click to select evidence; PgUp/PgDn scroll long details. Enter opens the identified container's current/previous logs when that finding supplies a container target, otherwise the pod's event history. Logs depend on what the cluster still retains. `l` opens all pod logs, `e` opens events, and Esc returns to the flat monitor. Event access failures stay visible alongside the pod-status evidence.
+
+![Selected-pod troubleshooting with termination details and previous logs](docs/images/pod-troubleshooting.png)
+
 ## Investigate
 
 Select a Deployment and press Enter. The inspector provides Overview, YAML, Events, Logs, Related, and Metrics views. Related follows owner UIDs and selectors to ReplicaSets, Pods, containers, Services, EndpointSlices, nodes and storage. Select a related resource to keep investigating. Discovered custom resources use the server's printer columns and remain browsable without plugins.
@@ -50,6 +75,8 @@ Logs aggregate up to 16 pod/container streams, include source labels and timesta
 | `F2` / `F3` | Pod monitor / Focus studio |
 | `0`–`3` on Pod monitor | All / not ready / restarts / high memory |
 | `d` / `D` on Pod monitor | Container/probe details / hide or show dock |
+| `v` / `S` / `C` on Pod monitor | Saved views / save current view / choose columns |
+| `t` on Pod monitor | Selected-pod troubleshooting evidence |
 | `Ctrl-R` / All resources | Toggle the complete API resource catalog |
 | `:` / `Ctrl-K` / click Commands | Searchable command palette |
 | `?` | Help |
@@ -84,7 +111,7 @@ Common phrases work immediately in the standard binary. The optional **AI editio
 
 Try natural phrasing such as “Could you bring up unhealthy pods in orders?”, “I want the manifest of the selected deployment”, “Show me CPU and memory usage for this pod”, or “Change context to Team-East”. Review the proposed action and scope, then Enter applies it. This is a **read-only navigation assistant**, not an autonomous operator or root-cause generator. Named-pod targets, compound actions and unsupported list conditions are rejected; select a resource before asking about “this pod”. Use the table's sorting/filter controls for metric thresholds and ordering.
 
-Local suggestions remain **experimental**: small pretrained models can misinterpret a request, and a limited evaluation suite cannot establish general accuracy. Only the typed request and fixed action definitions reach the local worker. It starts on demand with two CPU threads, a 4,096-token context and a 60-second overall deadline, then exits; the TUI remains responsive. Cold interpretation takes several seconds and varies by machine. See [AI setup, limitations and measured results](ai/README.md).
+Local suggestions remain **experimental**: small pretrained models can misinterpret a request, and a limited evaluation suite cannot establish general accuracy. Only the typed request and fixed action definitions reach the local worker. It starts on demand with two CPU threads, a 4,096-token context and a 90-second overall deadline, then exits; the TUI remains responsive. Cold interpretation takes several seconds and varies by machine. See [AI setup, limitations and measured results](ai/README.md).
 
 ONNX Runtime can also run pretrained models without training. This distribution uses the tested GGUF/native CPU path; converting to ONNX alone would not improve interpretation accuracy.
 

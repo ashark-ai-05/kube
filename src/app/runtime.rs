@@ -258,6 +258,8 @@ fn resolve_picker_choice(picker: &Picker, filtered_index: usize) -> Option<Strin
 enum PickerOutcome {
     ClusterChosen(String),
     SortChosen(String),
+    PodViewChosen(String),
+    PodColumnChosen(String),
     /// `None` is the all-namespaces scope, same convention as
     /// `namespace_choice_from_label`.
     NamespaceChosen(Option<String>),
@@ -285,6 +287,12 @@ fn resolve_confirm(overlay: &Overlay, index: Option<usize>) -> PickerOutcome {
     };
     match overlay {
         Overlay::None => PickerOutcome::NoOp,
+        Overlay::PodViews(p) => resolve_picker_choice(p, i)
+            .map(PickerOutcome::PodViewChosen)
+            .unwrap_or(PickerOutcome::NoOp),
+        Overlay::PodColumns(p) => resolve_picker_choice(p, i)
+            .map(PickerOutcome::PodColumnChosen)
+            .unwrap_or(PickerOutcome::NoOp),
         Overlay::ClusterPicker(p) => match resolve_picker_choice(p, i) {
             Some(label) => PickerOutcome::ClusterChosen(label),
             None => PickerOutcome::NoOp,
@@ -1565,6 +1573,8 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     let mut pane = DetailPane::new();
     pane.catalog = false;
     let mut workspace = crate::ui::workspace::Workspace::default();
+    let mut saved_views = crate::dashboard::views::Library::load();
+    workspace.dashboard.columns = saved_views.columns();
     let mut workspace_store = None;
     pane.sidebar_width = preferences.sidebar;
     if !preferences.mouse {
@@ -1574,6 +1584,9 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
     let mut header = Header::default();
     let mut assistant = crate::ui::assistant::Assistant::new(tx.clone());
     let mut operations = Operations::new(tx.clone());
+    if let Some(error) = &saved_views.error {
+        operations.notice = error.clone();
+    }
     operations.kubeconfig_paths = opts.kubeconfig_paths.clone();
     let mut filter_text = String::new();
     let mut filter_edit: Option<String> = None;
@@ -1946,7 +1959,10 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 );
                 clamp_selection(p);
             }
-            Overlay::SortPicker(_) | Overlay::None => {}
+            Overlay::SortPicker(_)
+            | Overlay::PodViews(_)
+            | Overlay::PodColumns(_)
+            | Overlay::None => {}
         }
 
         let mut quit = false;
@@ -2261,13 +2277,21 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             && !overlay.is_open()
                             && mouse.column > pane.sidebar_width =>
                     {
-                        workspace.dashboard.move_selection(
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                -3
-                            } else {
-                                3
-                            },
-                        );
+                        let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                            -3
+                        } else {
+                            3
+                        };
+                        if workspace.dashboard.troubleshoot {
+                            workspace.dashboard.evidence_selected = workspace
+                                .dashboard
+                                .evidence_selected
+                                .saturating_add_signed(delta)
+                                .min(workspace.dashboard.findings.len().saturating_sub(1));
+                            workspace.dashboard.evidence_scroll = 0;
+                        } else {
+                            workspace.dashboard.move_selection(delta);
+                        }
                         needs_redraw = true;
                         continue;
                     }
@@ -2353,8 +2377,55 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             continue;
                         }
                     } else if workspace.home && inspector.is_none() {
+                        if workspace.dashboard.troubleshoot {
+                            let dashboard = &mut workspace.dashboard;
+                            match k.code {
+                                KeyCode::Esc | KeyCode::Char('t' | 'q') => {
+                                    dashboard.troubleshoot = false
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    dashboard.evidence_selected = (dashboard.evidence_selected + 1)
+                                        .min(dashboard.findings.len().saturating_sub(1));
+                                    dashboard.evidence_scroll = 0;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    dashboard.evidence_selected =
+                                        dashboard.evidence_selected.saturating_sub(1);
+                                    dashboard.evidence_scroll = 0;
+                                }
+                                KeyCode::PageDown => {
+                                    dashboard.evidence_scroll =
+                                        dashboard.evidence_scroll.saturating_add(8)
+                                }
+                                KeyCode::PageUp => {
+                                    dashboard.evidence_scroll =
+                                        dashboard.evidence_scroll.saturating_sub(8)
+                                }
+                                KeyCode::Home => dashboard.evidence_scroll = 0,
+                                KeyCode::End => dashboard.evidence_scroll = u16::MAX,
+                                KeyCode::Enter => command = Some("evidence-open".into()),
+                                KeyCode::Char('l') => command = Some("logs".into()),
+                                KeyCode::Char('e') => command = Some("events".into()),
+                                _ => {}
+                            }
+                            if matches!(
+                                k.code,
+                                KeyCode::Esc
+                                    | KeyCode::Char('t' | 'q' | 'j' | 'k')
+                                    | KeyCode::Down
+                                    | KeyCode::Up
+                                    | KeyCode::PageDown
+                                    | KeyCode::PageUp
+                                    | KeyCode::Home
+                                    | KeyCode::End
+                            ) {
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
                         use crate::dashboard::pod::Filter;
                         match k.code {
+                            _ if workspace.dashboard.troubleshoot => {}
                             KeyCode::Down | KeyCode::Char('j') => {
                                 workspace.dashboard.move_selection(1)
                             }
@@ -2391,6 +2462,10 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             KeyCode::Enter => command = Some("overview".into()),
                             KeyCode::Char('l') => command = Some("logs".into()),
                             KeyCode::Char('r') => command = Some("related".into()),
+                            KeyCode::Char('v') => command = Some("views".into()),
+                            KeyCode::Char('S') => command = Some("save-view".into()),
+                            KeyCode::Char('C') => command = Some("columns".into()),
+                            KeyCode::Char('t') => command = Some("troubleshoot".into()),
                             _ => {}
                         }
                         if matches!(
@@ -2481,6 +2556,94 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                             panel.focused = false;
                         }
                     }
+                    "troubleshoot" => {
+                        if workspace.home
+                            && inspector.is_none()
+                            && workspace.dashboard.selected_pod().is_some()
+                        {
+                            workspace.dashboard.troubleshoot = true;
+                            workspace.dashboard.evidence_selected = 0;
+                            workspace.dashboard.evidence_scroll = 0;
+                        } else {
+                            operations.notice =
+                                "Select a pod in Pod monitor (F2), then press t".into();
+                        }
+                    }
+                    "troubleshoot-close" => workspace.dashboard.troubleshoot = false,
+                    "evidence-select" => {
+                        if let Some(i) = words.get(1).and_then(|v| v.parse::<usize>().ok()) {
+                            workspace.dashboard.evidence_selected =
+                                i.min(workspace.dashboard.findings.len().saturating_sub(1));
+                            workspace.dashboard.evidence_scroll = 0;
+                        }
+                    }
+                    "evidence-open" => {
+                        if let Some(object) = selected {
+                            let target = workspace
+                                .dashboard
+                                .findings
+                                .get(workspace.dashboard.evidence_selected)
+                                .and_then(|f| f.logs.clone());
+                            let mut panel = Inspector::new(
+                                object,
+                                Mode::Events,
+                                client.clone(),
+                                kinds.clone(),
+                                tx.clone(),
+                            );
+                            if let Some(target) = target {
+                                panel.container_logs(target.container, target.previous);
+                            }
+                            inspector = Some(panel);
+                            inspector_store = Some(StoreId::of(&store));
+                        }
+                    }
+                    "views" | "columns" | "save-view" | "delete-view" => {
+                        if !workspace.home || inspector.is_some() {
+                            operations.notice = "Open Pod monitor (F2) to manage pod views".into();
+                        } else {
+                            filter_edit = None;
+                            let name = command.strip_prefix(words[0]).unwrap_or("").trim();
+                            match words[0] {
+                                "views" => {
+                                    overlay = Overlay::PodViews(
+                                        crate::dashboard::views::views_picker(&saved_views),
+                                    );
+                                    if saved_views.views().is_empty() {
+                                        operations.notice = "No saved views · S saves the current query, columns and sort".into();
+                                    }
+                                }
+                                "columns" => {
+                                    overlay = Overlay::PodColumns(
+                                        crate::dashboard::views::columns_picker(
+                                            &workspace.dashboard.columns,
+                                        ),
+                                    )
+                                }
+                                "save-view" | "delete-view" if name.is_empty() => {
+                                    palette.start();
+                                    palette.query = format!("{} ", words[0]);
+                                }
+                                "save-view" => {
+                                    let settings = crate::dashboard::views::Settings::capture(
+                                        &workspace.dashboard,
+                                        &filter_text,
+                                    );
+                                    operations.notice = match saved_views.save_view(name, settings)
+                                    {
+                                        Ok(()) => format!("Saved view: {name} · v opens views"),
+                                        Err(e) => e,
+                                    };
+                                }
+                                _ => {
+                                    operations.notice = match saved_views.delete(name) {
+                                        Ok(()) => format!("Deleted saved view: {name}"),
+                                        Err(e) => e,
+                                    }
+                                }
+                            }
+                        }
+                    }
                     "pod-filter" => {
                         if let Some(filter) = words
                             .get(1)
@@ -2569,7 +2732,15 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         overlay = Overlay::SortPicker(picker);
                     }
                     "palette" => palette.start(),
-                    "filter" => filter_edit = Some(filter_text.clone()),
+                    "filter" => {
+                        let query = command.strip_prefix("filter").unwrap_or("").trim();
+                        if query.is_empty() {
+                            filter_edit = Some(filter_text.clone());
+                        } else {
+                            filter_text = query.into();
+                            filter_edit = None;
+                        }
+                    }
                     "clear" => {
                         workspace
                             .dashboard
@@ -2852,6 +3023,8 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                         }
                         Overlay::ClusterPicker(p)
                         | Overlay::NamespacePicker(p)
+                        | Overlay::PodViews(p)
+                        | Overlay::PodColumns(p)
                         | Overlay::SortPicker(p) => {
                             let n = filtered_indices(&p.items, &p.filter).len();
                             p.selected = apply_selection(p.selected, d, n);
@@ -3052,6 +3225,48 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
                 Action::PickerSelect(_) | Action::PickerConfirm => {
                     match resolve_confirm(&overlay, confirm_index) {
                         PickerOutcome::NoOp => {}
+                        PickerOutcome::PodViewChosen(name) => {
+                            if let Some(view) = saved_views.find(&name) {
+                                match view.settings.apply(&mut workspace.dashboard) {
+                                    Ok(()) => {
+                                        filter_text = view.settings.query.clone();
+                                        operations.notice =
+                                            format!("View: {name} · current cluster / namespace");
+                                    }
+                                    Err(e) => operations.notice = e,
+                                }
+                            }
+                            overlay = Overlay::None;
+                            needs_redraw = true;
+                        }
+                        PickerOutcome::PodColumnChosen(name) => {
+                            if let Some(column) = crate::dashboard::views::Column::parse(&name) {
+                                if column == crate::dashboard::views::Column::Name {
+                                    operations.notice =
+                                        "Name stays visible to identify each pod".into();
+                                } else {
+                                    let mut columns = workspace.dashboard.columns.clone();
+                                    if columns.contains(&column) {
+                                        columns.retain(|c| *c != column);
+                                    } else {
+                                        columns.push(column);
+                                    }
+                                    match saved_views.set_columns(&columns) {
+                                        Ok(()) => {
+                                            workspace.dashboard.columns = saved_views.columns()
+                                        }
+                                        Err(e) => operations.notice = e,
+                                    }
+                                }
+                                if let Some(picker) = overlay.picker_mut() {
+                                    picker.items = crate::dashboard::views::columns_picker(
+                                        &workspace.dashboard.columns,
+                                    )
+                                    .items;
+                                }
+                            }
+                            needs_redraw = true;
+                        }
                         PickerOutcome::SortChosen(label) => {
                             if workspace.home {
                                 if let Some((name, direction)) = label.rsplit_once(' ')
@@ -3329,7 +3544,12 @@ async fn run_with_scope(cli_scope: NamespaceScope, source: SourceOptions) -> any
             operations.render(f);
         })?;
         let event_target = (workspace.home && inspector.is_none() && connecting_name.is_none())
-            .then(|| workspace.dashboard.anchor.clone())
+            .then(|| {
+                workspace
+                    .dashboard
+                    .selected_pod()
+                    .map(|pod| crate::dashboard::pod::Identity::of(pod))
+            })
             .flatten();
         workspace
             .dashboard
