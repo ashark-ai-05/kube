@@ -33,7 +33,7 @@ impl Bundle {
     }
     pub async fn infer(&self, query: &str) -> Result<Intent, String> {
         super::check_query(query)?;
-        tokio::time::timeout(Duration::from_secs(30), self.infer_inner(query))
+        tokio::time::timeout(Duration::from_secs(60), self.infer_inner(query))
             .await
             .map_err(|_| "Local model timed out. Rephrase or use Commands.".to_string())?
     }
@@ -101,44 +101,48 @@ async fn request(
     path: &str,
     body: String,
 ) -> Result<(u16, Vec<u8>), String> {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let stream = TcpStream::connect(("127.0.0.1", port))
-            .await
-            .map_err(|_| "Local model is not ready")?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|_| "Local model connection failed")?;
-        let connection = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        // This task owns no process and stops when its one HTTP connection closes.
-        let req = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("Host", format!("127.0.0.1:{port}"))
-            .header("Authorization", format!("Bearer {key}"))
-            .header("Content-Type", "application/json")
-            .header("Connection", "close")
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|_| "Invalid local request")?;
-        let result = async {
-            let reply = sender
-                .send_request(req)
+    tokio::time::timeout(
+        Duration::from_secs(if method == "GET" { 2 } else { 45 }),
+        async {
+            let stream = TcpStream::connect(("127.0.0.1", port))
                 .await
-                .map_err(|_| "Local inference failed")?;
-            let status = reply.status().as_u16();
-            let data = Limited::new(reply.into_body(), 32 * 1024)
-                .collect()
-                .await
-                .map_err(|_| "Local model response exceeded its limit")?
-                .to_bytes()
-                .to_vec();
-            Ok((status, data))
-        }
-        .await;
-        connection.abort();
-        result
-    })
+                .map_err(|_| "Local model is not ready")?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(|_| "Local model connection failed")?;
+            let connection = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            // This task owns no process and stops when its one HTTP connection closes.
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("Host", format!("127.0.0.1:{port}"))
+                .header("Authorization", format!("Bearer {key}"))
+                .header("Content-Type", "application/json")
+                .header("Connection", "close")
+                .body(Full::new(Bytes::from(body)))
+                .map_err(|_| "Invalid local request")?;
+            let result = async {
+                let reply = sender
+                    .send_request(req)
+                    .await
+                    .map_err(|_| "Local inference failed")?;
+                let status = reply.status().as_u16();
+                let data = Limited::new(reply.into_body(), 32 * 1024)
+                    .collect()
+                    .await
+                    .map_err(|_| "Local model response exceeded its limit")?
+                    .to_bytes()
+                    .to_vec();
+                Ok((status, data))
+            }
+            .await;
+            connection.abort();
+            result
+        },
+    )
     .await
     .map_err(|_| "Local inference timed out".to_string())?
 }
