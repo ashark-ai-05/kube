@@ -14,7 +14,7 @@ use kube::{ResourceExt, api::DynamicObject};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
@@ -32,11 +32,19 @@ pub fn render(
         Block::default().style(Style::default().bg(theme::INK)),
         area,
     );
+    // Breathing room: on tall enough terminals, start the content one row
+    // below the header separator instead of hugging it. Small terminals keep
+    // every row, since there is nothing to spare.
+    let content_top = if area.height >= 24 {
+        area.y.saturating_add(1)
+    } else {
+        area.y
+    };
     let inner = Rect::new(
         area.x + 1,
-        area.y,
+        content_top,
         area.width.saturating_sub(2),
-        area.height,
+        area.height.saturating_sub(content_top - area.y),
     );
     let dashboard = &mut workspace.dashboard;
     let counts = dashboard.refresh(objects);
@@ -70,12 +78,16 @@ pub fn render(
             Line::from(vec![
                 Span::styled("POD MONITOR  ", theme::header_style()),
                 Span::styled(
-                    format!(
-                        "{}/{} pods · {status_label}",
-                        dashboard.rows.len(),
-                        objects.len()
-                    ),
-                    theme::muted_style(),
+                    format!("{}/{} pods ", dashboard.rows.len(), objects.len()),
+                    Style::default().fg(theme::PAPER),
+                ),
+                Span::styled(
+                    format!("· {status_label}"),
+                    if status == WatchStatus::Synced {
+                        Style::default().fg(theme::VIRIDIAN)
+                    } else {
+                        Style::default().fg(theme::AMBER)
+                    },
                 ),
             ]),
             Line::styled(
@@ -123,10 +135,15 @@ pub fn render(
         Filter::HighMemory,
     ];
     let tiles = Layout::horizontal([Constraint::Fill(1); 4])
-        .spacing(1)
+        .spacing(2)
         .split(sections[1]);
+    // One accent per tile so the filter row reads as four distinct signals
+    // rather than one grey block; the selected tile additionally gets a
+    // SURFACE background and its bottom border in the same accent.
+    let accents = [theme::PERIWINKLE, theme::CORAL, theme::AMBER, theme::VIOLET];
     for (i, filter) in filters.iter().enumerate() {
         let selected = dashboard.filter == *filter;
+        let accent = accents[i];
         let label = if inner.width < 70 {
             match filter {
                 Filter::NotReady => "Unready",
@@ -136,24 +153,25 @@ pub fn render(
         } else {
             filter.label()
         };
-        f.render_widget(
-            Paragraph::new(format!("{label} {}", counts[i]))
-                .style(if selected {
-                    theme::text_style().bg(theme::SURFACE)
-                } else {
-                    theme::muted_style()
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::BOTTOM)
-                        .border_style(if selected {
-                            theme::label_style()
-                        } else {
-                            theme::border_style()
-                        }),
-                ),
-            tiles[i],
+        let label_style = if selected {
+            Style::default().fg(theme::PAPER)
+        } else {
+            Style::default().fg(theme::MIST)
+        };
+        let count_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+        let mut tile = Paragraph::new(Line::from(vec![
+            Span::styled(format!("{label} "), label_style),
+            Span::styled(counts[i].to_string(), count_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(if selected { accent } else { theme::INDIGO })),
         );
+        if selected {
+            tile = tile.style(Style::default().bg(theme::SURFACE));
+        }
+        f.render_widget(tile, tiles[i]);
         workspace
             .buttons
             .push((tiles[i], format!("pod-filter {}", filter.key())));
@@ -298,12 +316,20 @@ pub fn render(
                 ),
                 format!("pod-select {i}"),
             ));
-            Row::new(
+            let built = Row::new(
                 columns
                     .iter()
                     .map(|c| all[c.index()].clone())
                     .collect::<Vec<_>>(),
-            )
+            );
+            // Zebra striping so a wide table of near-identical rows doesn't
+            // read as one grey mass; the selected row's own highlight style
+            // (below) always wins over this.
+            if i % 2 == 1 {
+                built.style(Style::default().bg(theme::ABYSS))
+            } else {
+                built
+            }
         })
         .collect();
     let mut table_state = TableState::default()
@@ -312,7 +338,12 @@ pub fn render(
         Table::new(rows, widths)
             .header(head)
             .column_spacing(1)
-            .row_highlight_style(theme::text_style().bg(theme::SURFACE))
+            .row_highlight_style(
+                Style::default()
+                    .fg(theme::PAPER)
+                    .bg(theme::DUSK)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("› "),
         sections[2],
         &mut table_state,
@@ -380,7 +411,15 @@ fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
             .spacing(2)
             .split(sections[1]);
         for (i, title) in ["CPU", "MEMORY"].iter().enumerate() {
-            let color = if i == 0 { theme::TEAL } else { theme::VIOLET };
+            // A 1-cell left pad so the panel's text doesn't touch the
+            // spacing gutter between CPU and MEMORY; the background fill
+            // below still covers the full panel width.
+            let padded = Rect {
+                x: columns[i].x + 1,
+                width: columns[i].width.saturating_sub(1),
+                ..columns[i]
+            };
+            let trend_color = if i == 0 { theme::TEAL } else { theme::VIOLET };
             let value = row
                 .usage
                 .map(|u| {
@@ -405,12 +444,15 @@ fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
                 )
             };
             let mut lines = vec![
-                Line::from(vec![Span::styled(
-                    format!("{title}  {value}"),
-                    Style::default().fg(color).bold(),
-                )]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("{title}  "),
+                        Style::default().fg(theme::TEAL).bold(),
+                    ),
+                    Span::styled(value, Style::default().fg(theme::PAPER).bold()),
+                ]),
                 Line::styled(
-                    ellipsis(&budget, columns[i].width as usize),
+                    ellipsis(&budget, padded.width as usize),
                     theme::muted_style(),
                 ),
             ];
@@ -429,8 +471,8 @@ fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
                     })
                     .collect();
                 lines.push(Line::styled(
-                    trend(&values, columns[i].width as usize),
-                    Style::default().fg(color),
+                    trend(&values, padded.width as usize),
+                    Style::default().fg(trend_color),
                 ));
             }
             if columns[i].height > 3 {
@@ -459,14 +501,15 @@ fn render_detail(f: &mut Frame, area: Rect, dashboard: &Dashboard) {
                     }
                 };
                 lines.push(Line::styled(
-                    ellipsis(&note, columns[i].width as usize),
+                    ellipsis(&note, padded.width as usize),
                     theme::muted_style(),
                 ));
             }
             f.render_widget(
-                Paragraph::new(lines).style(Style::default().bg(theme::ABYSS)),
+                Block::default().style(Style::default().bg(theme::ABYSS)),
                 columns[i],
             );
+            f.render_widget(Paragraph::new(lines), padded);
         }
     }
     f.render_widget(

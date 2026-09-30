@@ -10,7 +10,8 @@ use kube::{
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
 use std::sync::Arc;
@@ -177,14 +178,14 @@ impl Workspace {
         if area.width < 6 || area.height < 3 {
             return;
         }
-        let labels = [
-            "◈  Pod monitor",
-            "▤  Pods",
-            "▤  Deployments",
-            "▤  StatefulSets",
-            "▤  Jobs",
-            "⇄  Services",
-            "⌕  All resources",
+        let items: [(&str, Color, &str); 7] = [
+            ("◈", theme::TEAL, "Pod monitor"),
+            ("▤", theme::PERIWINKLE, "Pods"),
+            ("▤", theme::PERIWINKLE, "Deployments"),
+            ("▤", theme::PERIWINKLE, "StatefulSets"),
+            ("▤", theme::PERIWINKLE, "Jobs"),
+            ("⇄", theme::VIOLET, "Services"),
+            ("⌕", theme::INDIGO, "All resources"),
         ];
         let commands = self.nav_commands();
         let mut y = area.y + 1;
@@ -193,7 +194,7 @@ impl Workspace {
             Rect::new(area.x + 1, y, area.width - 2, 1),
         );
         y += 2;
-        for (i, label) in labels.iter().enumerate() {
+        for (i, (icon, icon_color, label)) in items.iter().enumerate() {
             if y >= area.bottom() {
                 break;
             }
@@ -202,18 +203,37 @@ impl Workspace {
             } else {
                 !self.home && commands[i] == format!("kind {}", kind.kind)
             };
-            let style = if focused && self.selected == i {
-                theme::header_style().bg(theme::DUSK)
+            let cursor = focused && self.selected == i;
+            let (bg, label_fg, bold) = if cursor {
+                (Some(theme::DUSK), theme::PAPER, true)
             } else if subject {
-                theme::label_style().bg(theme::SURFACE)
+                (Some(theme::SURFACE), theme::TEAL, false)
             } else {
-                theme::text_style()
+                (None, theme::PAPER, false)
             };
             let r = Rect::new(area.x + 1, y, area.width - 2, 1);
-            f.render_widget(
-                Paragraph::new(ellipsis(label, r.width as usize)).style(style),
-                r,
-            );
+            let full = format!("{icon}  {label}");
+            let truncated = ellipsis(&full, r.width as usize);
+            let icon_len = icon.len().min(truncated.len());
+            let (icon_part, rest_part) = truncated.split_at(icon_len);
+            let mut icon_style = Style::default().fg(*icon_color);
+            let mut label_style = Style::default().fg(label_fg);
+            if bold {
+                label_style = label_style.add_modifier(Modifier::BOLD);
+            }
+            if let Some(bg) = bg {
+                icon_style = icon_style.bg(bg);
+                label_style = label_style.bg(bg);
+            }
+            let line = Line::from(vec![
+                Span::styled(icon_part.to_string(), icon_style),
+                Span::styled(rest_part.to_string(), label_style),
+            ]);
+            let mut para = Paragraph::new(line);
+            if let Some(bg) = bg {
+                para = para.style(Style::default().bg(bg));
+            }
+            f.render_widget(para, r);
             self.buttons.push((r, commands[i].clone()));
             y += 2;
         }

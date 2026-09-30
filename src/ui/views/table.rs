@@ -203,6 +203,17 @@ pub fn render_table_with_data(
     view: &mut TableView,
     hits: &mut HitRegistry,
 ) {
+    // Breathing room: on tall enough terminals, start one row below whatever
+    // sits above (header, ribbon) rather than hugging it.
+    let area = if area.height >= 24 {
+        Rect {
+            y: area.y + 1,
+            height: area.height - 1,
+            ..area
+        }
+    } else {
+        area
+    };
     let source = column_source(gvk, table_data);
 
     let headers: Vec<String> = match &source {
@@ -356,6 +367,20 @@ pub fn render_table_with_data(
             .map(|row| project(&row.cells))
             .collect(),
     };
+    // Zebra striping: alternate rows get a faint background so a long list
+    // of near-identical resources doesn't read as one solid mass. The
+    // selected row's own highlight style always wins over this.
+    let rows: Vec<Row> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if (window.start + i) % 2 == 1 {
+                row.style(Style::default().bg(theme::ABYSS))
+            } else {
+                row
+            }
+        })
+        .collect();
     let row_count = rows.len();
 
     // Window-relative selection: ratatui is given exactly the rows it draws,

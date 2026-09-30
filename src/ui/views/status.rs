@@ -46,9 +46,17 @@ pub fn render_status(
             Style::default().fg(theme::cluster_hue(context)),
         ),
         Span::styled("· ", Style::default().fg(theme::MIST)),
-        Span::styled(format!("{namespace} "), Style::default().fg(theme::PAPER)),
+        Span::styled(
+            format!("{namespace} "),
+            Style::default()
+                .fg(theme::PAPER)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
         Span::styled("· ", Style::default().fg(theme::MIST)),
-        Span::styled(format!("{count} items "), Style::default().fg(theme::PAPER)),
+        Span::styled(
+            format!("{count} items "),
+            Style::default().fg(theme::VIOLET),
+        ),
         Span::styled("· ", Style::default().fg(theme::MIST)),
         Span::styled(label, style),
     ];

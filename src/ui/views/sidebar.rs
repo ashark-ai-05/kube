@@ -46,6 +46,18 @@ pub fn render_sidebar(
     // below, the same defensive clamp `render_table`/`render_picker` perform.
     tree.clamp_selected();
 
+    // Breathing room: on tall enough terminals, start one row below whatever
+    // sits above (header, ribbon) rather than hugging it.
+    let area = if area.height >= 24 {
+        Rect {
+            y: area.y + 1,
+            height: area.height - 1,
+            ..area
+        }
+    } else {
+        area
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
